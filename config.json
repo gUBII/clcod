@@ -1,0 +1,53 @@
+{
+  "agents": [
+    {
+      "name": "CLAUDE",
+      "enabled": true,
+      "cmd": "claude",
+      "args": [
+        "-p"
+      ],
+      "shell_cmd": "claude",
+      "timeout": 60
+    },
+    {
+      "name": "CODEX",
+      "enabled": true,
+      "cmd": "codex",
+      "args": [
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--ephemeral",
+        "-C",
+        "{script_dir}"
+      ],
+      "shell_cmd": "codex",
+      "timeout": 60
+    },
+    {
+      "name": "GEMINI",
+      "enabled": true,
+      "cmd": "gemini",
+      "args": [
+        "-p"
+      ],
+      "shell_cmd": "gemini",
+      "timeout": 60
+    }
+  ],
+  "workspace": {
+    "log_path": "clcodgemmix.txt",
+    "lock_path": "speaker.lock",
+    "poll_sec": 0.5,
+    "context_len": 6000,
+    "relay_log_path": ".clcod-runtime/relay.log",
+    "pid_path": ".clcod-runtime/relay.pid"
+  },
+  "locks": {
+    "ttl": 90
+  },
+  "tmux": {
+    "session": "triagent"
+  }
+}

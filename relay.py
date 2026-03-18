@@ -1,294 +1,516 @@
 #!/usr/bin/env python3
 """
-relay.py — Watches clcodgemmix.txt and routes new messages to Codex and Gemini
-via their CLI tools. Claude's responses are handled by the active Claude Code session.
+relay.py - Watches the shared transcript and routes new human messages to the
+configured agent CLIs.
 
 Usage:
-    python3 relay.py                          # default log path
-    python3 relay.py --log /path/to/log.txt   # custom log
+    python3 relay.py
+    python3 relay.py --config ./config.json
+    python3 relay.py --log ./clcodgemmix.txt
 """
 
-import asyncio
+from __future__ import annotations
+
 import argparse
+import asyncio
+import copy
 import fcntl
+import json
 import os
 import re
+import shlex
+import signal
 import sys
 import time
+from pathlib import Path
+from typing import Any
 
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LOG = os.path.join(SCRIPT_DIR, "clcodgemmix.txt")
-LOCK_FILE   = os.path.join(SCRIPT_DIR, "speaker.lock")
-POLL_SEC    = 0.5   # how often to check for new content
-TIMEOUT_SEC = 60    # max seconds to wait for a CLI response
-CONTEXT_LEN = 6000  # chars of log tail sent as context
-LOCK_TTL    = 90    # seconds before a stale lock is released
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 
-# All three agents. Claude is included — works when not nested inside Claude Code.
-AGENTS = ("CLAUDE", "CODEX", "GEMINI")
+DEFAULT_CONFIG: dict[str, Any] = {
+    "agents": [
+        {
+            "name": "CLAUDE",
+            "enabled": True,
+            "cmd": "claude",
+            "args": ["-p"],
+            "shell_cmd": "claude",
+            "timeout": 60,
+        },
+        {
+            "name": "CODEX",
+            "enabled": True,
+            "cmd": "codex",
+            "args": [
+                "exec",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral",
+                "-C",
+                "{script_dir}",
+            ],
+            "shell_cmd": "codex",
+            "timeout": 60,
+        },
+        {
+            "name": "GEMINI",
+            "enabled": True,
+            "cmd": "gemini",
+            "args": ["-p"],
+            "shell_cmd": "gemini",
+            "timeout": 60,
+        },
+    ],
+    "workspace": {
+        "log_path": "clcodgemmix.txt",
+        "lock_path": "speaker.lock",
+        "poll_sec": 0.5,
+        "context_len": 6000,
+        "relay_log_path": ".clcod-runtime/relay.log",
+        "pid_path": ".clcod-runtime/relay.pid",
+    },
+    "locks": {
+        "ttl": 90,
+    },
+    "tmux": {
+        "session": "triagent",
+    },
+}
 
 PROMPT_TEMPLATE = (
     "You are {name}, one of three AI agents (Claude, Codex, Gemini) sharing a "
-    "real-time terminal chat room.  Below is the recent conversation log.  "
-    "Reply naturally as yourself in 2-5 sentences.  "
-    "Do NOT prefix your reply with your name or a [TAG].\n\n{context}"
+    "real-time terminal chat room. Below is the recent conversation log. "
+    "Reply naturally as yourself in 2-5 sentences. Do not prefix your reply "
+    "with your name or a [TAG].\n\n{context}"
 )
 
 
-# ── speaker lock (anti-collision) ─────────────────────────────────────────────
+def relay_log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[relay {timestamp}] {message}", flush=True)
 
-def acquire_lock(owner: str) -> bool:
-    """Try to claim the speaker lock. Returns True if acquired."""
+
+def merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge_dicts(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def resolve_path(base_dir: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def interpolate(value: Any, variables: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        return value.format_map(variables)
+    if isinstance(value, list):
+        return [interpolate(item, variables) for item in value]
+    return value
+
+
+def read_text(path: Path) -> str:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    config_path = Path(path).expanduser()
+    if not config_path.is_absolute():
+        config_path = (Path.cwd() / config_path).resolve()
+
+    config_dir = config_path.parent
+    config = copy.deepcopy(DEFAULT_CONFIG)
+
+    if config_path.exists():
+        try:
+            raw = json.loads(read_text(config_path))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid config JSON: {config_path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError(f"config root must be an object: {config_path}")
+        merge_dicts(config, raw)
+
+    workspace = config.get("workspace", {})
+    locks = config.get("locks", {})
+    tmux = config.get("tmux", {})
+    variables = {
+        "script_dir": str(SCRIPT_DIR),
+        "config_dir": str(config_dir),
+    }
+
+    normalized_workspace = {
+        "log_path": resolve_path(config_dir, str(workspace.get("log_path", "clcodgemmix.txt"))),
+        "lock_path": resolve_path(config_dir, str(workspace.get("lock_path", "speaker.lock"))),
+        "poll_sec": float(workspace.get("poll_sec", 0.5)),
+        "context_len": int(workspace.get("context_len", 6000)),
+        "relay_log_path": resolve_path(
+            config_dir, str(workspace.get("relay_log_path", ".clcod-runtime/relay.log"))
+        ),
+        "pid_path": resolve_path(
+            config_dir, str(workspace.get("pid_path", ".clcod-runtime/relay.pid"))
+        ),
+    }
+    variables.update(
+        {
+            "log_path": str(normalized_workspace["log_path"]),
+            "lock_path": str(normalized_workspace["lock_path"]),
+            "relay_log_path": str(normalized_workspace["relay_log_path"]),
+            "pid_path": str(normalized_workspace["pid_path"]),
+        }
+    )
+
+    agents: list[dict[str, Any]] = []
+    raw_agents = config.get("agents", [])
+    if not isinstance(raw_agents, list):
+        raise ValueError("config.agents must be a list")
+    for raw_agent in raw_agents:
+        if not isinstance(raw_agent, dict):
+            raise ValueError("each agent config must be an object")
+
+        name = str(raw_agent.get("name", "")).strip().upper()
+        cmd = str(raw_agent.get("cmd", "")).strip()
+        if not name or not cmd:
+            raise ValueError("each agent requires non-empty name and cmd fields")
+
+        raw_args = raw_agent.get("args", [])
+        if isinstance(raw_args, str):
+            args = shlex.split(raw_args)
+        elif isinstance(raw_args, list):
+            args = [str(item) for item in raw_args]
+        else:
+            raise ValueError(f"{name}: args must be a string or list")
+
+        agent = {
+            "name": name,
+            "enabled": bool(raw_agent.get("enabled", True)),
+            "cmd": interpolate(cmd, variables),
+            "args": interpolate(args, variables),
+            "shell_cmd": interpolate(str(raw_agent.get("shell_cmd", cmd)), variables),
+            "timeout": int(raw_agent.get("timeout", 60)),
+        }
+        agents.append(agent)
+
+    if not agents:
+        raise ValueError("config must define at least one agent")
+
+    return {
+        "config_path": config_path,
+        "agents": agents,
+        "workspace": normalized_workspace,
+        "locks": {
+            "ttl": int(locks.get("ttl", 90)),
+        },
+        "tmux": {
+            "session": str(tmux.get("session", "triagent")),
+        },
+    }
+
+
+def last_speaker(text: str) -> str:
+    tags = re.findall(r"^\[([^\]]+)\]", text, re.MULTILINE)
+    return tags[-1].strip() if tags else ""
+
+
+def activity_jitter(content: str) -> float:
+    recent = content[-500:]
+    msg_count = recent.count("\n[")
+    if msg_count > 4:
+        return 0.5
+    if msg_count > 2:
+        return 1.0
+    return 2.0
+
+
+def acquire_lock(lock_path: Path, owner: str, ttl: int) -> bool:
     try:
-        # If lock exists and is fresh, someone else is speaking
-        if os.path.exists(LOCK_FILE):
-            age = time.time() - os.path.getmtime(LOCK_FILE)
-            if age < LOCK_TTL:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            age = time.time() - lock_path.stat().st_mtime
+            if age < ttl:
                 return False
-        with open(LOCK_FILE, "w") as f:
-            f.write(f"{owner}:{time.time()}")
+        write_text(lock_path, f"{owner}:{time.time()}\n")
         return True
     except OSError:
         return False
 
-def release_lock():
+
+def release_lock(lock_path: Path) -> None:
     try:
-        os.remove(LOCK_FILE)
+        lock_path.unlink()
+    except FileNotFoundError:
+        return
     except OSError:
-        pass
-
-def activity_jitter(content: str) -> float:
-    """Adaptive jitter: short if conversation is busy, longer if quiet."""
-    recent = content[-500:]
-    msg_count = recent.count("\n[")
-    if msg_count > 4:
-        return 0.5   # busy — minimal wait
-    elif msg_count > 2:
-        return 1.0
-    else:
-        return 2.0   # quiet — give humans time to respond
+        return
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def last_speaker(text: str) -> str:
-    """Return the last [SPEAKER] tag in the log."""
-    tags = re.findall(r"^\[([A-Z]+)\]", text, re.MULTILINE)
-    return tags[-1] if tags else ""
-
-
-async def append_reply(lock: asyncio.Lock, path: str, speaker: str, text: str):
-    """Atomically append a tagged reply to the log."""
+async def append_reply(write_lock: asyncio.Lock, log_path: Path, speaker: str, text: str) -> None:
     entry = f"\n[{speaker}]\n{text.strip()}\n"
-    async with lock:
-        with open(path, "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(entry)
-            fcntl.flock(f, fcntl.LOCK_UN)
+    async with write_lock:
+        with log_path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.write(entry)
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-
-# ── CLI output parsers ────────────────────────────────────────────────────────
 
 def parse_codex(raw: str) -> str:
-    """Extract the actual reply from `codex exec` stdout.
-
-    Codex prints:
-        <header block>
-        user
-        <prompt>
-        mcp startup: ...
-        thinking
-        <thought>
-        codex
-        <RESPONSE>
-        tokens used
-        <number>
-        <RESPONSE repeated>
-
-    Strategy: grab lines between the "codex" marker and "tokens used".
-    """
     lines = raw.strip().splitlines()
     response: list[str] = []
     capture = False
     for line in lines:
-        if line.strip() == "codex":
+        stripped = line.strip()
+        if stripped == "codex":
             capture = True
             continue
         if capture:
-            if line.strip().startswith("tokens used"):
+            if stripped.startswith("tokens used"):
                 break
             response.append(line)
+
     text = "\n".join(response).strip()
     if text:
         return text
-    # Fallback: last non-metadata line
-    skip = {
-        "OpenAI", "--------", "workdir:", "model:", "provider:", "approval:",
-        "sandbox:", "reasoning", "session id:", "user", "mcp startup:",
-        "thinking", "codex", "tokens used",
-    }
+
+    skip_prefixes = (
+        "OpenAI",
+        "--------",
+        "workdir:",
+        "model:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning",
+        "session id:",
+        "user",
+        "mcp startup:",
+        "thinking",
+        "codex",
+        "tokens used",
+    )
     for line in reversed(lines):
-        s = line.strip()
-        if s and not any(s.startswith(k) for k in skip) and not s.startswith("**"):
-            try:
-                int(s.replace(",", ""))   # skip bare numbers (token count)
-                continue
-            except ValueError:
-                return s
+        stripped = line.strip()
+        if not stripped or stripped.startswith("**"):
+            continue
+        if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        try:
+            int(stripped.replace(",", ""))
+            continue
+        except ValueError:
+            return stripped
     return ""
 
 
 def parse_gemini(raw: str) -> str:
-    """Strip the 'Loaded cached credentials.' preamble from gemini output."""
     lines = raw.strip().splitlines()
-    return "\n".join(l for l in lines if "Loaded cached" not in l).strip()
+    return "\n".join(line for line in lines if "Loaded cached" not in line).strip()
 
 
-# ── agent callers ─────────────────────────────────────────────────────────────
-
-async def call_codex(prompt: str) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "codex", "exec",
-        "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--ephemeral",
-        "-C", SCRIPT_DIR,
-        prompt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SEC)
-    return parse_codex(stdout.decode("utf-8", errors="replace"))
+def parse_claude(raw: str) -> str:
+    return raw.strip()
 
 
-async def call_gemini(prompt: str) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "gemini", "-p", prompt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SEC)
-    return parse_gemini(stdout.decode("utf-8", errors="replace"))
-
-
-async def call_claude(prompt: str) -> str:
-    """Call claude -p. Works when NOT nested inside a Claude Code session."""
-    env = {**os.environ, "CLAUDECODE": ""}  # unset nesting guard
-    proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", prompt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=env,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SEC)
-    raw = stdout.decode("utf-8", errors="replace").strip()
-    # Strip any leading/trailing tool-use noise — claude -p is usually clean
-    return raw
-
-
-CALLERS = {
-    "CLAUDE": call_claude,
-    "CODEX":  call_codex,
-    "GEMINI": call_gemini,
+PARSERS = {
+    "CLAUDE": parse_claude,
+    "CODEX": parse_codex,
+    "GEMINI": parse_gemini,
 }
 
 
-# ── routing ───────────────────────────────────────────────────────────────────
+async def call_agent(agent: dict[str, Any], prompt: str) -> str:
+    env = dict(os.environ)
+    if agent["name"] == "CLAUDE":
+        env["CLAUDECODE"] = ""
 
-async def route_to(name: str, prompt: str, log_path: str, lock: asyncio.Lock):
-    """Call one agent and append its reply."""
+    cmd = [agent["cmd"], *agent["args"], prompt]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(SCRIPT_DIR),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
     try:
-        reply = await CALLERS[name](prompt)
-        if reply:
-            await append_reply(lock, log_path, name, reply)
-            print(f"  {name} replied ({len(reply)} chars)", flush=True)
-        else:
-            print(f"  {name}: empty reply", flush=True)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=agent["timeout"])
     except asyncio.TimeoutError:
-        print(f"  {name}: timed out ({TIMEOUT_SEC}s)", flush=True)
-    except Exception as e:
-        print(f"  {name}: error — {e}", flush=True)
+        proc.kill()
+        try:
+            await proc.communicate()
+        except Exception:
+            pass
+        raise
+
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
+    if stderr_text:
+        relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"exit code {proc.returncode}")
+
+    raw = stdout.decode("utf-8", errors="replace")
+    parser = PARSERS.get(agent["name"], parse_claude)
+    return parser(raw)
 
 
-# ── main loop ─────────────────────────────────────────────────────────────────
+async def route_to(
+    agent: dict[str, Any],
+    prompt: str,
+    log_path: Path,
+    write_lock: asyncio.Lock,
+) -> None:
+    name = agent["name"]
+    try:
+        reply = await call_agent(agent, prompt)
+        if reply:
+            await append_reply(write_lock, log_path, name, reply)
+            relay_log(f"{name} replied ({len(reply)} chars)")
+        else:
+            relay_log(f"{name}: empty reply")
+    except FileNotFoundError:
+        relay_log(f"{name}: command not found: {agent['cmd']}")
+    except asyncio.TimeoutError:
+        relay_log(f"{name}: timed out after {agent['timeout']}s")
+    except Exception as exc:
+        relay_log(f"{name}: error: {exc}")
 
-async def main(log_path: str):
-    lock = asyncio.Lock()
 
-    if not os.path.exists(log_path):
-        open(log_path, "a").close()
+async def run_relay(config: dict[str, Any]) -> int:
+    workspace = config["workspace"]
+    log_path: Path = workspace["log_path"]
+    lock_path: Path = workspace["lock_path"]
+    poll_sec = workspace["poll_sec"]
+    context_len = workspace["context_len"]
+    lock_ttl = config["locks"]["ttl"]
+    enabled_agents = [agent for agent in config["agents"] if agent["enabled"]]
+    managed_names = {agent["name"] for agent in enabled_agents}
+    write_lock = asyncio.Lock()
 
-    last_size = os.path.getsize(log_path)
+    if not enabled_agents:
+        raise ValueError("no enabled agents configured")
 
-    print(f"[relay] watching {log_path}")
-    print(f"[relay] routing to: {', '.join(AGENTS)}")
-    print(f"[relay] Claude handled by your Claude Code session")
-    print(f"[relay] poll={POLL_SEC}s  timeout={TIMEOUT_SEC}s")
-    print()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
+    last_size = log_path.stat().st_size
 
-    while True:
-        await asyncio.sleep(POLL_SEC)
+    relay_log(f"watching {log_path}")
+    relay_log(f"routing to: {', '.join(agent['name'] for agent in enabled_agents)}")
+    relay_log(
+        "poll="
+        f"{poll_sec}s context_len={context_len} lock_ttl={lock_ttl}s "
+        f"timeouts={[agent['timeout'] for agent in enabled_agents]}"
+    )
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
+            break
+        except asyncio.TimeoutError:
+            pass
 
         try:
-            cur_size = os.path.getsize(log_path)
-        except OSError:
-            continue
+            cur_size = log_path.stat().st_size
+        except FileNotFoundError:
+            log_path.touch(exist_ok=True)
+            cur_size = 0
+
+        if cur_size < last_size:
+            last_size = 0
         if cur_size <= last_size:
             continue
 
-        with open(log_path, "r") as f:
-            content = f.read()
+        content = read_text(log_path)
         last_size = cur_size
 
         speaker = last_speaker(content)
-        if not speaker:
-            continue
-        # Don't re-route our own agents' replies
-        if speaker in AGENTS:
+        if not speaker or speaker.upper() in managed_names:
             continue
 
-        context = content[-CONTEXT_LEN:]
-        targets = [a for a in AGENTS]
-        print(f"[relay] [{speaker}] spoke → {', '.join(targets)}", flush=True)
+        relay_log(f"[{speaker}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
-        # Adaptive jitter before responding
-        jitter = activity_jitter(content)
-        await asyncio.sleep(jitter)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=activity_jitter(content))
+            break
+        except asyncio.TimeoutError:
+            pass
 
-        # Re-check: if someone responded during the jitter, skip
-        with open(log_path, "r") as f:
-            fresh = f.read()
-        if last_speaker(fresh) in AGENTS:
-            last_size = os.path.getsize(log_path)
+        fresh = read_text(log_path)
+        fresh_speaker = last_speaker(fresh)
+        if not fresh_speaker or fresh_speaker.upper() in managed_names:
+            last_size = log_path.stat().st_size
             continue
 
-        # Acquire speaker lock
-        if not acquire_lock("relay"):
-            print(f"[relay] lock held by another speaker, skipping", flush=True)
-            last_size = os.path.getsize(log_path)
+        if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
+            relay_log("speaker.lock is active; skipping this cycle")
+            last_size = log_path.stat().st_size
             continue
 
+        context = fresh[-context_len:]
         prompts = {
-            name: PROMPT_TEMPLATE.format(name=name.capitalize(), context=context)
-            for name in targets
+            agent["name"]: PROMPT_TEMPLATE.format(name=agent["name"].capitalize(), context=context)
+            for agent in enabled_agents
         }
+
         try:
             await asyncio.gather(
-                *[route_to(name, prompts[name], log_path, lock) for name in targets],
-                return_exceptions=True,
+                *[
+                    route_to(agent, prompts[agent["name"]], log_path, write_lock)
+                    for agent in enabled_agents
+                ]
             )
         finally:
-            release_lock()
+            release_lock(lock_path)
 
-        # Re-read size after writes so we don't re-trigger on our own appends
-        last_size = os.path.getsize(log_path)
+        last_size = log_path.stat().st_size
+
+    relay_log("stopped")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="clcod relay")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.json",
+    )
+    parser.add_argument(
+        "--log",
+        help="Override the configured shared log path",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    config = load_config(args.config)
+    if args.log:
+        config["workspace"]["log_path"] = resolve_path(Path.cwd(), args.log)
+    return asyncio.run(run_relay(config))
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="clcodgemmix relay")
-    ap.add_argument("--log", default=DEFAULT_LOG, help="Path to shared log file")
-    args = ap.parse_args()
     try:
-        asyncio.run(main(args.log))
+        raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\n[relay] stopped")
+        relay_log("stopped")

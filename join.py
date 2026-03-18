@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-join.py — Join the clcodgemmix shared chat room from your terminal.
+join.py - Join the clcodgemmix shared chat room from your terminal.
 
 Usage:
     python3 join.py --name Farhan
+    python3 join.py --name Farhan --config ./config.json
     python3 join.py --name Farhan --log ./clcodgemmix.txt
 """
 
-import asyncio
-import argparse
-import fcntl
-import os
-import sys
-from datetime import datetime, timezone
+from __future__ import annotations
 
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LOG = os.path.join(SCRIPT_DIR, "clcodgemmix.txt")
+import argparse
+import asyncio
+import fcntl
+import json
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SCRIPT_DIR / "config.json"
+DEFAULT_LOG = SCRIPT_DIR / "clcodgemmix.txt"
 
 # ANSI colours per speaker
 COLOURS = {
@@ -38,19 +42,47 @@ def colour_line(line: str) -> str:
     return f"{DIM}{stripped}{RESET}" if stripped else ""
 
 
-def append_message(log_path: str, name: str, text: str):
+def resolve_log_path(config_path: str | Path, explicit_log: str | None) -> Path:
+    if explicit_log:
+        path = Path(explicit_log).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        return path
+
+    config_file = Path(config_path).expanduser()
+    if not config_file.is_absolute():
+        config_file = (Path.cwd() / config_file).resolve()
+
+    if config_file.exists():
+        try:
+            config = json.loads(config_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid config JSON: {config_file}: {exc}") from exc
+        workspace = config.get("workspace", {})
+        raw_log_path = workspace.get("log_path")
+        if raw_log_path:
+            path = Path(str(raw_log_path)).expanduser()
+            if not path.is_absolute():
+                path = (config_file.parent / path).resolve()
+            return path
+
+    return DEFAULT_LOG
+
+
+def append_message(log_path: Path, name: str, text: str) -> None:
     entry = f"\n[{name.upper()}]\n{text.strip()}\n"
-    with open(log_path, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(entry)
-        fcntl.flock(f, fcntl.LOCK_UN)
+    with log_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(entry)
+        handle.flush()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-async def tail_log(log_path: str):
+async def tail_log(log_path: Path) -> None:
     """Print new lines from the log as they appear."""
-    with open(log_path, "r") as f:
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
         # Show last 30 lines on join
-        content = f.read()
+        content = handle.read()
         recent = content.strip().split("\n")[-30:]
         for line in recent:
             coloured = colour_line(line)
@@ -60,7 +92,7 @@ async def tail_log(log_path: str):
 
         # Now tail
         while True:
-            line = f.readline()
+            line = handle.readline()
             if line:
                 coloured = colour_line(line.rstrip("\n"))
                 if coloured:
@@ -70,7 +102,7 @@ async def tail_log(log_path: str):
                 await asyncio.sleep(0.3)
 
 
-async def read_input(log_path: str, name: str):
+async def read_input(log_path: Path, name: str) -> None:
     """Read user input and append to log."""
     loop = asyncio.get_event_loop()
     while True:
@@ -88,14 +120,15 @@ async def read_input(log_path: str, name: str):
             append_message(log_path, name, text)
 
 
-async def main(name: str, log_path: str):
-    if not os.path.exists(log_path):
-        open(log_path, "a").close()
+async def main(name: str, log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
 
     print(f"\n{BOLD}clcodgemmix — shared room{RESET}")
-    print(f"{DIM}You are: {name.upper()}.  Type to speak.  /quit to leave.{RESET}")
+    print(f"{DIM}You are: {name.upper()}. Type to speak. /quit to leave.{RESET}")
+    print(f"{DIM}Log: {log_path}{RESET}")
 
-    tail_task  = asyncio.create_task(tail_log(log_path))
+    tail_task = asyncio.create_task(tail_log(log_path))
     input_task = asyncio.create_task(read_input(log_path, name))
 
     done, pending = await asyncio.wait(
@@ -107,11 +140,12 @@ async def main(name: str, log_path: str):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Join the clcodgemmix shared room")
-    ap.add_argument("--name", required=True, help="Your display name")
-    ap.add_argument("--log",  default=DEFAULT_LOG, help="Path to shared log")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Join the clcodgemmix shared room")
+    parser.add_argument("--name", required=True, help="Your display name")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to config.json")
+    parser.add_argument("--log", help="Path to shared log")
+    args = parser.parse_args()
     try:
-        asyncio.run(main(args.name, args.log))
+        asyncio.run(main(args.name, resolve_log_path(args.config, args.log)))
     except KeyboardInterrupt:
         print(f"\n{DIM}Disconnected.{RESET}")
