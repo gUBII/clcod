@@ -60,7 +60,7 @@
           <div class="workspace__header">
             <div>
               <p class="hero__eyebrow">Live Workspace</p>
-              <h2>Transcript and engine telemetry</h2>
+              <h2>Transcript, engine control, and room input</h2>
             </div>
             <div class="workspace__meta">
               <span id="workspaceRelay">relay: ready</span>
@@ -71,8 +71,8 @@
           <div class="workspace__grid">
             <section class="panel panel--status">
               <div class="panel__header">
-                <h3>Engines</h3>
-                <span class="panel__hint">truthful mirrors only</span>
+                <h3>Engine Control</h3>
+                <span class="panel__hint">model and effort live settings</span>
               </div>
               <div id="statusGrid" class="status-grid"></div>
             </section>
@@ -85,6 +85,30 @@
               <div id="transcript" class="transcript"></div>
             </section>
           </div>
+
+          <section class="panel panel--composer">
+            <div class="panel__header">
+              <div>
+                <h3>Send To Room</h3>
+                <span class="panel__hint">web composer writes directly into the shared transcript</span>
+              </div>
+              <p class="composer__meta">use this when you want the app to act as your terminal join client</p>
+            </div>
+            <form id="chatForm" class="composer">
+              <div class="composer__top">
+                <label class="field">
+                  <span class="field__label">Sender</span>
+                  <input id="senderName" name="senderName" type="text" maxlength="40" placeholder="Operator" required>
+                </label>
+                <button type="submit" id="sendButton">Send To Room</button>
+              </div>
+              <label class="field field--message">
+                <span class="field__label">Message</span>
+                <textarea id="chatInput" name="message" rows="5" maxlength="8000" placeholder="Ask the room something precise. The relay will pick it up from the transcript."></textarea>
+              </label>
+              <p class="composer__status" id="chatStatus"></p>
+            </form>
+          </section>
         </section>
       </main>
     </div>

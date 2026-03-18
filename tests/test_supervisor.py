@@ -38,6 +38,40 @@ class SupervisorTests(unittest.TestCase):
             "ready",
         )
 
+    def test_build_agent_state_exposes_control_metadata(self):
+        payload = supervisor.build_agent_state(
+            {
+                "mirror_mode": "resume",
+                "selected_model": "sonnet",
+                "selected_effort": "high",
+                "model_options": [{"id": "default"}, {"id": "sonnet"}],
+                "effort_options": [{"id": "default"}, {"id": "high"}],
+                "effort_matrix": {"sonnet": ["default", "high"]},
+            }
+        )
+
+        self.assertEqual(payload["selected_model"], "sonnet")
+        self.assertEqual(payload["selected_effort"], "high")
+        self.assertEqual(payload["mirror_mode"], "resume")
+        self.assertEqual(payload["effort_matrix"], {"sonnet": ["default", "high"]})
+
+    def test_build_resume_mirror_command_prefixes_selection_args(self):
+        command = supervisor.build_resume_mirror_command(
+            {
+                "cmd": "claude",
+                "mirror_resume_args": ["--resume", "{session_id}"],
+                "model_arg": ["--model", "{value}"],
+                "effort_arg": ["--effort", "{value}"],
+                "model_options": [{"id": "default", "value": None}, {"id": "sonnet", "value": "sonnet"}],
+                "effort_options": [{"id": "default", "value": None}, {"id": "high", "value": "high"}],
+                "selected_model": "sonnet",
+                "selected_effort": "high",
+            },
+            "session-1",
+        )
+
+        self.assertIn("claude --model sonnet --effort high --resume session-1", command)
+
 
 if __name__ == "__main__":
     unittest.main()

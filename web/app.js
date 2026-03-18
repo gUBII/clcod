@@ -15,6 +15,7 @@ const stateNotes = {
 };
 
 const previousStates = new Map();
+const senderStorageKey = "clcod.senderName";
 
 const gate = document.getElementById("gate");
 const engineRoom = document.getElementById("engineRoom");
@@ -31,10 +32,16 @@ const engineCards = document.getElementById("engineCards");
 const statusGrid = document.getElementById("statusGrid");
 const transcript = document.getElementById("transcript");
 const copyTmux = document.getElementById("copyTmux");
+const chatForm = document.getElementById("chatForm");
+const senderName = document.getElementById("senderName");
+const chatInput = document.getElementById("chatInput");
+const chatStatus = document.getElementById("chatStatus");
+const sendButton = document.getElementById("sendButton");
 
 let unlocked = false;
 let transcriptTimer = null;
 let stateTimer = null;
+let latestState = null;
 
 unlockForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -75,6 +82,74 @@ copyTmux.addEventListener("click", async () => {
   }
 });
 
+statusGrid.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-agent][data-kind][data-option]");
+  if (!button || button.disabled) {
+    return;
+  }
+
+  const agent = button.dataset.agent;
+  const kind = button.dataset.kind;
+  const option = button.dataset.option;
+  const payload = latestState?.agents?.[agent];
+  if (!payload) {
+    return;
+  }
+
+  const body = {
+    selected_model: kind === "model" ? option : payload.selected_model,
+    selected_effort: kind === "effort" ? option : payload.selected_effort,
+  };
+
+  setControlMessage(agent, `Updating ${kind}...`);
+  const response = await fetch(`/api/agents/${agent}/settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    setControlMessage(agent, "Update failed.");
+    return;
+  }
+
+  const result = await response.json();
+  renderState(result.state);
+  setControlMessage(agent, `${kind} set to ${option}.`);
+});
+
+chatForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = String(senderName.value || "").trim();
+  const message = String(chatInput.value || "").trim();
+  if (!name || !message) {
+    chatStatus.textContent = "Sender and message are required.";
+    return;
+  }
+
+  sendButton.disabled = true;
+  chatStatus.textContent = "Writing message into the room...";
+  localStorage.setItem(senderStorageKey, name);
+
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, message }),
+  });
+
+  sendButton.disabled = false;
+  if (!response.ok) {
+    chatStatus.textContent = "Message failed.";
+    return;
+  }
+
+  const result = await response.json();
+  chatInput.value = "";
+  chatStatus.textContent = "Message posted to the transcript.";
+  renderState(result.state);
+  await pollTranscript();
+});
+
 function startPolling() {
   if (stateTimer) {
     clearInterval(stateTimer);
@@ -113,6 +188,7 @@ async function pollTranscript() {
 }
 
 function renderState(state) {
+  latestState = state;
   const phase = state.app?.phase || "booting";
   appPhase.textContent = phase.toUpperCase();
   relayState.textContent = `relay: ${state.relay?.state || "unknown"}`;
@@ -120,7 +196,7 @@ function renderState(state) {
   workspaceRelay.textContent = relayState.textContent;
   workspaceTmux.textContent = tmuxState.textContent;
   tmuxCommand.textContent = state.tmux?.attach_command || "tmux attach -t triagent";
-
+  hydrateSender(state.app?.default_sender || "Operator");
   renderEngines(state.agents || {});
 
   if (!unlocked) {
@@ -132,6 +208,28 @@ function renderState(state) {
   } else {
     showEngineRoom();
   }
+}
+
+function hydrateSender(defaultSender) {
+  const remembered = localStorage.getItem(senderStorageKey);
+  if (!senderName.value.trim()) {
+    senderName.value = remembered || defaultSender;
+  }
+}
+
+function labelForOption(options, optionId, fallback = "default") {
+  const match = (options || []).find((option) => option.id === optionId);
+  return match?.label || fallback;
+}
+
+function allowedEffortIds(payload) {
+  const matrix = payload.effort_matrix || {};
+  const selectedModel = payload.selected_model || "default";
+  const fromMatrix = matrix[selectedModel] || matrix.default;
+  if (Array.isArray(fromMatrix) && fromMatrix.length > 0) {
+    return new Set(fromMatrix);
+  }
+  return new Set((payload.effort_options || []).map((option) => option.id));
 }
 
 function renderEngines(agents) {
@@ -153,9 +251,10 @@ function renderEngines(agents) {
         <div class="engine__beam"></div>
       </div>
       <p class="engine__note">${stateNotes[state] || ""}</p>
-      <div class="engine__meta">
+      <div class="engine__meta engine__meta--stack">
         <span>mirror: ${(payload.mirror_view || payload.mirror_mode || "log").toUpperCase()}</span>
-        <span>${payload.session_id ? payload.session_id.slice(0, 8) : "pending"}</span>
+        <span>model: ${labelForOption(payload.model_options, payload.selected_model, "default")}</span>
+        <span>effort: ${labelForOption(payload.effort_options, payload.selected_effort, "default")}</span>
       </div>
     `;
 
@@ -166,24 +265,79 @@ function renderEngines(agents) {
     previousStates.set(name, state);
     engineCards.appendChild(card);
 
-    const status = document.createElement("div");
-    status.className = `status status--${state}`;
-    status.innerHTML = `
-      <div>
-        <p class="status__name">${name}</p>
-        <p class="status__detail">${payload.pane_target || "no pane"}</p>
+    const control = document.createElement("article");
+    control.className = `control control--${state}`;
+    control.dataset.agent = name;
+    control.innerHTML = `
+      <div class="control__header">
+        <div>
+          <p class="control__name">${name}</p>
+          <p class="control__detail">${payload.pane_target || "no pane target"}</p>
+        </div>
+        <div class="control__status">
+          <span>${stateLabels[state] || state}</span>
+          <span>${(payload.mirror_view || payload.mirror_mode || "log").toUpperCase()}</span>
+        </div>
       </div>
-      <div class="status__meta">
-        <span>${payload.mirror_view || payload.mirror_mode || "log"}</span>
-        <span>${stateLabels[state] || state}</span>
+      <div class="control__section">
+        <p class="control__label">Model</p>
+        <div class="chip-row">
+          ${renderChoiceButtons(name, "model", payload.model_options || [], payload.selected_model || "default")}
+        </div>
       </div>
+      <div class="control__section">
+        <p class="control__label">Effort</p>
+        <div class="chip-row">
+          ${renderChoiceButtons(
+            name,
+            "effort",
+            (payload.effort_options || []).filter((option) => allowedEffortIds(payload).has(option.id)),
+            payload.selected_effort || "default",
+          )}
+        </div>
+      </div>
+      <p class="control__message" data-control-message>${payload.last_error || ""}</p>
     `;
-    statusGrid.appendChild(status);
+    statusGrid.appendChild(control);
+  }
+}
+
+function renderChoiceButtons(agent, kind, options, selectedId) {
+  if (!options || options.length === 0) {
+    return `<span class="chip chip--empty">Not supported</span>`;
+  }
+  return options
+    .map((option) => {
+      const active = option.id === selectedId;
+      return `
+        <button
+          type="button"
+          class="chip ${active ? "chip--active" : ""}"
+          data-agent="${agent}"
+          data-kind="${kind}"
+          data-option="${option.id}"
+          aria-pressed="${active ? "true" : "false"}"
+          title="${option.description || option.label}"
+        >${option.label}</button>
+      `;
+    })
+    .join("");
+}
+
+function setControlMessage(agent, message) {
+  const card = statusGrid.querySelector(`[data-agent="${agent}"]`);
+  const target = card?.querySelector("[data-control-message]");
+  if (target) {
+    target.textContent = message;
   }
 }
 
 function renderTranscript(entries) {
   transcript.innerHTML = "";
+  if (!entries.length) {
+    transcript.innerHTML = `<p class="transcript__empty">No transcript entries yet.</p>`;
+    return;
+  }
   for (const entry of entries) {
     const item = document.createElement("article");
     item.className = "message";

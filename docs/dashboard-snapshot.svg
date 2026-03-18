@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1020" viewBox="0 0 1600 1020" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="40" x2="1460" y2="980" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10253d"/>
+      <stop offset="0.42" stop-color="#091421"/>
+      <stop offset="1" stop-color="#03080f"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(250 80) rotate(29.3) scale(520 340)">
+      <stop stop-color="#245F92" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#245F92" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1310 160) rotate(122) scale(420 280)">
+      <stop stop-color="#FF7043" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#FF7043" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shell" x1="100" y1="82" x2="1520" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A1522" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#07111C" stop-opacity="0.98"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#122033" stop-opacity="0.92"/>
+      <stop offset="1" stop-color="#09111B" stop-opacity="0.94"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FFD27C"/>
+      <stop offset="1" stop-color="#FF8E57"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7CF5D0" stop-opacity="0.2"/>
+      <stop offset="0.48" stop-color="#8CC7FF" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#E8EEF7" stop-opacity="0.12"/>
+    </linearGradient>
+    <filter id="shadow" x="-80" y="-80" width="1760" height="1180" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="28" stdDeviation="38" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <style>
+      .display { font-family: 'Avenir Next', 'Segoe UI', sans-serif; }
+      .mono { font-family: 'SF Mono', 'Menlo', monospace; }
+      .title { fill: #E8EEF7; font-weight: 700; letter-spacing: -0.03em; }
+      .body { fill: #E8EEF7; font-family: 'Avenir Next', 'Segoe UI', sans-serif; }
+      .muted { fill: #8DA0B6; font-family: 'Avenir Next', 'Segoe UI', sans-serif; }
+      .eyebrow { fill: #8DA0B6; font-family: 'Avenir Next', 'Segoe UI', sans-serif; font-size: 12px; letter-spacing: 0.24em; text-transform: uppercase; }
+      .mono-small { fill: #8DA0B6; font-family: 'SF Mono', 'Menlo', monospace; font-size: 15px; }
+      .chip { fill: rgba(255,255,255,0.07); stroke: rgba(255,255,255,0.12); stroke-width: 1; }
+      .chip-text { fill: #E8EEF7; font-family: 'SF Mono', 'Menlo', monospace; font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
+      .chip-active { fill: rgba(255,210,124,0.18); stroke: rgba(255,210,124,0.55); stroke-width: 1; }
+      .chip-ready { fill: rgba(112,240,194,0.14); stroke: rgba(112,240,194,0.46); stroke-width: 1; }
+      .chip-log { fill: rgba(140,199,255,0.12); stroke: rgba(140,199,255,0.35); stroke-width: 1; }
+      .line { stroke: rgba(158,190,219,0.14); stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1020" fill="url(#bg)"/>
+  <rect width="1600" height="1020" fill="url(#glowA)"/>
+  <rect width="1600" height="1020" fill="url(#glowB)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="58" width="1460" height="904" rx="34" fill="url(#shell)" stroke="rgba(158,190,219,0.16)"/>
+  </g>
+
+  <rect x="104" y="92" width="1392" height="86" rx="24" fill="rgba(4,10,18,0.78)" stroke="rgba(158,190,219,0.16)"/>
+  <text x="138" y="126" class="eyebrow">LOCAL ENGINE SUPERVISOR</text>
+  <text x="138" y="160" class="title display" font-size="36">clcod</text>
+  <rect x="1323" y="112" width="139" height="42" rx="21" fill="rgba(18,32,51,0.8)" stroke="rgba(140,199,255,0.24)"/>
+  <text x="1392.5" y="139" text-anchor="middle" class="chip-text mono" font-size="14" fill="#8CC7FF">READY</text>
+
+  <text x="104" y="220" class="eyebrow">ENGINE ROOM</text>
+  <text x="104" y="258" class="title display" font-size="34">Three agents. One shared room. Real boot states only.</text>
+  <text x="1278" y="220" class="mono-small mono">relay: running</text>
+  <text x="1288" y="246" class="mono-small mono">tmux: running</text>
+
+  <g>
+    <rect x="104" y="292" width="432" height="244" rx="28" fill="url(#panel)" stroke="rgba(158,190,219,0.14)"/>
+    <text x="136" y="336" class="title display" font-size="28">CLAUDE</text>
+    <rect x="382" y="314" width="122" height="30" rx="15" class="chip-ready"/>
+    <text x="443" y="333" text-anchor="middle" class="chip-text mono">READY</text>
+    <rect x="136" y="370" width="368" height="82" rx="41" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.08)"/>
+    <rect x="154" y="388" width="332" height="46" rx="23" fill="url(#beam)"/>
+    <text x="136" y="486" class="muted body" font-size="18">Mirror and routing path are healthy.</text>
+    <rect x="136" y="502" width="92" height="28" rx="14" class="chip-ready"/>
+    <text x="182" y="520" text-anchor="middle" class="chip-text mono" font-size="12">RESUME</text>
+    <rect x="238" y="502" width="96" height="28" rx="14" class="chip"/>
+    <text x="286" y="520" text-anchor="middle" class="chip-text mono" font-size="12">SONNET</text>
+    <rect x="344" y="502" width="108" height="28" rx="14" class="chip"/>
+    <text x="398" y="520" text-anchor="middle" class="chip-text mono" font-size="12">DEFAULT</text>
+  </g>
+
+  <g>
+    <rect x="550" y="292" width="432" height="244" rx="28" fill="url(#panel)" stroke="rgba(158,190,219,0.14)"/>
+    <text x="582" y="336" class="title display" font-size="28">CODEX</text>
+    <rect x="828" y="314" width="122" height="30" rx="15" class="chip-ready"/>
+    <text x="889" y="333" text-anchor="middle" class="chip-text mono">READY</text>
+    <rect x="582" y="370" width="368" height="82" rx="41" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.08)"/>
+    <rect x="600" y="388" width="332" height="46" rx="23" fill="url(#beam)"/>
+    <text x="582" y="486" class="muted body" font-size="18">Mirror and routing path are healthy.</text>
+    <rect x="582" y="502" width="92" height="28" rx="14" class="chip-ready"/>
+    <text x="628" y="520" text-anchor="middle" class="chip-text mono" font-size="12">RESUME</text>
+    <rect x="684" y="502" width="194" height="28" rx="14" class="chip"/>
+    <text x="781" y="520" text-anchor="middle" class="chip-text mono" font-size="12">GPT-5.1-CODEX-MINI</text>
+    <rect x="888" y="502" width="82" height="28" rx="14" class="chip-active"/>
+    <text x="929" y="520" text-anchor="middle" class="chip-text mono" font-size="12">MEDIUM</text>
+  </g>
+
+  <g>
+    <rect x="996" y="292" width="500" height="244" rx="28" fill="url(#panel)" stroke="rgba(158,190,219,0.14)"/>
+    <text x="1028" y="336" class="title display" font-size="28">GEMINI</text>
+    <rect x="1344" y="314" width="120" height="30" rx="15" class="chip-ready"/>
+    <text x="1404" y="333" text-anchor="middle" class="chip-text mono">READY</text>
+    <rect x="1028" y="370" width="404" height="82" rx="41" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.08)"/>
+    <rect x="1046" y="388" width="368" height="46" rx="23" fill="url(#beam)"/>
+    <text x="1028" y="486" class="muted body" font-size="18">Mirror and routing path are healthy.</text>
+    <rect x="1028" y="502" width="76" height="28" rx="14" class="chip-log"/>
+    <text x="1066" y="520" text-anchor="middle" class="chip-text mono" font-size="12">LOG</text>
+    <rect x="1114" y="502" width="108" height="28" rx="14" class="chip"/>
+    <text x="1168" y="520" text-anchor="middle" class="chip-text mono" font-size="12">DEFAULT</text>
+    <rect x="1232" y="502" width="108" height="28" rx="14" class="chip"/>
+    <text x="1286" y="520" text-anchor="middle" class="chip-text mono" font-size="12">DEFAULT</text>
+  </g>
+
+  <rect x="104" y="564" width="1392" height="92" rx="24" fill="rgba(12,21,34,0.84)" stroke="rgba(158,190,219,0.16)"/>
+  <text x="136" y="598" class="eyebrow">DEBUG MIRROR</text>
+  <text x="136" y="630" class="mono-small mono" fill="#E8EEF7">tmux attach -t triagent</text>
+  <rect x="1278" y="587" width="184" height="42" rx="21" fill="url(#accent)"/>
+  <text x="1370" y="613" text-anchor="middle" class="chip-text mono" fill="#041018">COPY TMUX COMMAND</text>
+
+  <text x="104" y="714" class="eyebrow">LIVE WORKSPACE</text>
+  <text x="104" y="752" class="title display" font-size="32">Transcript, engine control, and room input</text>
+  <text x="1284" y="714" class="mono-small mono">relay: ready</text>
+  <text x="1284" y="740" class="mono-small mono">tmux: running</text>
+
+  <rect x="104" y="784" width="426" height="146" rx="24" fill="rgba(12,21,34,0.9)" stroke="rgba(158,190,219,0.16)"/>
+  <text x="136" y="822" class="title display" font-size="22">Engine Control</text>
+  <text x="386" y="822" class="eyebrow">MODEL AND EFFORT LIVE SETTINGS</text>
+  <line x1="136" y1="844" x2="498" y2="844" class="line"/>
+  <text x="136" y="872" class="body display" font-size="16">CLAUDE</text>
+  <text x="136" y="900" class="body display" font-size="16">CODEX</text>
+  <rect x="220" y="856" width="78" height="24" rx="12" class="chip-active"/>
+  <text x="259" y="872" text-anchor="middle" class="chip-text mono" font-size="11">SONNET</text>
+  <rect x="304" y="856" width="82" height="24" rx="12" class="chip"/>
+  <text x="345" y="872" text-anchor="middle" class="chip-text mono" font-size="11">DEFAULT</text>
+  <rect x="220" y="884" width="164" height="24" rx="12" class="chip-active"/>
+  <text x="302" y="900" text-anchor="middle" class="chip-text mono" font-size="11">GPT-5.1-CODEX-MINI</text>
+  <rect x="390" y="884" width="74" height="24" rx="12" class="chip-active"/>
+  <text x="427" y="900" text-anchor="middle" class="chip-text mono" font-size="11">MEDIUM</text>
+
+  <rect x="550" y="784" width="946" height="146" rx="24" fill="rgba(12,21,34,0.9)" stroke="rgba(158,190,219,0.16)"/>
+  <text x="582" y="822" class="title display" font-size="22">Transcript</text>
+  <text x="860" y="822" class="eyebrow">LATEST ROOM TRAFFIC</text>
+  <line x1="582" y1="844" x2="1464" y2="844" class="line"/>
+  <text x="582" y="874" class="mono-small mono" fill="#FFD27C">FARHAN</text>
+  <text x="690" y="874" class="body display" font-size="17">UI composer smoke test from the web control surface.</text>
+  <text x="582" y="902" class="mono-small mono" fill="#70F0C2">CODEX</text>
+  <text x="690" y="902" class="body display" font-size="17">Selectors are live. Preferences persisted. Mirror remains truthful.</text>
+
+  <rect x="104" y="946" width="1392" height="38" rx="19" fill="rgba(12,21,34,0.9)" stroke="rgba(158,190,219,0.16)"/>
+  <text x="128" y="970" class="mono-small mono" fill="#8DA0B6">Send To Room</text>
+  <rect x="248" y="954" width="188" height="22" rx="11" class="chip"/>
+  <text x="342" y="969" text-anchor="middle" class="chip-text mono" font-size="11">Sender: Operator</text>
+  <rect x="456" y="954" width="816" height="22" rx="11" fill="rgba(5,10,18,0.94)" stroke="rgba(140,199,255,0.22)"/>
+  <text x="480" y="970" class="mono-small mono" fill="#8DA0B6">Ask the room something precise. The relay will pick it up from the transcript.</text>
+  <rect x="1292" y="950" width="172" height="30" rx="15" fill="url(#accent)"/>
+  <text x="1378" y="970" text-anchor="middle" class="chip-text mono" fill="#041018">SEND TO ROOM</text>
+</svg>

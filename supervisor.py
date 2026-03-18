@@ -43,19 +43,28 @@ def build_ui_url(config: dict[str, Any]) -> str:
     return f"http://{ui['host']}:{ui['port']}"
 
 
+def build_agent_state(agent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "state": "starting",
+        "session_id": None,
+        "mirror_mode": agent["mirror_mode"],
+        "mirror_view": "log",
+        "pane_target": None,
+        "pane_command": None,
+        "last_error": None,
+        "last_reply_at": None,
+        "selected_model": agent.get("selected_model", "default"),
+        "selected_effort": agent.get("selected_effort", "default"),
+        "model_options": agent.get("model_options", []),
+        "effort_options": agent.get("effort_options", []),
+        "effort_matrix": agent.get("effort_matrix", {}),
+    }
+
+
 def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
     session = config["tmux"]["session"]
     agents = {
-        agent["name"]: {
-            "state": "starting",
-            "session_id": None,
-            "mirror_mode": agent["mirror_mode"],
-            "mirror_view": "log",
-            "pane_target": None,
-            "pane_command": None,
-            "last_error": None,
-            "last_reply_at": None,
-        }
+        agent["name"]: build_agent_state(agent)
         for agent in config["agents"]
         if agent["enabled"]
     }
@@ -63,6 +72,7 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
         "app": {
             "phase": "booting",
             "ui_url": build_ui_url(config),
+            "default_sender": config["ui"]["default_sender"],
         },
         "relay": {
             "state": "starting",
@@ -117,7 +127,7 @@ def build_resume_mirror_command(agent: dict[str, Any], session_id: str) -> str:
         item.format_map({"session_id": session_id})
         for item in agent.get("mirror_resume_args", [])
     ]
-    cmd = [agent["cmd"], *args]
+    cmd = [agent["cmd"], *relay.build_selection_args(agent), *args]
     return "cd {} && exec {}".format(
         shlex.quote(str(SCRIPT_DIR)),
         " ".join(shlex.quote(part) for part in cmd),
@@ -178,6 +188,8 @@ class RuntimeSupervisor:
         self.config = config
         self.session = config["tmux"]["session"]
         self.workspace = config["workspace"]
+        self.settings_lock = threading.Lock()
+        self.apply_saved_preferences()
         self.state = StateStore(config)
         self.stop_event = asyncio.Event()
         self.auth_tokens: set[str] = set()
@@ -189,6 +201,130 @@ class RuntimeSupervisor:
     def password(self) -> str:
         env_name = self.config["ui"]["password_env"]
         return os.environ.get(env_name) or self.config["ui"]["password"]
+
+    def preferences_payload(self) -> dict[str, Any]:
+        data = relay.read_json(self.workspace["preferences_path"], {"agents": {}})
+        if not isinstance(data, dict):
+            return {"agents": {}}
+        agents = data.get("agents", {})
+        if not isinstance(agents, dict):
+            agents = {}
+        return {"agents": agents}
+
+    def save_preferences_payload(self, payload: dict[str, Any]) -> None:
+        relay.write_json(self.workspace["preferences_path"], payload)
+
+    def apply_saved_preferences(self) -> None:
+        preferences = self.preferences_payload()
+        agent_preferences = preferences.get("agents", {})
+        for agent in self.config["agents"]:
+            if not agent["enabled"]:
+                continue
+            saved = agent_preferences.get(agent["name"], {})
+            if not isinstance(saved, dict):
+                saved = {}
+            agent["selected_model"] = relay.resolve_selected_option(
+                saved.get("selected_model", agent.get("selected_model", "default")),
+                agent.get("model_options", []),
+                str(agent.get("selected_model", "default")),
+            )
+            if agent.get("effort_options"):
+                selected_effort = relay.resolve_selected_option(
+                    saved.get("selected_effort", agent.get("selected_effort", "default")),
+                    agent["effort_options"],
+                    str(agent.get("selected_effort", "default")),
+                )
+                allowed_efforts = set(self.allowed_efforts_for(agent, agent["selected_model"]))
+                if allowed_efforts and selected_effort not in allowed_efforts:
+                    selected_effort = "default" if "default" in allowed_efforts else sorted(allowed_efforts)[0]
+                agent["selected_effort"] = selected_effort
+            else:
+                agent["selected_effort"] = "default"
+
+    def find_agent(self, name: str) -> dict[str, Any] | None:
+        target = name.strip().upper()
+        for agent in self.config["agents"]:
+            if agent["name"] == target and agent["enabled"]:
+                return agent
+        return None
+
+    def persist_agent_preferences(self, agent: dict[str, Any]) -> None:
+        preferences = self.preferences_payload()
+        preferences.setdefault("agents", {})
+        preferences["agents"][agent["name"]] = {
+            "selected_model": agent.get("selected_model", "default"),
+            "selected_effort": agent.get("selected_effort", "default"),
+        }
+        self.save_preferences_payload(preferences)
+
+    def allowed_efforts_for(self, agent: dict[str, Any], selected_model: str) -> list[str]:
+        matrix = agent.get("effort_matrix", {})
+        if isinstance(matrix, dict):
+            allowed = matrix.get(selected_model) or matrix.get("default")
+            if isinstance(allowed, list) and allowed:
+                return [str(item) for item in allowed]
+        return [str(item["id"]) for item in agent.get("effort_options", [])]
+
+    def reset_agent_session(self, name: str) -> None:
+        sessions = relay.load_sessions(self.workspace["sessions_path"])
+        if name in sessions:
+            del sessions[name]
+            relay.save_sessions(self.workspace["sessions_path"], sessions)
+        self.mirror_keys.pop(name, None)
+
+    def update_agent_settings(
+        self,
+        name: str,
+        selected_model: str | None,
+        selected_effort: str | None,
+    ) -> dict[str, Any]:
+        agent = self.find_agent(name)
+        if not agent:
+            raise KeyError(name)
+
+        with self.settings_lock:
+            next_model = relay.resolve_selected_option(
+                selected_model or agent.get("selected_model", "default"),
+                agent.get("model_options", []),
+                str(agent.get("selected_model", "default")),
+            )
+            if agent.get("effort_options"):
+                next_effort = relay.resolve_selected_option(
+                    selected_effort or agent.get("selected_effort", "default"),
+                    agent["effort_options"],
+                    str(agent.get("selected_effort", "default")),
+                )
+                allowed_efforts = set(self.allowed_efforts_for(agent, next_model))
+                if allowed_efforts and next_effort not in allowed_efforts:
+                    next_effort = "default" if "default" in allowed_efforts else sorted(allowed_efforts)[0]
+            else:
+                next_effort = "default"
+
+            changed = (
+                next_model != agent.get("selected_model")
+                or next_effort != agent.get("selected_effort")
+            )
+            agent["selected_model"] = next_model
+            agent["selected_effort"] = next_effort
+            self.persist_agent_preferences(agent)
+            if changed:
+                self.reset_agent_session(agent["name"])
+
+        self.state.patch_agent(
+            agent["name"],
+            {
+                "selected_model": agent["selected_model"],
+                "selected_effort": agent["selected_effort"],
+                "session_id": None if changed else self.state.snapshot()["agents"][agent["name"]].get("session_id"),
+                "mirror_view": "log" if changed else self.state.snapshot()["agents"][agent["name"]].get("mirror_view", "log"),
+                "model_options": agent.get("model_options", []),
+                "effort_options": agent.get("effort_options", []),
+                "effort_matrix": agent.get("effort_matrix", {}),
+            },
+        )
+        if changed:
+            self.sync_agent_mirrors(force=True)
+        return self.state.snapshot()["agents"][agent["name"]]
 
     def tmux(self, *args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -214,11 +350,14 @@ class RuntimeSupervisor:
             self.workspace["relay_log_path"],
             self.workspace["state_path"],
             self.workspace["sessions_path"],
+            self.workspace["preferences_path"],
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
         self.workspace["log_path"].touch(exist_ok=True)
         if not self.workspace["sessions_path"].exists():
             relay.save_sessions(self.workspace["sessions_path"], {})
+        if not self.workspace["preferences_path"].exists():
+            self.save_preferences_payload({"agents": {}})
         for agent in self.config["agents"]:
             if agent["enabled"]:
                 agent["io_log_path"].parent.mkdir(parents=True, exist_ok=True)
@@ -277,6 +416,11 @@ class RuntimeSupervisor:
                         "pane_target": pane_target,
                         "mirror_mode": agent["mirror_mode"],
                         "mirror_view": "log",
+                        "selected_model": agent.get("selected_model", "default"),
+                        "selected_effort": agent.get("selected_effort", "default"),
+                        "model_options": agent.get("model_options", []),
+                        "effort_options": agent.get("effort_options", []),
+                        "effort_matrix": agent.get("effort_matrix", {}),
                     },
                 )
 
@@ -317,6 +461,11 @@ class RuntimeSupervisor:
                     "mirror_view": mirror_view,
                     "pane_target": pane_target,
                     "mirror_mode": agent["mirror_mode"],
+                    "selected_model": agent.get("selected_model", "default"),
+                    "selected_effort": agent.get("selected_effort", "default"),
+                    "model_options": agent.get("model_options", []),
+                    "effort_options": agent.get("effort_options", []),
+                    "effort_matrix": agent.get("effort_matrix", {}),
                 },
             )
 
@@ -447,6 +596,15 @@ class RuntimeSupervisor:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _payload(self) -> dict[str, Any]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(length).decode("utf-8") if length else ""
+                parsed = json.loads(raw or "{}")
+                return parsed if isinstance(parsed, dict) else {}
+
             def _file(self, path: Path, content_type: str) -> None:
                 if not path.exists():
                     self.send_error(HTTPStatus.NOT_FOUND)
@@ -481,24 +639,58 @@ class RuntimeSupervisor:
 
             def do_POST(self) -> None:
                 parsed = urlparse(self.path)
-                if parsed.path != "/api/unlock":
-                    self.send_error(HTTPStatus.NOT_FOUND)
-                    return
+                if parsed.path == "/api/unlock":
+                    payload = self._payload()
+                    if str(payload.get("password", "")) != supervisor.password():
+                        return self._json({"ok": False, "error": "invalid password"}, status=HTTPStatus.UNAUTHORIZED)
 
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                except ValueError:
-                    length = 0
-                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                if str(payload.get("password", "")) != supervisor.password():
-                    return self._json({"ok": False, "error": "invalid password"}, status=HTTPStatus.UNAUTHORIZED)
+                    token = secrets.token_urlsafe(24)
+                    supervisor.auth_tokens.add(token)
+                    headers = {
+                        "Set-Cookie": f"clcod_session={token}; Path=/; HttpOnly; SameSite=Strict"
+                    }
+                    return self._json({"ok": True, "state": supervisor.state.snapshot()}, headers=headers)
 
-                token = secrets.token_urlsafe(24)
-                supervisor.auth_tokens.add(token)
-                headers = {
-                    "Set-Cookie": f"clcod_session={token}; Path=/; HttpOnly; SameSite=Strict"
-                }
-                return self._json({"ok": True, "state": supervisor.state.snapshot()}, headers=headers)
+                if not self._authorized():
+                    return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
+
+                if parsed.path == "/api/chat":
+                    payload = self._payload()
+                    raw_name = str(payload.get("name") or supervisor.config["ui"]["default_sender"]).strip()
+                    raw_message = str(payload.get("message") or "").strip()
+                    if not raw_name:
+                        return self._json({"ok": False, "error": "name is required"}, status=HTTPStatus.BAD_REQUEST)
+                    if not raw_message:
+                        return self._json({"ok": False, "error": "message is required"}, status=HTTPStatus.BAD_REQUEST)
+                    speaker = raw_name.upper()[:40]
+                    relay.append_tagged_entry(supervisor.workspace["log_path"], speaker, raw_message[:8000])
+                    supervisor.state.patch(
+                        "transcript",
+                        {
+                            "last_speaker": speaker,
+                            "last_updated_at": utc_now(),
+                        },
+                    )
+                    return self._json({"ok": True, "state": supervisor.state.snapshot()})
+
+                if parsed.path.startswith("/api/agents/") and parsed.path.endswith("/settings"):
+                    parts = [part for part in parsed.path.split("/") if part]
+                    if len(parts) != 4:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    agent_name = parts[2]
+                    payload = self._payload()
+                    try:
+                        agent_state = supervisor.update_agent_settings(
+                            agent_name,
+                            str(payload.get("selected_model") or "").strip() or None,
+                            str(payload.get("selected_effort") or "").strip() or None,
+                        )
+                    except KeyError:
+                        return self._json({"ok": False, "error": "unknown agent"}, status=HTTPStatus.NOT_FOUND)
+                    return self._json({"ok": True, "agent": agent_state, "state": supervisor.state.snapshot()})
+
+                self.send_error(HTTPStatus.NOT_FOUND)
 
         return Handler
 

@@ -38,6 +38,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "args": ["-p"],
             "invoke_resume_args": ["-p", "--session-id", "{session_id}"],
             "mirror_resume_args": ["--resume", "{session_id}"],
+            "model_arg": ["--model", "{value}"],
+            "effort_arg": ["--effort", "{value}"],
+            "model_options": ["default", "sonnet", "opus"],
+            "effort_options": ["default", "low", "medium", "high", "max"],
             "mirror_mode": "resume",
             "preseed_session_id": True,
             "timeout": 60,
@@ -55,6 +59,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             ],
             "invoke_resume_args": ["exec", "resume", "{session_id}"],
             "mirror_resume_args": ["resume", "--no-alt-screen", "-C", "{script_dir}", "{session_id}"],
+            "model_arg": ["-m", "{value}"],
+            "effort_arg": ["-c", "model_reasoning_effort=\"{value}\""],
             "mirror_mode": "resume",
             "preseed_session_id": False,
             "timeout": 60,
@@ -64,6 +70,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "cmd": "gemini",
             "args": ["-p"],
+            "model_arg": ["--model", "{value}"],
+            "model_options": ["default", "gemini-2.5-pro", "gemini-2.5-flash"],
             "mirror_mode": "log",
             "preseed_session_id": False,
             "timeout": 60,
@@ -78,6 +86,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pid_path": ".clcod-runtime/supervisor.pid",
         "state_path": ".clcod-runtime/state.json",
         "sessions_path": ".clcod-runtime/sessions.json",
+        "preferences_path": ".clcod-runtime/preferences.json",
         "agent_logs_dir": ".clcod-runtime/agents",
     },
     "locks": {
@@ -91,6 +100,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "port": 4173,
         "password_env": "CLCOD_PASSWORD",
         "password": "free",
+        "default_sender": "Operator",
         "open_browser": True,
     },
 }
@@ -107,6 +117,7 @@ SESSION_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 EventCallback = Callable[[dict[str, Any]], None]
+EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 class SafeFormatDict(dict[str, str]):
@@ -167,6 +178,182 @@ def write_json(path: Path, payload: Any) -> None:
     write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def build_option(
+    raw_value: str,
+    *,
+    label: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    value = raw_value.strip()
+    option_value: str | None = None if value == "default" else value
+    return {
+        "id": value,
+        "label": label or ("Default" if value == "default" else value),
+        "value": option_value,
+        "description": description,
+    }
+
+
+def dedupe_options(options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for option in options:
+        option_id = str(option["id"])
+        if option_id in seen:
+            continue
+        seen.add(option_id)
+        result.append(option)
+    return result
+
+
+def effort_rank(value: str) -> int:
+    try:
+        return EFFORT_ORDER.index(value)
+    except ValueError:
+        return len(EFFORT_ORDER)
+
+
+def discover_codex_catalog() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+    cache_path = Path.home() / ".codex" / "models_cache.json"
+    payload = read_json(cache_path, {})
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return [build_option("default")], [build_option("default")], {}
+
+    effort_ids: set[str] = set()
+    effort_matrix: dict[str, list[str]] = {}
+    normalized_models: list[tuple[int, dict[str, Any]]] = []
+
+    for raw_model in models:
+        if not isinstance(raw_model, dict):
+            continue
+        if raw_model.get("visibility") not in {None, "list"}:
+            continue
+        slug = str(raw_model.get("slug", "")).strip()
+        if not slug:
+            continue
+        display_name = str(raw_model.get("display_name") or slug).strip()
+        description = str(raw_model.get("description") or "").strip() or None
+        priority = int(raw_model.get("priority", 9999))
+        normalized_models.append(
+            (
+                priority,
+                build_option(slug, label=display_name, description=description),
+            )
+        )
+        levels = raw_model.get("supported_reasoning_levels", [])
+        if isinstance(levels, list):
+            efforts = []
+            for level in levels:
+                if not isinstance(level, dict):
+                    continue
+                effort = str(level.get("effort", "")).strip()
+                if not effort:
+                    continue
+                effort_ids.add(effort)
+                efforts.append(effort)
+            if efforts:
+                effort_matrix[slug] = ["default", *sorted(set(efforts), key=effort_rank)]
+
+    model_options = [build_option("default")]
+    model_options.extend(option for _, option in sorted(normalized_models, key=lambda item: (item[0], item[1]["label"])))
+    effort_options = [build_option("default")]
+    effort_options.extend(build_option(effort) for effort in sorted(effort_ids, key=effort_rank))
+    return dedupe_options(model_options), dedupe_options(effort_options), effort_matrix
+
+
+def normalize_option_list(
+    raw_options: Any,
+    agent_name: str,
+    field_name: str,
+    fallback_options: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if raw_options in (None, []):
+        return copy.deepcopy(fallback_options)
+    if not isinstance(raw_options, list):
+        raise ValueError(f"{agent_name}: {field_name} must be a list")
+
+    options: list[dict[str, Any]] = []
+    for item in raw_options:
+        if isinstance(item, str):
+            options.append(build_option(item))
+            continue
+        if isinstance(item, dict):
+            option_id = str(item.get("id") or item.get("value") or "").strip()
+            if not option_id:
+                raise ValueError(f"{agent_name}: {field_name} option requires id or value")
+            label = item.get("label")
+            description = item.get("description")
+            options.append(
+                build_option(
+                    option_id,
+                    label=str(label) if label is not None else None,
+                    description=str(description) if description is not None else None,
+                )
+            )
+            continue
+        raise ValueError(f"{agent_name}: {field_name} entries must be strings or objects")
+
+    return dedupe_options(options)
+
+
+def normalize_effort_matrix(raw_matrix: Any, agent_name: str) -> dict[str, list[str]]:
+    if raw_matrix in (None, {}):
+        return {}
+    if not isinstance(raw_matrix, dict):
+        raise ValueError(f"{agent_name}: effort_matrix must be an object")
+    matrix: dict[str, list[str]] = {}
+    for key, value in raw_matrix.items():
+        if not isinstance(value, list):
+            raise ValueError(f"{agent_name}: effort_matrix values must be lists")
+        matrix[str(key)] = [str(item) for item in value]
+    return matrix
+
+
+def default_agent_controls(name: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+    if name == "CODEX":
+        return discover_codex_catalog()
+    if name == "CLAUDE":
+        models = [build_option("default"), build_option("sonnet"), build_option("opus")]
+        efforts = [
+            build_option("default"),
+            build_option("low"),
+            build_option("medium"),
+            build_option("high"),
+            build_option("max"),
+        ]
+        matrix = {
+            "default": ["default", "low", "medium", "high", "max"],
+            "sonnet": ["default", "low", "medium", "high", "max"],
+            "opus": ["default", "low", "medium", "high", "max"],
+        }
+        return models, efforts, matrix
+    if name == "GEMINI":
+        models = [
+            build_option("default"),
+            build_option("gemini-2.5-pro"),
+            build_option("gemini-2.5-flash"),
+        ]
+        return models, [], {}
+    return [build_option("default")], [], {}
+
+
+def resolve_selected_option(
+    selected_id: Any,
+    options: list[dict[str, Any]],
+    fallback_id: str,
+) -> str:
+    valid_ids = {str(item["id"]) for item in options}
+    normalized = str(selected_id or fallback_id or "default")
+    if normalized in valid_ids:
+        return normalized
+    if fallback_id in valid_ids:
+        return fallback_id
+    if options:
+        return str(options[0]["id"])
+    return "default"
+
+
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     config_path = Path(path).expanduser()
     if not config_path.is_absolute():
@@ -210,6 +397,9 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "sessions_path": resolve_path(
             config_dir, str(workspace.get("sessions_path", ".clcod-runtime/sessions.json"))
         ),
+        "preferences_path": resolve_path(
+            config_dir, str(workspace.get("preferences_path", ".clcod-runtime/preferences.json"))
+        ),
         "agent_logs_dir": resolve_path(
             config_dir, str(workspace.get("agent_logs_dir", ".clcod-runtime/agents"))
         ),
@@ -222,6 +412,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "pid_path": str(normalized_workspace["pid_path"]),
             "state_path": str(normalized_workspace["state_path"]),
             "sessions_path": str(normalized_workspace["sessions_path"]),
+            "preferences_path": str(normalized_workspace["preferences_path"]),
             "agent_logs_dir": str(normalized_workspace["agent_logs_dir"]),
         }
     )
@@ -246,6 +437,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         mirror_resume_args = normalize_argv(
             raw_agent.get("mirror_resume_args", []), name, "mirror_resume_args"
         )
+        model_arg = normalize_argv(raw_agent.get("model_arg", []), name, "model_arg")
+        effort_arg = normalize_argv(raw_agent.get("effort_arg", []), name, "effort_arg")
         mirror_mode = str(raw_agent.get("mirror_mode", "log")).strip().lower()
         if mirror_mode not in {"resume", "log"}:
             raise ValueError(f"{name}: mirror_mode must be 'resume' or 'log'")
@@ -254,6 +447,31 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         if not isinstance(raw_preseed_session_id, (bool, str)):
             raise ValueError(f"{name}: preseed_session_id must be a boolean or string")
 
+        default_models, default_efforts, default_effort_matrix = default_agent_controls(name)
+        model_options = normalize_option_list(
+            raw_agent.get("model_options"),
+            name,
+            "model_options",
+            default_models,
+        )
+        effort_options = normalize_option_list(
+            raw_agent.get("effort_options"),
+            name,
+            "effort_options",
+            default_efforts if effort_arg else [],
+        )
+        effort_matrix = normalize_effort_matrix(raw_agent.get("effort_matrix"), name) or default_effort_matrix
+        selected_model = resolve_selected_option(
+            raw_agent.get("selected_model", "default"),
+            model_options,
+            "default",
+        )
+        selected_effort = resolve_selected_option(
+            raw_agent.get("selected_effort", "default"),
+            effort_options or [build_option("default")],
+            "default",
+        )
+
         agent = {
             "name": name,
             "enabled": bool(raw_agent.get("enabled", True)),
@@ -261,6 +479,13 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "args": interpolate(args, variables),
             "invoke_resume_args": interpolate(invoke_resume_args, variables),
             "mirror_resume_args": interpolate(mirror_resume_args, variables),
+            "model_arg": interpolate(model_arg, variables),
+            "effort_arg": interpolate(effort_arg, variables),
+            "model_options": interpolate(model_options, variables),
+            "effort_options": interpolate(effort_options, variables),
+            "effort_matrix": interpolate(effort_matrix, variables),
+            "selected_model": selected_model,
+            "selected_effort": selected_effort if effort_options else "default",
             "mirror_mode": mirror_mode,
             "preseed_session_id": interpolate(raw_preseed_session_id, variables),
             "timeout": int(raw_agent.get("timeout", 60)),
@@ -286,6 +511,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "port": int(ui.get("port", 4173)),
             "password_env": str(ui.get("password_env", "CLCOD_PASSWORD")),
             "password": str(ui.get("password", "free")),
+            "default_sender": str(ui.get("default_sender") or os.environ.get("USER") or "Operator"),
             "open_browser": bool(ui.get("open_browser", True)),
         },
     }
@@ -336,14 +562,19 @@ def release_lock(lock_path: Path) -> None:
         return
 
 
-async def append_reply(write_lock: asyncio.Lock, log_path: Path, speaker: str, text: str) -> None:
+def append_tagged_entry(log_path: Path, speaker: str, text: str) -> None:
     entry = f"\n[{speaker}]\n{text.strip()}\n"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(entry)
+        handle.flush()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+async def append_reply(write_lock: asyncio.Lock, log_path: Path, speaker: str, text: str) -> None:
     async with write_lock:
-        with log_path.open("a", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            handle.write(entry)
-            handle.flush()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        append_tagged_entry(log_path, speaker, text)
 
 
 def parse_codex(raw: str) -> str:
@@ -457,6 +688,29 @@ def extract_session_id(agent: dict[str, Any], raw: str, stderr_text: str, sessio
     return session_id
 
 
+def option_value(options: list[dict[str, Any]], option_id: str) -> str | None:
+    for option in options:
+        if str(option["id"]) == option_id:
+            value = option.get("value")
+            return str(value) if value is not None else None
+    return None
+
+
+def build_selection_args(agent: dict[str, Any]) -> list[str]:
+    args: list[str] = []
+    selected_model = str(agent.get("selected_model") or "default")
+    model_value = option_value(agent.get("model_options", []), selected_model)
+    if model_value and agent.get("model_arg"):
+        args.extend(item.format_map({"value": model_value}) for item in agent["model_arg"])
+
+    selected_effort = str(agent.get("selected_effort") or "default")
+    effort_value = option_value(agent.get("effort_options", []), selected_effort)
+    if effort_value and agent.get("effort_arg"):
+        args.extend(item.format_map({"value": effort_value}) for item in agent["effort_arg"])
+
+    return args
+
+
 def build_agent_command(
     agent: dict[str, Any], prompt: str, session_id: str | None
 ) -> tuple[list[str], str | None]:
@@ -469,7 +723,8 @@ def build_agent_command(
     if effective_session_id and agent["invoke_resume_args"]:
         args = [str(item).format_map({"session_id": effective_session_id}) for item in agent["invoke_resume_args"]]
 
-    return [agent["cmd"], *args, prompt], effective_session_id
+    selection_args = build_selection_args(agent)
+    return [agent["cmd"], *selection_args, *args, prompt], effective_session_id
 
 
 def seed_sessions(path: Path, agents: list[dict[str, Any]]) -> dict[str, str]:

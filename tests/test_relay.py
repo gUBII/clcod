@@ -77,6 +77,7 @@ class RelayTests(unittest.TestCase):
             config = relay.load_config(config_path)
             expected_log_path = (config_path.parent / "logs" / "room.txt").resolve()
             self.assertEqual(config["workspace"]["log_path"], expected_log_path)
+            self.assertTrue(str(config["workspace"]["preferences_path"]).endswith("preferences.json"))
             self.assertEqual(config["agents"][0]["args"], ["-p"])
             self.assertEqual(config["agents"][0]["preseed_session_id"], "seed-1")
 
@@ -111,6 +112,29 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(session_id, "session-123")
         self.assertEqual(cmd[2], "--session-id")
         self.assertEqual(cmd[3], "session-123")
+
+    def test_build_agent_command_applies_selected_model_and_effort(self):
+        agent = {
+            "name": "CLAUDE",
+            "cmd": "claude",
+            "args": ["-p"],
+            "invoke_resume_args": ["-p", "--session-id", "{session_id}"],
+            "preseed_session_id": False,
+            "model_arg": ["--model", "{value}"],
+            "effort_arg": ["--effort", "{value}"],
+            "model_options": [relay.build_option("default"), relay.build_option("sonnet")],
+            "effort_options": [relay.build_option("default"), relay.build_option("high")],
+            "selected_model": "sonnet",
+            "selected_effort": "high",
+        }
+
+        cmd, session_id = relay.build_agent_command(agent, "hello", None)
+
+        self.assertIsNone(session_id)
+        self.assertEqual(
+            cmd,
+            ["claude", "--model", "sonnet", "--effort", "high", "-p", "hello"],
+        )
 
     def test_seed_sessions_persists_preseeded_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:

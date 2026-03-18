@@ -16,6 +16,26 @@
         "--resume",
         "{session_id}"
       ],
+      "model_arg": [
+        "--model",
+        "{value}"
+      ],
+      "effort_arg": [
+        "--effort",
+        "{value}"
+      ],
+      "model_options": [
+        "default",
+        "sonnet",
+        "opus"
+      ],
+      "effort_options": [
+        "default",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
       "mirror_mode": "resume",
       "preseed_session_id": true,
       "timeout": 60
@@ -43,6 +63,14 @@
         "{script_dir}",
         "{session_id}"
       ],
+      "model_arg": [
+        "-m",
+        "{value}"
+      ],
+      "effort_arg": [
+        "-c",
+        "model_reasoning_effort=\"{value}\""
+      ],
       "mirror_mode": "resume",
       "preseed_session_id": false,
       "timeout": 60
@@ -53,6 +81,15 @@
       "cmd": "gemini",
       "args": [
         "-p"
+      ],
+      "model_arg": [
+        "--model",
+        "{value}"
+      ],
+      "model_options": [
+        "default",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash"
       ],
       "mirror_mode": "log",
       "preseed_session_id": false,
@@ -68,6 +105,7 @@
     "pid_path": ".clcod-runtime/supervisor.pid",
     "state_path": ".clcod-runtime/state.json",
     "sessions_path": ".clcod-runtime/sessions.json",
+    "preferences_path": ".clcod-runtime/preferences.json",
     "agent_logs_dir": ".clcod-runtime/agents"
   },
   "locks": {
@@ -81,6 +119,7 @@
     "port": 4173,
     "password_env": "CLCOD_PASSWORD",
     "password": "free",
+    "default_sender": "Operator",
     "open_browser": true
   }
 }

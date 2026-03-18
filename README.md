@@ -2,6 +2,12 @@
 
 `clcod` is a local-first multi-agent workspace that keeps Claude, Codex, Gemini, and a human operator inside one shared transcript while exposing an app-style control surface, real runtime state, and a truthful tmux debug mirror.
 
+## Dashboard Snapshot
+
+The current local dashboard is shown below. This snapshot reflects the engine-room control deck, live transcript panel, and the in-app room composer introduced in the latest update.
+
+![Dashboard snapshot](docs/dashboard-snapshot.svg)
+
 The current architecture is intentionally split into two surfaces:
 
 - The local web app is the primary operator UI.

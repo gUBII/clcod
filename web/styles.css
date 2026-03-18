@@ -266,6 +266,11 @@ button {
   font-size: 0.82rem;
 }
 
+.engine__meta--stack {
+  display: grid;
+  justify-content: start;
+}
+
 .engine__spark {
   position: absolute;
   inset: auto -30% -40% auto;
@@ -338,7 +343,7 @@ button {
 
 .workspace__grid {
   display: grid;
-  grid-template-columns: 360px minmax(0, 1fr);
+  grid-template-columns: 430px minmax(0, 1fr);
   gap: 18px;
 }
 
@@ -366,31 +371,160 @@ button {
   gap: 14px;
 }
 
-.status {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(255, 255, 255, 0.03);
+.control {
+  padding: 18px;
+  border-radius: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    radial-gradient(circle at top right, rgba(140, 199, 255, 0.09), transparent 32%),
+    rgba(255, 255, 255, 0.03);
 }
 
-.status__name,
-.status__detail {
+.control__header,
+.composer__top {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: start;
+}
+
+.composer__top .field {
+  flex: 1 1 auto;
+}
+
+.composer__top button {
+  align-self: end;
+}
+
+.control__name,
+.control__detail,
+.control__label,
+.composer__meta,
+.composer__status,
+.field__label,
+.transcript__empty {
   margin: 0;
 }
 
-.status__name {
+.control__name {
   font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: 0.08em;
 }
 
-.status__detail {
-  margin-top: 4px;
+.control__detail,
+.composer__meta,
+.composer__status,
+.transcript__empty {
+  margin-top: 6px;
   color: var(--muted);
   font-family: var(--font-mono);
   font-size: 0.8rem;
+}
+
+.control__status {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.control__status span {
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.control__section {
+  margin-top: 16px;
+}
+
+.control__label {
+  margin-bottom: 10px;
+  font-size: 0.76rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.chip {
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(140, 199, 255, 0.16);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  background: rgba(11, 19, 31, 0.9);
+}
+
+.chip:hover {
+  border-color: rgba(255, 210, 124, 0.34);
+}
+
+.chip--active {
+  color: #07121b;
+  background: linear-gradient(90deg, #ffd27c, #ff8e57);
+}
+
+.chip--empty {
+  cursor: default;
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.control__message {
+  min-height: 18px;
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.panel--composer {
+  padding-top: 18px;
+}
+
+.composer {
+  display: grid;
+  gap: 18px;
+}
+
+.field {
+  display: grid;
+  gap: 10px;
+}
+
+.field--message textarea {
+  min-height: 150px;
+  resize: vertical;
+}
+
+.field__label {
+  font-size: 0.76rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+textarea {
+  width: 100%;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid rgba(140, 199, 255, 0.22);
+  color: var(--text);
+  font: inherit;
+  background: rgba(5, 10, 18, 0.92);
 }
 
 .transcript {
@@ -458,7 +592,9 @@ button {
 
   .hero,
   .workspace__header,
-  .boot-console {
+  .boot-console,
+  .control__header,
+  .composer__top {
     flex-direction: column;
     align-items: flex-start;
   }
