@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# start.sh - Launch the clcod shared room and its tmux workspace.
+# start.sh - Launch the clcod supervisor, UI, and tmux debug mirrors.
 
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
 CONFIG="${CONFIG:-$DIR/config.json}"
 
 SETTINGS=()
@@ -11,96 +13,77 @@ while IFS= read -r line; do
   SETTINGS+=("$line")
 done < <(
   python3 - "$CONFIG" <<'PY'
-import json
 import sys
-from pathlib import Path
 
-config_path = Path(sys.argv[1]).expanduser()
-if not config_path.is_absolute():
-    config_path = (Path.cwd() / config_path).resolve()
-base = config_path.parent
-data = {}
-if config_path.exists():
-    data = json.loads(config_path.read_text(encoding="utf-8"))
+import relay
 
-workspace = data.get("workspace", {})
-tmux_cfg = data.get("tmux", {})
-agents = data.get("agents", [])
+config = relay.load_config(sys.argv[1])
+workspace = config["workspace"]
+ui = config["ui"]
 
-def resolve(raw, fallback):
-    value = Path(str(raw or fallback)).expanduser()
-    if not value.is_absolute():
-        value = (base / value).resolve()
-    return str(value)
-
-print(str(tmux_cfg.get("session", "triagent")))
-print(resolve(workspace.get("log_path"), "clcodgemmix.txt"))
-print(resolve(workspace.get("lock_path"), "speaker.lock"))
-print(resolve(workspace.get("relay_log_path"), ".clcod-runtime/relay.log"))
-print(resolve(workspace.get("pid_path"), ".clcod-runtime/relay.pid"))
-for agent in agents:
-    if not agent.get("enabled", True):
-        continue
-    shell_cmd = str(agent.get("shell_cmd") or agent.get("cmd") or "").strip()
-    if shell_cmd:
-        print(shell_cmd)
+print(config["tmux"]["session"])
+print(str(workspace["log_path"]))
+print(str(workspace["lock_path"]))
+print(str(workspace["relay_log_path"]))
+print(str(workspace["pid_path"]))
+print(build_ui_url := f"http://{ui['host']}:{ui['port']}")
+print("1" if ui["open_browser"] else "0")
 PY
 )
 
 SESSION="${SETTINGS[0]:-triagent}"
-LOG="${SETTINGS[1]:-$DIR/clcodgemmix.txt}"
+LOG_PATH="${SETTINGS[1]:-$DIR/clcodgemmix.txt}"
 LOCK_PATH="${SETTINGS[2]:-$DIR/speaker.lock}"
-RELAY_LOG="${SETTINGS[3]:-$DIR/.clcod-runtime/relay.log}"
-PID_FILE="${SETTINGS[4]:-$DIR/.clcod-runtime/relay.pid}"
-AGENT_CMDS=("${SETTINGS[@]:5}")
+SUPERVISOR_LOG="${SETTINGS[3]:-$DIR/.clcod-runtime/relay.log}"
+PID_FILE="${SETTINGS[4]:-$DIR/.clcod-runtime/supervisor.pid}"
+UI_URL="${SETTINGS[5]:-http://127.0.0.1:4173}"
+OPEN_BROWSER="${SETTINGS[6]:-1}"
 
-chmod +x "$DIR/relay.py" "$DIR/join.py" "$DIR/stop.sh" "$DIR/watch-log.sh" "$DIR/healthcheck.sh"
-mkdir -p "$(dirname "$LOG")" "$(dirname "$RELAY_LOG")" "$(dirname "$PID_FILE")" "$(dirname "$LOCK_PATH")"
-touch "$LOG"
+chmod +x "$DIR/supervisor.py" "$DIR/relay.py" "$DIR/join.py" "$DIR/stop.sh" "$DIR/watch-log.sh" "$DIR/healthcheck.sh"
+mkdir -p "$(dirname "$LOG_PATH")" "$(dirname "$SUPERVISOR_LOG")" "$(dirname "$PID_FILE")" "$(dirname "$LOCK_PATH")"
+touch "$LOG_PATH" "$SUPERVISOR_LOG"
 
-if [[ -f "$PID_FILE" ]]; then
-  OLD_PID="$(<"$PID_FILE")"
-  if [[ "$OLD_PID" =~ ^[0-9]+$ ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    kill "$OLD_PID" 2>/dev/null || true
-    sleep 0.5
+CONFIG="$CONFIG" bash "$DIR/stop.sh" >/dev/null 2>&1 || true
+rm -f "$LOCK_PATH"
+
+nohup python3 "$DIR/supervisor.py" --config "$CONFIG" >>"$SUPERVISOR_LOG" 2>&1 &
+LAUNCH_PID="$!"
+
+SUPERVISOR_PID=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if [[ -f "$PID_FILE" ]]; then
+    SUPERVISOR_PID="$(<"$PID_FILE")"
+    if [[ "$SUPERVISOR_PID" =~ ^[0-9]+$ ]] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+      break
+    fi
   fi
-  rm -f "$PID_FILE"
+  sleep 0.5
+done
+
+if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]] && [[ "$LAUNCH_PID" =~ ^[0-9]+$ ]] && kill -0 "$LAUNCH_PID" 2>/dev/null; then
+  SUPERVISOR_PID="$LAUNCH_PID"
 fi
 
-rm -f "$LOCK_PATH"
-tmux kill-session -t "$SESSION" 2>/dev/null || true
-
-python3 "$DIR/relay.py" --config "$CONFIG" >"$RELAY_LOG" 2>&1 &
-RELAY_PID=$!
-printf '%s\n' "$RELAY_PID" >"$PID_FILE"
-
-if ! kill -0 "$RELAY_PID" 2>/dev/null; then
-  echo "[start] relay failed to start; inspect $RELAY_LOG" >&2
+if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]] || ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+  echo "[start] supervisor failed to start; inspect $SUPERVISOR_LOG" >&2
   exit 1
 fi
 
-tmux new-session -d -s "$SESSION" -x 220 -y 55
-tmux send-keys -t "$SESSION:0.0" "bash \"$DIR/watch-log.sh\" --config \"$CONFIG\"" Enter
-tmux split-window -v -t "$SESSION:0.0" -p 35
-
-if [[ ${#AGENT_CMDS[@]} -gt 0 ]]; then
-  PANE_INDEX=1
-  tmux send-keys -t "$SESSION:0.$PANE_INDEX" "${AGENT_CMDS[0]}" Enter
-  for ((i = 1; i < ${#AGENT_CMDS[@]}; i++)); do
-    tmux split-window -h -t "$SESSION:0.$PANE_INDEX"
-    PANE_INDEX=$((PANE_INDEX + 1))
-    tmux send-keys -t "$SESSION:0.$PANE_INDEX" "${AGENT_CMDS[$i]}" Enter
-  done
+if [[ "$OPEN_BROWSER" == "1" ]]; then
+  if command -v open >/dev/null 2>&1; then
+    open "$UI_URL" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$UI_URL" >/dev/null 2>&1 || true
+  fi
 fi
-
-tmux select-layout -t "$SESSION:0" main-horizontal >/dev/null 2>&1 || true
 
 echo ""
 echo "  clcod is live."
 echo ""
+echo "  UI:       $UI_URL"
 echo "  Attach:   tmux attach -t $SESSION"
 echo "  Chat:     python3 $DIR/join.py --config $CONFIG --name ${USER:-Observer}"
 echo "  Stop:     CONFIG=$CONFIG bash $DIR/stop.sh"
 echo "  Health:   CONFIG=$CONFIG bash $DIR/healthcheck.sh"
-echo "  Relay:    $RELAY_LOG"
+echo "  Runtime:  $SUPERVISOR_LOG"
 echo ""

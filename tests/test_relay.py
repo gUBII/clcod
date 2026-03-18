@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 import relay
@@ -62,6 +63,7 @@ class RelayTests(unittest.TestCase):
                                 "name": "CLAUDE",
                                 "cmd": "claude",
                                 "args": "-p",
+                                "preseed_session_id": "seed-1",
                             }
                         ],
                         "workspace": {
@@ -76,6 +78,71 @@ class RelayTests(unittest.TestCase):
             expected_log_path = (config_path.parent / "logs" / "room.txt").resolve()
             self.assertEqual(config["workspace"]["log_path"], expected_log_path)
             self.assertEqual(config["agents"][0]["args"], ["-p"])
+            self.assertEqual(config["agents"][0]["preseed_session_id"], "seed-1")
+
+    def test_build_agent_command_preseeds_session_id_for_resume_agents(self):
+        agent = {
+            "name": "CLAUDE",
+            "cmd": "claude",
+            "args": ["-p"],
+            "invoke_resume_args": ["-p", "--session-id", "{session_id}"],
+            "preseed_session_id": True,
+        }
+
+        cmd, session_id = relay.build_agent_command(agent, "hello", None)
+
+        self.assertEqual(cmd[0], "claude")
+        self.assertEqual(cmd[-1], "hello")
+        self.assertEqual(cmd[1], "-p")
+        self.assertEqual(cmd[2], "--session-id")
+        uuid.UUID(session_id)
+
+    def test_build_agent_command_uses_explicit_preseed_session_id(self):
+        agent = {
+            "name": "CLAUDE",
+            "cmd": "claude",
+            "args": ["-p"],
+            "invoke_resume_args": ["-p", "--session-id", "{session_id}"],
+            "preseed_session_id": "session-123",
+        }
+
+        cmd, session_id = relay.build_agent_command(agent, "hello", None)
+
+        self.assertEqual(session_id, "session-123")
+        self.assertEqual(cmd[2], "--session-id")
+        self.assertEqual(cmd[3], "session-123")
+
+    def test_seed_sessions_persists_preseeded_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_path = Path(tmpdir) / "sessions.json"
+            relay.save_sessions(sessions_path, {})
+
+            sessions = relay.seed_sessions(
+                sessions_path,
+                [
+                    {
+                        "name": "CLAUDE",
+                        "enabled": True,
+                        "preseed_session_id": "claude-seed",
+                    },
+                    {
+                        "name": "CODEX",
+                        "enabled": True,
+                        "preseed_session_id": False,
+                    },
+                ],
+            )
+
+            self.assertEqual(sessions, {"CLAUDE": "claude-seed"})
+            self.assertEqual(relay.load_sessions(sessions_path), {"CLAUDE": "claude-seed"})
+
+    def test_extract_session_id_from_codex_stderr(self):
+        agent = {"name": "CODEX"}
+        stderr = "approval: never\nsession id: 123e4567-e89b-12d3-a456-426614174000\n"
+
+        session_id = relay.extract_session_id(agent, "", stderr, None)
+
+        self.assertEqual(session_id, "123e4567-e89b-12d3-a456-426614174000")
 
 
 if __name__ == "__main__":

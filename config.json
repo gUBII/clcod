@@ -7,7 +7,17 @@
       "args": [
         "-p"
       ],
-      "shell_cmd": "claude",
+      "invoke_resume_args": [
+        "-p",
+        "--session-id",
+        "{session_id}"
+      ],
+      "mirror_resume_args": [
+        "--resume",
+        "{session_id}"
+      ],
+      "mirror_mode": "resume",
+      "preseed_session_id": true,
       "timeout": 60
     },
     {
@@ -18,11 +28,23 @@
         "exec",
         "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
-        "--ephemeral",
         "-C",
         "{script_dir}"
       ],
-      "shell_cmd": "codex",
+      "invoke_resume_args": [
+        "exec",
+        "resume",
+        "{session_id}"
+      ],
+      "mirror_resume_args": [
+        "resume",
+        "--no-alt-screen",
+        "-C",
+        "{script_dir}",
+        "{session_id}"
+      ],
+      "mirror_mode": "resume",
+      "preseed_session_id": false,
       "timeout": 60
     },
     {
@@ -32,7 +54,8 @@
       "args": [
         "-p"
       ],
-      "shell_cmd": "gemini",
+      "mirror_mode": "log",
+      "preseed_session_id": false,
       "timeout": 60
     }
   ],
@@ -42,12 +65,22 @@
     "poll_sec": 0.5,
     "context_len": 6000,
     "relay_log_path": ".clcod-runtime/relay.log",
-    "pid_path": ".clcod-runtime/relay.pid"
+    "pid_path": ".clcod-runtime/supervisor.pid",
+    "state_path": ".clcod-runtime/state.json",
+    "sessions_path": ".clcod-runtime/sessions.json",
+    "agent_logs_dir": ".clcod-runtime/agents"
   },
   "locks": {
     "ttl": 90
   },
   "tmux": {
     "session": "triagent"
+  },
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 4173,
+    "password_env": "CLCOD_PASSWORD",
+    "password": "free",
+    "open_browser": true
   }
 }

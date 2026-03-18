@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>clcod Engine Room</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <div class="chrome">
+        <div class="chrome__brand">
+          <span class="chrome__eyebrow">Local Engine Supervisor</span>
+          <h1>clcod</h1>
+        </div>
+        <div class="chrome__status" id="appPhase">LOCKED</div>
+      </div>
+
+      <main class="main">
+        <section class="gate" id="gate">
+          <div class="gate__panel">
+            <p class="gate__eyebrow">Secure Startup</p>
+            <h2>Unlock the engine room</h2>
+            <p class="gate__copy">
+              One command boots the runtime. This gate only unlocks the local control surface.
+            </p>
+            <form id="unlockForm" class="gate__form">
+              <label class="gate__label" for="password">Access password</label>
+              <input id="password" name="password" type="password" autocomplete="current-password" required>
+              <button type="submit">Ignite</button>
+            </form>
+            <p class="gate__error" id="unlockError" hidden></p>
+          </div>
+        </section>
+
+        <section class="engine-room hidden" id="engineRoom">
+          <div class="hero">
+            <div>
+              <p class="hero__eyebrow">Engine Room</p>
+              <h2>Three agents. One shared room. Real boot states only.</h2>
+            </div>
+            <div class="hero__meta">
+              <span id="relayState">relay: starting</span>
+              <span id="tmuxState">tmux: starting</span>
+            </div>
+          </div>
+
+          <div class="engines" id="engineCards"></div>
+
+          <div class="boot-console">
+            <div>
+              <p class="boot-console__eyebrow">Debug Mirror</p>
+              <code id="tmuxCommand">tmux attach -t triagent</code>
+            </div>
+            <button type="button" id="copyTmux">Copy tmux command</button>
+          </div>
+        </section>
+
+        <section class="workspace hidden" id="workspace">
+          <div class="workspace__header">
+            <div>
+              <p class="hero__eyebrow">Live Workspace</p>
+              <h2>Transcript and engine telemetry</h2>
+            </div>
+            <div class="workspace__meta">
+              <span id="workspaceRelay">relay: ready</span>
+              <span id="workspaceTmux">tmux: running</span>
+            </div>
+          </div>
+
+          <div class="workspace__grid">
+            <section class="panel panel--status">
+              <div class="panel__header">
+                <h3>Engines</h3>
+                <span class="panel__hint">truthful mirrors only</span>
+              </div>
+              <div id="statusGrid" class="status-grid"></div>
+            </section>
+
+            <section class="panel panel--transcript">
+              <div class="panel__header">
+                <h3>Transcript</h3>
+                <span class="panel__hint">latest room traffic</span>
+              </div>
+              <div id="transcript" class="transcript"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# healthcheck.sh - Report relay, lock, transcript, and tmux session health.
+# healthcheck.sh - Report supervisor, runtime state, transcript, and tmux health.
 
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
 CONFIG="${CONFIG:-$DIR/config.json}"
 REPAIR=0
 
@@ -16,53 +18,40 @@ while IFS= read -r line; do
   SETTINGS+=("$line")
 done < <(
   python3 - "$CONFIG" <<'PY'
-import json
 import sys
-from pathlib import Path
 
-config_path = Path(sys.argv[1]).expanduser()
-if not config_path.is_absolute():
-    config_path = (Path.cwd() / config_path).resolve()
-base = config_path.parent
-data = {}
-if config_path.exists():
-    data = json.loads(config_path.read_text(encoding="utf-8"))
+import relay
 
-workspace = data.get("workspace", {})
-locks = data.get("locks", {})
-tmux_cfg = data.get("tmux", {})
+config = relay.load_config(sys.argv[1])
+workspace = config["workspace"]
 
-def resolve(raw, fallback):
-    value = Path(str(raw or fallback)).expanduser()
-    if not value.is_absolute():
-        value = (base / value).resolve()
-    return str(value)
-
-print(str(tmux_cfg.get("session", "triagent")))
-print(resolve(workspace.get("log_path"), "clcodgemmix.txt"))
-print(resolve(workspace.get("lock_path"), "speaker.lock"))
-print(resolve(workspace.get("pid_path"), ".clcod-runtime/relay.pid"))
-print(str(int(locks.get("ttl", 90))))
+print(config["tmux"]["session"])
+print(str(workspace["log_path"]))
+print(str(workspace["lock_path"]))
+print(str(workspace["pid_path"]))
+print(str(workspace["state_path"]))
+print(str(int(config["locks"]["ttl"])))
 PY
 )
 
 SESSION="${SETTINGS[0]:-triagent}"
 LOG_PATH="${SETTINGS[1]:-$DIR/clcodgemmix.txt}"
 LOCK_PATH="${SETTINGS[2]:-$DIR/speaker.lock}"
-PID_FILE="${SETTINGS[3]:-$DIR/.clcod-runtime/relay.pid}"
-TTL="${SETTINGS[4]:-90}"
+PID_FILE="${SETTINGS[3]:-$DIR/.clcod-runtime/supervisor.pid}"
+STATE_PATH="${SETTINGS[4]:-$DIR/.clcod-runtime/state.json}"
+TTL="${SETTINGS[5]:-90}"
 STATUS=0
 
 if [[ -f "$PID_FILE" ]]; then
-  RELAY_PID="$(<"$PID_FILE")"
-  if [[ "$RELAY_PID" =~ ^[0-9]+$ ]] && kill -0 "$RELAY_PID" 2>/dev/null; then
-    echo "[HEALTH] relay pid alive: $RELAY_PID"
+  SUPERVISOR_PID="$(<"$PID_FILE")"
+  if [[ "$SUPERVISOR_PID" =~ ^[0-9]+$ ]] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+    echo "[HEALTH] supervisor pid alive: $SUPERVISOR_PID"
   else
-    echo "[HEALTH] WARNING: relay pid file exists but process is not running"
+    echo "[HEALTH] WARNING: supervisor pid file exists but process is not running"
     STATUS=1
   fi
 else
-  echo "[HEALTH] WARNING: relay pid file not found"
+  echo "[HEALTH] WARNING: supervisor pid file not found"
   STATUS=1
 fi
 
@@ -93,6 +82,36 @@ if [[ -f "$LOG_PATH" ]]; then
   echo "[HEALTH] transcript present: $LOG_PATH"
 else
   echo "[HEALTH] WARNING: transcript missing: $LOG_PATH"
+  STATUS=1
+fi
+
+if [[ -f "$STATE_PATH" ]]; then
+  STATE_AGE="$(python3 - "$STATE_PATH" <<'PY'
+import sys
+import time
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+print(int(time.time() - state_path.stat().st_mtime))
+PY
+)"
+  echo "[HEALTH] state age: ${STATE_AGE}s"
+  if (( STATE_AGE > 10 )); then
+    echo "[HEALTH] WARNING: runtime state is stale"
+    STATUS=1
+  fi
+  python3 - "$STATE_PATH" <<'PY'
+import json
+import sys
+
+state = json.loads(open(sys.argv[1], "r", encoding="utf-8").read())
+print(f"[HEALTH] app phase: {state['app']['phase']}")
+print(f"[HEALTH] relay state: {state['relay']['state']}")
+for name, payload in state["agents"].items():
+    print(f"[HEALTH] {name} state: {payload['state']} mirror={payload['mirror_view']} pane={payload['pane_target']}")
+PY
+else
+  echo "[HEALTH] WARNING: runtime state missing: $STATE_PATH"
   STATUS=1
 fi
 

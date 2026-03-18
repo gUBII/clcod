@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# stop.sh - Stop the relay and tmux room using config-derived paths.
+# stop.sh - Stop the clcod supervisor and tmux room.
 
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
 CONFIG="${CONFIG:-$DIR/config.json}"
 
 SETTINGS=()
@@ -11,50 +13,52 @@ while IFS= read -r line; do
   SETTINGS+=("$line")
 done < <(
   python3 - "$CONFIG" <<'PY'
-import json
 import sys
-from pathlib import Path
 
-config_path = Path(sys.argv[1]).expanduser()
-if not config_path.is_absolute():
-    config_path = (Path.cwd() / config_path).resolve()
-base = config_path.parent
-data = {}
-if config_path.exists():
-    data = json.loads(config_path.read_text(encoding="utf-8"))
+import relay
 
-workspace = data.get("workspace", {})
-tmux_cfg = data.get("tmux", {})
+config = relay.load_config(sys.argv[1])
+workspace = config["workspace"]
 
-def resolve(raw, fallback):
-    value = Path(str(raw or fallback)).expanduser()
-    if not value.is_absolute():
-        value = (base / value).resolve()
-    return str(value)
-
-print(str(tmux_cfg.get("session", "triagent")))
-print(resolve(workspace.get("lock_path"), "speaker.lock"))
-print(resolve(workspace.get("pid_path"), ".clcod-runtime/relay.pid"))
+print(config["tmux"]["session"])
+print(str(workspace["lock_path"]))
+print(str(workspace["pid_path"]))
 PY
 )
 
 SESSION="${SETTINGS[0]:-triagent}"
 LOCK_PATH="${SETTINGS[1]:-$DIR/speaker.lock}"
-PID_FILE="${SETTINGS[2]:-$DIR/.clcod-runtime/relay.pid}"
+PID_FILE="${SETTINGS[2]:-$DIR/.clcod-runtime/supervisor.pid}"
 
-if [[ -f "$PID_FILE" ]]; then
-  RELAY_PID="$(<"$PID_FILE")"
-  if [[ "$RELAY_PID" =~ ^[0-9]+$ ]] && kill -0 "$RELAY_PID" 2>/dev/null; then
-    kill "$RELAY_PID" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do
-      if ! kill -0 "$RELAY_PID" 2>/dev/null; then
+stop_pid() {
+  local target_pid="$1"
+  if [[ "$target_pid" =~ ^[0-9]+$ ]] && kill -0 "$target_pid" 2>/dev/null; then
+    kill "$target_pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if ! kill -0 "$target_pid" 2>/dev/null; then
         break
       fi
       sleep 0.2
     done
+    if kill -0 "$target_pid" 2>/dev/null; then
+      kill -9 "$target_pid" 2>/dev/null || true
+    fi
   fi
+}
+
+if [[ -f "$PID_FILE" ]]; then
+  SUPERVISOR_PID="$(<"$PID_FILE")"
+  stop_pid "$SUPERVISOR_PID"
   rm -f "$PID_FILE"
 fi
+
+while IFS= read -r extra_pid; do
+  stop_pid "$extra_pid"
+done < <(
+  ps ax -o pid=,command= 2>/dev/null | awk -v dir="$DIR" '
+    $0 ~ /[[:space:]]python[0-9.]*[[:space:]].*supervisor\.py/ && index($0, dir) { print $1 }
+  ' || true
+)
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 rm -f "$LOCK_PATH"
