@@ -44,7 +44,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "effort_options": ["default", "low", "medium", "high", "max"],
             "mirror_mode": "resume",
             "preseed_session_id": True,
-            "timeout": 60,
+            "timeout": 180,
         },
         {
             "name": "CODEX",
@@ -63,6 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "effort_arg": ["-c", "model_reasoning_effort=\"{value}\""],
             "mirror_mode": "resume",
             "preseed_session_id": False,
+            "selected_effort": "medium",
             "timeout": 60,
         },
         {
@@ -696,6 +697,27 @@ def option_value(options: list[dict[str, Any]], option_id: str) -> str | None:
     return None
 
 
+def effective_effort_id(agent: dict[str, Any]) -> str:
+    selected_effort = str(agent.get("selected_effort") or "default")
+    if selected_effort != "default":
+        return selected_effort
+
+    if str(agent.get("name") or "").upper() != "CODEX":
+        return selected_effort
+
+    matrix = agent.get("effort_matrix", {})
+    if not isinstance(matrix, dict):
+        return selected_effort
+
+    selected_model = str(agent.get("selected_model") or "default")
+    allowed = matrix.get(selected_model) or matrix.get("default") or []
+    for candidate in allowed:
+        normalized = str(candidate)
+        if normalized != "default":
+            return normalized
+    return selected_effort
+
+
 def build_selection_args(agent: dict[str, Any]) -> list[str]:
     args: list[str] = []
     selected_model = str(agent.get("selected_model") or "default")
@@ -703,7 +725,7 @@ def build_selection_args(agent: dict[str, Any]) -> list[str]:
     if model_value and agent.get("model_arg"):
         args.extend(item.format_map({"value": model_value}) for item in agent["model_arg"])
 
-    selected_effort = str(agent.get("selected_effort") or "default")
+    selected_effort = effective_effort_id(agent)
     effort_value = option_value(agent.get("effort_options", []), selected_effort)
     if effort_value and agent.get("effort_arg"):
         args.extend(item.format_map({"value": effort_value}) for item in agent["effort_arg"])
@@ -940,6 +962,8 @@ async def run_relay(
             except NotImplementedError:
                 pass
 
+    pending_size = 0
+
     while not internal_stop_event.is_set():
         try:
             await asyncio.wait_for(internal_stop_event.wait(), timeout=poll_sec)
@@ -959,21 +983,23 @@ async def run_relay(
             continue
 
         content = read_text(log_path)
-        last_size = cur_size
 
         speaker = last_speaker(content)
         if not speaker or speaker.upper() in managed_names:
+            pending_size = 0
+            last_size = cur_size
             continue
 
-        emit_event(
-            event_callback,
-            {
-                "type": "transcript",
-                "last_speaker": speaker,
-                "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
-        )
-        relay_log(f"[{speaker}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
+        if pending_size != cur_size:
+            emit_event(
+                event_callback,
+                {
+                    "type": "transcript",
+                    "last_speaker": speaker,
+                    "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            )
+            relay_log(f"[{speaker}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
         try:
             await asyncio.wait_for(internal_stop_event.wait(), timeout=activity_jitter(content))
@@ -984,12 +1010,13 @@ async def run_relay(
         fresh = read_text(log_path)
         fresh_speaker = last_speaker(fresh)
         if not fresh_speaker or fresh_speaker.upper() in managed_names:
+            pending_size = 0
             last_size = log_path.stat().st_size
             continue
 
         if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
-            relay_log("speaker.lock is active; skipping this cycle")
-            last_size = log_path.stat().st_size
+            pending_size = cur_size
+            relay_log("speaker.lock is active; will retry this message")
             continue
 
         context = fresh[-context_len:]
@@ -1016,6 +1043,7 @@ async def run_relay(
         finally:
             release_lock(lock_path)
 
+        pending_size = 0
         last_size = log_path.stat().st_size
 
     relay_log("stopped")

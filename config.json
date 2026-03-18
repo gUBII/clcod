@@ -38,7 +38,7 @@
       ],
       "mirror_mode": "resume",
       "preseed_session_id": true,
-      "timeout": 60
+      "timeout": 180
     },
     {
       "name": "CODEX",
@@ -73,6 +73,7 @@
       ],
       "mirror_mode": "resume",
       "preseed_session_id": false,
+      "selected_effort": "medium",
       "timeout": 60
     },
     {

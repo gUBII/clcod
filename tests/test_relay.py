@@ -136,6 +136,41 @@ class RelayTests(unittest.TestCase):
             ["claude", "--model", "sonnet", "--effort", "high", "-p", "hello"],
         )
 
+    def test_effective_effort_id_uses_model_safe_codex_default(self):
+        agent = {
+            "name": "CODEX",
+            "selected_model": "gpt-5.1-codex-mini",
+            "selected_effort": "default",
+            "effort_matrix": {
+                "gpt-5.1-codex-mini": ["default", "medium", "high"],
+            },
+        }
+
+        self.assertEqual(relay.effective_effort_id(agent), "medium")
+
+    def test_build_selection_args_uses_safe_codex_effort_when_default_selected(self):
+        agent = {
+            "name": "CODEX",
+            "model_arg": ["-m", "{value}"],
+            "effort_arg": ["-c", "model_reasoning_effort=\"{value}\""],
+            "model_options": [relay.build_option("default"), relay.build_option("gpt-5.1-codex-mini")],
+            "effort_options": [
+                relay.build_option("default"),
+                relay.build_option("medium"),
+                relay.build_option("high"),
+            ],
+            "effort_matrix": {
+                "gpt-5.1-codex-mini": ["default", "medium", "high"],
+            },
+            "selected_model": "gpt-5.1-codex-mini",
+            "selected_effort": "default",
+        }
+
+        self.assertEqual(
+            relay.build_selection_args(agent),
+            ["-m", "gpt-5.1-codex-mini", "-c", 'model_reasoning_effort="medium"'],
+        )
+
     def test_seed_sessions_persists_preseeded_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sessions_path = Path(tmpdir) / "sessions.json"
