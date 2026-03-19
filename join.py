@@ -35,12 +35,44 @@ DIM   = "\033[2m"
 
 def colour_line(line: str) -> str:
     stripped = line.rstrip()
+    if not stripped:
+        return ""
+    try:
+        payload = json.loads(stripped)
+        if "sender" in payload and "body" in payload:
+            tag = payload["sender"].upper()
+            c = COLOURS.get(tag, "\033[97m")
+            return f"{c}{BOLD}[{tag}]{RESET}\n{payload['body']}"
+    except json.JSONDecodeError:
+        pass
+        
+    # fallback for raw text lines
     if stripped.startswith("[") and "]" in stripped:
         tag = stripped[1:stripped.index("]")]
         c = COLOURS.get(tag, "\033[97m")
         return f"{c}{BOLD}{stripped}{RESET}"
-    return f"{DIM}{stripped}{RESET}" if stripped else ""
+    return f"{DIM}{stripped}{RESET}"
 
+def resolve_socket_path(config_path: str | Path) -> Path:
+    config_file = Path(config_path).expanduser()
+    if not config_file.is_absolute():
+        config_file = (Path.cwd() / config_file).resolve()
+
+    if config_file.exists():
+        try:
+            config = json.loads(config_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+        else:
+            workspace = config.get("workspace", {})
+            raw_socket_path = workspace.get("socket_path")
+            if raw_socket_path:
+                path = Path(str(raw_socket_path)).expanduser()
+                if not path.is_absolute():
+                    path = (config_file.parent / path).resolve()
+                return path
+
+    return SCRIPT_DIR / ".clcod-runtime/room.sock"
 
 def resolve_log_path(config_path: str | Path, explicit_log: str | None) -> Path:
     if explicit_log:
@@ -68,14 +100,29 @@ def resolve_log_path(config_path: str | Path, explicit_log: str | None) -> Path:
 
     return DEFAULT_LOG
 
+import time
+import uuid
+import socket
 
-def append_message(log_path: Path, name: str, text: str) -> None:
-    entry = f"\n[{name.upper()}]\n{text.strip()}\n"
-    with log_path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.write(entry)
-        handle.flush()
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+def append_message(socket_path: Path, name: str, text: str) -> None:
+    message = {
+        "id": str(uuid.uuid4()),
+        "sender": name.upper(),
+        "seq": int(time.time() * 1000),
+        "type": "message",
+        "body": text.strip(),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    payload = json.dumps(message).encode("utf-8")
+    
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(socket_path))
+        sock.sendall(payload)
+    except Exception as e:
+        print(f"\n{DIM}Failed to send message: {e}{RESET}")
+    finally:
+        sock.close()
 
 
 async def tail_log(log_path: Path) -> None:
@@ -102,7 +149,7 @@ async def tail_log(log_path: Path) -> None:
                 await asyncio.sleep(0.3)
 
 
-async def read_input(log_path: Path, name: str) -> None:
+async def read_input(socket_path: Path, name: str) -> None:
     """Read user input and append to log."""
     loop = asyncio.get_event_loop()
     while True:
@@ -117,19 +164,23 @@ async def read_input(log_path: Path, name: str) -> None:
             print(f"{DIM}Leaving the room.{RESET}")
             break
         if text:
-            append_message(log_path, name, text)
+            append_message(socket_path, name, text)
 
 
-async def main(name: str, log_path: Path) -> None:
+async def main(name: str, config_path: str, explicit_log: str | None) -> None:
+    log_path = resolve_log_path(config_path, explicit_log)
+    socket_path = resolve_socket_path(config_path)
+    
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.touch(exist_ok=True)
 
     print(f"\n{BOLD}clcodgemmix — shared room{RESET}")
     print(f"{DIM}You are: {name.upper()}. Type to speak. /quit to leave.{RESET}")
     print(f"{DIM}Log: {log_path}{RESET}")
+    print(f"{DIM}Socket: {socket_path}{RESET}")
 
     tail_task = asyncio.create_task(tail_log(log_path))
-    input_task = asyncio.create_task(read_input(log_path, name))
+    input_task = asyncio.create_task(read_input(socket_path, name))
 
     done, pending = await asyncio.wait(
         [tail_task, input_task],
@@ -146,6 +197,6 @@ if __name__ == "__main__":
     parser.add_argument("--log", help="Path to shared log")
     args = parser.parse_args()
     try:
-        asyncio.run(main(args.name, resolve_log_path(args.config, args.log)))
+        asyncio.run(main(args.name, args.config, args.log))
     except KeyboardInterrupt:
         print(f"\n{DIM}Disconnected.{RESET}")

@@ -14,6 +14,7 @@ import os
 import secrets
 import shlex
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -95,19 +96,18 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
 
 def parse_transcript_entries(text: str, limit: int) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
-    speaker: str | None = None
-    body: list[str] = []
     for line in text.splitlines():
-        if line.startswith("[") and line.endswith("]") and len(line) > 2:
-            if speaker is not None:
-                entries.append({"speaker": speaker, "text": "\n".join(body).strip()})
-            speaker = line[1:-1].strip()
-            body = []
+        line = line.strip()
+        if not line:
             continue
-        if speaker is not None:
-            body.append(line)
-    if speaker is not None:
-        entries.append({"speaker": speaker, "text": "\n".join(body).strip()})
+        try:
+            payload = json.loads(line)
+            if "speaker" in payload and "text" in payload:
+                entries.append({"speaker": payload["speaker"], "text": payload["text"]})
+            elif "sender" in payload and "body" in payload:
+                entries.append({"speaker": payload["sender"], "text": payload["body"]})
+        except json.JSONDecodeError:
+            pass
     return entries[-limit:]
 
 
@@ -425,6 +425,8 @@ class RuntimeSupervisor:
                 )
 
         self.tmux("select-layout", "-t", f"{self.session}:0", "main-horizontal", check=False)
+        self.tmux("set-window-option", "-t", f"{self.session}:0", "main-pane-height", "30", check=False)
+        self.tmux("select-pane", "-t", f"{self.session}:0.0", check=False)
         self.tmux(
             "new-window",
             "-d",
@@ -662,8 +664,29 @@ class RuntimeSupervisor:
                         return self._json({"ok": False, "error": "name is required"}, status=HTTPStatus.BAD_REQUEST)
                     if not raw_message:
                         return self._json({"ok": False, "error": "message is required"}, status=HTTPStatus.BAD_REQUEST)
+                    
                     speaker = raw_name.upper()[:40]
-                    relay.append_tagged_entry(supervisor.workspace["log_path"], speaker, raw_message[:8000])
+                    message = {
+                        "id": secrets.token_urlsafe(16),
+                        "sender": speaker,
+                        "seq": int(time.time() * 1000),
+                        "type": "message",
+                        "body": raw_message[:8000],
+                        "ts": utc_now(),
+                    }
+                    
+                    socket_path = supervisor.workspace.get("socket_path")
+                    if socket_path and Path(socket_path).exists():
+                        try:
+                            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                            sock.connect(str(socket_path))
+                            sock.sendall(json.dumps(message).encode("utf-8"))
+                            sock.close()
+                        except Exception as e:
+                            print(f"[supervisor] error sending to socket: {e}", file=sys.stderr)
+                    else:
+                        relay.append_tagged_entry(supervisor.workspace["log_path"], speaker, raw_message[:8000])
+
                     supervisor.state.patch(
                         "transcript",
                         {

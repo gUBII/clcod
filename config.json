@@ -5,10 +5,12 @@
       "enabled": true,
       "cmd": "claude",
       "args": [
-        "-p"
+        "-p",
+        "--dangerously-skip-permissions"
       ],
       "invoke_resume_args": [
         "-p",
+        "--dangerously-skip-permissions",
         "--session-id",
         "{session_id}"
       ],
@@ -89,8 +91,12 @@
       ],
       "model_options": [
         "default",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
         "gemini-2.5-pro",
-        "gemini-2.5-flash"
+        "gemini-2.5-flash",
+        "gemini-2.0-pro",
+        "gemini-2.0-flash"
       ],
       "mirror_mode": "log",
       "preseed_session_id": false,
@@ -100,6 +106,7 @@
   "workspace": {
     "log_path": "clcodgemmix.txt",
     "lock_path": "speaker.lock",
+    "socket_path": ".clcod-runtime/room.sock",
     "poll_sec": 0.5,
     "context_len": 6000,
     "relay_log_path": ".clcod-runtime/relay.log",

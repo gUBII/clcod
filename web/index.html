@@ -86,29 +86,12 @@
             </section>
           </div>
 
-          <section class="panel panel--composer">
-            <div class="panel__header">
-              <div>
-                <h3>Send To Room</h3>
-                <span class="panel__hint">web composer writes directly into the shared transcript</span>
-              </div>
-              <p class="composer__meta">use this when you want the app to act as your terminal join client</p>
-            </div>
-            <form id="chatForm" class="composer">
-              <div class="composer__top">
-                <label class="field">
-                  <span class="field__label">Sender</span>
-                  <input id="senderName" name="senderName" type="text" maxlength="40" placeholder="Operator" required>
-                </label>
-                <button type="submit" id="sendButton">Send To Room</button>
-              </div>
-              <label class="field field--message">
-                <span class="field__label">Message</span>
-                <textarea id="chatInput" name="message" rows="5" maxlength="8000" placeholder="Ask the room something precise. The relay will pick it up from the transcript."></textarea>
-              </label>
-              <p class="composer__status" id="chatStatus"></p>
-            </form>
-          </section>
+          <form id="chatForm" class="chat-bar">
+            <input id="senderName" class="chat-bar__sender" name="senderName" type="text" maxlength="40" placeholder="Operator" required>
+            <input id="chatInput" class="chat-bar__message" name="message" type="text" maxlength="8000" placeholder="Message the room..." required>
+            <button type="submit" id="sendButton" class="chat-bar__send" title="Send">&rarr;</button>
+            <span class="chat-bar__status" id="chatStatus"></span>
+          </form>
         </section>
       </main>
     </div>

@@ -35,8 +35,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "name": "CLAUDE",
             "enabled": True,
             "cmd": "claude",
-            "args": ["-p"],
-            "invoke_resume_args": ["-p", "--session-id", "{session_id}"],
+            "args": ["-p", "--dangerously-skip-permissions"],
+            "invoke_resume_args": ["-p", "--dangerously-skip-permissions", "--session-id", "{session_id}"],
             "mirror_resume_args": ["--resume", "{session_id}"],
             "model_arg": ["--model", "{value}"],
             "effort_arg": ["--effort", "{value}"],
@@ -384,6 +384,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     normalized_workspace = {
         "log_path": resolve_path(config_dir, str(workspace.get("log_path", "clcodgemmix.txt"))),
         "lock_path": resolve_path(config_dir, str(workspace.get("lock_path", "speaker.lock"))),
+        "socket_path": resolve_path(config_dir, str(workspace.get("socket_path", ".clcod-runtime/room.sock"))),
         "poll_sec": float(workspace.get("poll_sec", 0.5)),
         "context_len": int(workspace.get("context_len", 6000)),
         "relay_log_path": resolve_path(
@@ -409,6 +410,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         {
             "log_path": str(normalized_workspace["log_path"]),
             "lock_path": str(normalized_workspace["lock_path"]),
+            "socket_path": str(normalized_workspace["socket_path"]),
             "relay_log_path": str(normalized_workspace["relay_log_path"]),
             "pid_path": str(normalized_workspace["pid_path"]),
             "state_path": str(normalized_workspace["state_path"]),
@@ -527,8 +529,18 @@ def normalize_argv(value: Any, agent_name: str, field_name: str) -> list[str]:
 
 
 def last_speaker(text: str) -> str:
-    tags = re.findall(r"^\[([^\]]+)\]", text, re.MULTILINE)
-    return tags[-1].strip() if tags else ""
+    last = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+            if "sender" in payload:
+                last = payload["sender"]
+        except json.JSONDecodeError:
+            pass
+    return last
 
 
 def activity_jitter(content: str) -> float:
@@ -564,7 +576,15 @@ def release_lock(lock_path: Path) -> None:
 
 
 def append_tagged_entry(log_path: Path, speaker: str, text: str) -> None:
-    entry = f"\n[{speaker}]\n{text.strip()}\n"
+    message = {
+        "id": str(uuid.uuid4()),
+        "sender": speaker,
+        "seq": int(time.time() * 1000),
+        "type": "message",
+        "body": text.strip(),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    entry = json.dumps(message) + "\n"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -782,21 +802,11 @@ def log_agent_io(path: Path, cmd: list[str], raw: str, stderr_text: str, session
         handle.write("\n".join(lines))
 
 
-async def call_agent(
+async def _exec_agent(
     agent: dict[str, Any],
-    prompt: str,
-    sessions_path: Path,
-    session_lock: asyncio.Lock,
-) -> AgentCallResult:
-    env = dict(os.environ)
-    if agent["name"] == "CLAUDE":
-        env["CLAUDECODE"] = ""
-
-    async with session_lock:
-        sessions = load_sessions(sessions_path)
-        current_session_id = sessions.get(agent["name"])
-        cmd, current_session_id = build_agent_command(agent, prompt, current_session_id)
-
+    cmd: list[str],
+    env: dict[str, str],
+) -> tuple[bytes, bytes, int]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(SCRIPT_DIR),
@@ -813,13 +823,51 @@ async def call_agent(
         except Exception:
             pass
         raise
+    return stdout, stderr, proc.returncode
+
+
+_SESSION_IN_USE_RE = re.compile(r"session\s+id\s+\S+\s+is\s+already\s+in\s+use", re.IGNORECASE)
+
+
+async def call_agent(
+    agent: dict[str, Any],
+    prompt: str,
+    sessions_path: Path,
+    session_lock: asyncio.Lock,
+) -> AgentCallResult:
+    env = dict(os.environ)
+    if agent["name"] == "CLAUDE":
+        env["CLAUDECODE"] = ""
+
+    async with session_lock:
+        sessions = load_sessions(sessions_path)
+        current_session_id = sessions.get(agent["name"])
+        cmd, current_session_id = build_agent_command(agent, prompt, current_session_id)
+
+    stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
 
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if stderr_text:
         relay_log(f"{agent['name']}: stderr: {stderr_text}")
 
-    if proc.returncode != 0:
-        raise RuntimeError(f"exit code {proc.returncode}")
+    # Retry once with a fresh session ID when the stored one is still held open
+    if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
+        relay_log(f"{agent['name']}: session in use, retrying with fresh session")
+        async with session_lock:
+            sessions = load_sessions(sessions_path)
+            sessions.pop(agent["name"], None)
+            save_sessions(sessions_path, sessions)
+
+        cmd, current_session_id = build_agent_command(agent, prompt, None)
+        log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+
+        stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+    if returncode != 0:
+        raise RuntimeError(f"exit code {returncode}")
 
     raw = stdout.decode("utf-8", errors="replace")
     parser = PARSERS.get(agent["name"], parse_claude)
@@ -953,6 +1001,9 @@ async def run_relay(
             },
         )
 
+    socket_path: Path = workspace["socket_path"]
+    
+    # ... setup code above remains ...
     internal_stop_event = stop_event or asyncio.Event()
     if stop_event is None:
         loop = asyncio.get_running_loop()
@@ -962,89 +1013,85 @@ async def run_relay(
             except NotImplementedError:
                 pass
 
-    pending_size = 0
-
-    while not internal_stop_event.is_set():
+    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            await asyncio.wait_for(internal_stop_event.wait(), timeout=poll_sec)
-            break
-        except asyncio.TimeoutError:
-            pass
+            data = await reader.read(65536)
+            if not data:
+                return
+            
+            payload = json.loads(data.decode("utf-8"))
+            sender = payload.get("sender", "UNKNOWN")
+            body = payload.get("body", "")
+            if not body:
+                return
 
-        try:
-            cur_size = log_path.stat().st_size
-        except FileNotFoundError:
-            log_path.touch(exist_ok=True)
-            cur_size = 0
-
-        if cur_size < last_size:
-            last_size = 0
-        if cur_size <= last_size:
-            continue
-
-        content = read_text(log_path)
-
-        speaker = last_speaker(content)
-        if not speaker or speaker.upper() in managed_names:
-            pending_size = 0
-            last_size = cur_size
-            continue
-
-        if pending_size != cur_size:
+            append_tagged_entry(log_path, sender, body)
+            
             emit_event(
                 event_callback,
                 {
                     "type": "transcript",
-                    "last_speaker": speaker,
+                    "last_speaker": sender,
                     "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 },
             )
-            relay_log(f"[{speaker}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
+            relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
-        try:
-            await asyncio.wait_for(internal_stop_event.wait(), timeout=activity_jitter(content))
-            break
-        except asyncio.TimeoutError:
-            pass
+            # Read back context to ensure we get the full log state
+            fresh = read_text(log_path)
+            context = fresh[-context_len:]
+            prompts = {
+                agent["name"]: PROMPT_TEMPLATE.format(name=agent["name"].capitalize(), context=context)
+                for agent in enabled_agents
+            }
 
-        fresh = read_text(log_path)
-        fresh_speaker = last_speaker(fresh)
-        if not fresh_speaker or fresh_speaker.upper() in managed_names:
-            pending_size = 0
-            last_size = log_path.stat().st_size
-            continue
+            if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
+                relay_log("speaker.lock is active; will retry this message")
+                return
 
-        if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
-            pending_size = cur_size
-            relay_log("speaker.lock is active; will retry this message")
-            continue
-
-        context = fresh[-context_len:]
-        prompts = {
-            agent["name"]: PROMPT_TEMPLATE.format(name=agent["name"].capitalize(), context=context)
-            for agent in enabled_agents
-        }
-
-        try:
-            await asyncio.gather(
-                *[
-                    route_to(
-                        agent,
-                        prompts[agent["name"]],
-                        log_path,
-                        write_lock,
-                        sessions_path,
-                        session_lock,
-                        event_callback,
-                    )
-                    for agent in enabled_agents
-                ]
-            )
+            try:
+                await asyncio.gather(
+                    *[
+                        route_to(
+                            agent,
+                            prompts[agent["name"]],
+                            log_path,
+                            write_lock,
+                            sessions_path,
+                            session_lock,
+                            event_callback,
+                        )
+                        for agent in enabled_agents
+                    ]
+                )
+            finally:
+                release_lock(lock_path)
+                
+        except json.JSONDecodeError:
+            relay_log("received invalid JSON on socket")
+        except Exception as e:
+            relay_log(f"socket error: {e}")
         finally:
-            release_lock(lock_path)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
-        pending_size = 0
-        last_size = log_path.stat().st_size
+    if socket_path.exists():
+        socket_path.unlink()
+        
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
+    relay_log(f"listening on {socket_path}")
+
+    try:
+        await internal_stop_event.wait()
+    finally:
+        server.close()
+        await server.wait_closed()
+        if socket_path.exists():
+            socket_path.unlink()
 
     relay_log("stopped")
     emit_event(event_callback, {"type": "relay_state", "state": "stopped"})

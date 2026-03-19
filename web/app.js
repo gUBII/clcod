@@ -3,7 +3,7 @@ const stateLabels = {
   auth: "tool online",
   warming: "routing traffic",
   ready: "ready",
-  error: "fault",
+  error: "no fuel left",
 };
 
 const stateNotes = {
@@ -11,7 +11,7 @@ const stateNotes = {
   auth: "The CLI process is available and attached.",
   warming: "The room is settling and the engine is actively routing work.",
   ready: "Mirror and routing path are healthy.",
-  error: "The last routing cycle or mirror command failed.",
+  error: "Out of fuel. The last routing cycle failed or capacity was exhausted.",
 };
 
 const previousStates = new Map();
@@ -150,6 +150,8 @@ chatForm.addEventListener("submit", async (event) => {
   await pollTranscript();
 });
 
+/* Enter on the message input submits the form (default for single-line input in a form). */
+
 function startPolling() {
   if (stateTimer) {
     clearInterval(stateTimer);
@@ -247,8 +249,10 @@ function renderEngines(agents) {
         <span class="engine__name">${name}</span>
         <span class="engine__badge">${stateLabels[state] || state}</span>
       </div>
-      <div class="engine__gauge">
-        <div class="engine__beam"></div>
+      <div class="engine__tach">
+        <div class="tach__dial"></div>
+        <div class="tach__needle"></div>
+        <div class="tach__mark">${state === "ready" ? "REV" : state === "error" ? "ERR" : state === "warming" ? "REV" : "IDLE"}</div>
       </div>
       <p class="engine__note">${stateNotes[state] || ""}</p>
       <div class="engine__meta engine__meta--stack">
@@ -273,6 +277,11 @@ function renderEngines(agents) {
         <div>
           <p class="control__name">${name}</p>
           <p class="control__detail">${payload.pane_target || "no pane target"}</p>
+        </div>
+        <div class="control__tach">
+          <div class="tach__dial tach__dial--sm"></div>
+          <div class="tach__needle tach__needle--sm"></div>
+          <div class="tach__mark tach__mark--sm">${state === "ready" ? "REV" : state === "error" ? "ERR" : state === "warming" ? "REV" : "IDLE"}</div>
         </div>
         <div class="control__status">
           <span>${stateLabels[state] || state}</span>
