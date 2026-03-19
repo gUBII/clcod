@@ -16,6 +16,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -44,6 +45,18 @@ def build_ui_url(config: dict[str, Any]) -> str:
     return f"http://{ui['host']}:{ui['port']}"
 
 
+USAGE_WINDOW_SECONDS = 5 * 60 * 60  # 5-hour rolling window
+DEFAULT_USAGE_LIMIT = 50000         # default token budget per window
+
+
+def build_usage_window(agent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "window_start": time.time(),
+        "tokens_used": 0,
+        "limit": agent.get("usage_limit", DEFAULT_USAGE_LIMIT),
+    }
+
+
 def build_agent_state(agent: dict[str, Any]) -> dict[str, Any]:
     return {
         "state": "starting",
@@ -59,6 +72,7 @@ def build_agent_state(agent: dict[str, Any]) -> dict[str, Any]:
         "model_options": agent.get("model_options", []),
         "effort_options": agent.get("effort_options", []),
         "effort_matrix": agent.get("effort_matrix", {}),
+        "usage_window": build_usage_window(agent),
     }
 
 
@@ -103,9 +117,9 @@ def parse_transcript_entries(text: str, limit: int) -> list[dict[str, str]]:
         try:
             payload = json.loads(line)
             if "speaker" in payload and "text" in payload:
-                entries.append({"speaker": payload["speaker"], "text": payload["text"]})
+                entries.append({"speaker": payload["speaker"], "text": payload["text"], "ts": payload.get("ts", "")})
             elif "sender" in payload and "body" in payload:
-                entries.append({"speaker": payload["sender"], "text": payload["body"]})
+                entries.append({"speaker": payload["sender"], "text": payload["body"], "ts": payload.get("ts", "")})
         except json.JSONDecodeError:
             pass
     return entries[-limit:]
@@ -181,6 +195,47 @@ class StateStore:
         with self._lock:
             self.state["agents"][name].update(values)
             relay.write_json(self.path, self.state)
+
+    def record_agent_usage(self, name: str, tokens: int) -> None:
+        """Increment token usage for an agent, resetting the window if expired."""
+        with self._lock:
+            agent = self.state["agents"].get(name)
+            if not agent:
+                return
+            window = agent.setdefault("usage_window", {
+                "window_start": time.time(),
+                "tokens_used": 0,
+                "limit": DEFAULT_USAGE_LIMIT,
+            })
+            now = time.time()
+            if now - window["window_start"] >= USAGE_WINDOW_SECONDS:
+                window["window_start"] = now
+                window["tokens_used"] = 0
+            window["tokens_used"] += tokens
+            relay.write_json(self.path, self.state)
+
+    def fuel_for_agent(self, name: str) -> dict[str, Any]:
+        """Return fuel gauge data for a single agent."""
+        with self._lock:
+            agent = self.state["agents"].get(name, {})
+            window = agent.get("usage_window", {})
+            window_start = window.get("window_start", time.time())
+            tokens_used = window.get("tokens_used", 0)
+            limit = window.get("limit", DEFAULT_USAGE_LIMIT)
+            now = time.time()
+            # Auto-reset expired windows
+            if now - window_start >= USAGE_WINDOW_SECONDS:
+                tokens_used = 0
+                window_start = now
+            remaining = max(0, limit - tokens_used)
+            pct = round((remaining / limit) * 100, 1) if limit > 0 else 0
+            return {
+                "window_start": window_start,
+                "tokens_used": tokens_used,
+                "limit": limit,
+                "remaining": remaining,
+                "pct_remaining": pct,
+            }
 
 
 class RuntimeSupervisor:
@@ -264,6 +319,19 @@ class RuntimeSupervisor:
             if isinstance(allowed, list) and allowed:
                 return [str(item) for item in allowed]
         return [str(item["id"]) for item in agent.get("effort_options", [])]
+
+    def restart_agent(self, name: str) -> dict[str, Any]:
+        """Kill the process in an agent's pane and respawn its mirror command."""
+        agent = self.find_agent(name)
+        if not agent:
+            raise KeyError(name)
+        pane_target = self.pane_targets.get(agent["name"])
+        if not pane_target:
+            raise RuntimeError(f"no pane target for {name}")
+        # Force-respawn the mirror (kills whatever is running in the pane)
+        self.mirror_keys.pop(agent["name"], None)
+        self.sync_agent_mirrors(force=True)
+        return self.state.snapshot()["agents"][agent["name"]]
 
     def reset_agent_session(self, name: str) -> None:
         sessions = relay.load_sessions(self.workspace["sessions_path"])
@@ -491,6 +559,78 @@ class RuntimeSupervisor:
             pane_commands[pane_id] = pane_command.strip()
         return pane_commands
 
+    def _send_to_socket(self, message: dict[str, Any]) -> bool:
+        """Send a message to the relay socket. Returns True if sent successfully."""
+        socket_path = self.workspace.get("socket_path")
+        if not socket_path:
+            return False
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(str(socket_path))
+                sock.sendall(json.dumps(message).encode("utf-8"))
+                return True
+            finally:
+                sock.close()
+        except Exception as e:
+            print(f"[supervisor] socket error: {e}", file=sys.stderr)
+            return False
+
+    def _pick_compact_agent(self) -> str:
+        """Pick the agent with the most remaining fuel capacity. Tie-break: alphabetical."""
+        best_name = ""
+        best_remaining = -1
+        for name in sorted(self.state.snapshot()["agents"]):
+            fuel = self.state.fuel_for_agent(name)
+            if fuel["remaining"] > best_remaining:
+                best_remaining = fuel["remaining"]
+                best_name = name
+        return best_name
+
+    def compact_context(self) -> dict[str, Any]:
+        """Declutter temp logs and inject a summarization request into the transcript."""
+        cleared: list[str] = []
+
+        # Truncate agent io logs and relay log (not the transcript itself)
+        for path in [self.workspace["relay_log_path"]] + [
+            a["io_log_path"] for a in self.config["agents"] if a.get("io_log_path")
+        ]:
+            try:
+                relay.write_text(Path(path), "")
+                cleared.append(str(path))
+            except OSError:
+                pass
+
+        # Delete any .tmp files under the runtime dir
+        runtime_dir = self.workspace["log_path"].parent
+        for tmp in runtime_dir.glob("**/*.tmp"):
+            tmp.unlink(missing_ok=True)
+            cleared.append(str(tmp))
+
+        # Pick the agent with the most remaining capacity
+        chosen_agent = self._pick_compact_agent()
+
+        # Inject a SYSTEM message asking the chosen agent to summarize
+        summary_request = (
+            f"[COMPACT → {chosen_agent}] Please read the full conversation above and reply with a "
+            "single paragraph that summarises all key decisions, features built, open "
+            "questions, and next actions. Keep it under 120 words. This will replace the "
+            "working context for all agents."
+        )
+        message = {
+            "id": secrets.token_urlsafe(16),
+            "sender": "SYSTEM",
+            "seq": int(time.time() * 1000),
+            "type": "compact",
+            "body": summary_request,
+            "ts": utc_now(),
+        }
+        injected = self._send_to_socket(message)
+        if not injected:
+            relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)
+
+        return {"cleared": cleared, "injected": injected, "chosen_agent": chosen_agent}
+
     def refresh_transcript_state(self) -> None:
         log_path = self.workspace["log_path"]
         text = relay.read_text(log_path) if log_path.exists() else ""
@@ -554,6 +694,12 @@ class RuntimeSupervisor:
                     "last_updated_at": event.get("last_updated_at"),
                 },
             )
+            # Track usage: use character count as token proxy (~4 chars ≈ 1 token)
+            speaker = event.get("last_speaker", "").strip().upper()
+            char_count = event.get("char_count", 0)
+            if speaker and speaker in self.state.snapshot()["agents"] and char_count > 0:
+                estimated_tokens = max(1, char_count // 4)
+                self.state.record_agent_usage(speaker, estimated_tokens)
             return
 
         if event["type"] == "agent_state":
@@ -629,7 +775,11 @@ class RuntimeSupervisor:
                 if parsed.path == "/api/state":
                     if not self._authorized():
                         return self._json({"locked": True, "app": {"phase": "locked"}})
-                    return self._json(supervisor.state.snapshot())
+                    snapshot = supervisor.state.snapshot()
+                    # Enrich each agent with fuel gauge data
+                    for agent_name in snapshot.get("agents", {}):
+                        snapshot["agents"][agent_name]["fuel"] = supervisor.state.fuel_for_agent(agent_name)
+                    return self._json(snapshot)
                 if parsed.path == "/api/transcript":
                     if not self._authorized():
                         return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
@@ -675,16 +825,7 @@ class RuntimeSupervisor:
                         "ts": utc_now(),
                     }
                     
-                    socket_path = supervisor.workspace.get("socket_path")
-                    if socket_path and Path(socket_path).exists():
-                        try:
-                            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                            sock.connect(str(socket_path))
-                            sock.sendall(json.dumps(message).encode("utf-8"))
-                            sock.close()
-                        except Exception as e:
-                            print(f"[supervisor] error sending to socket: {e}", file=sys.stderr)
-                    else:
+                    if not supervisor._send_to_socket(message):
                         relay.append_tagged_entry(supervisor.workspace["log_path"], speaker, raw_message[:8000])
 
                     supervisor.state.patch(
@@ -712,6 +853,69 @@ class RuntimeSupervisor:
                     except KeyError:
                         return self._json({"ok": False, "error": "unknown agent"}, status=HTTPStatus.NOT_FOUND)
                     return self._json({"ok": True, "agent": agent_state, "state": supervisor.state.snapshot()})
+
+                if parsed.path.startswith("/api/agents/") and parsed.path.endswith("/restart"):
+                    parts = [part for part in parsed.path.split("/") if part]
+                    if len(parts) != 4:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    agent_name = parts[2]
+                    try:
+                        agent_state = supervisor.restart_agent(agent_name)
+                    except KeyError:
+                        return self._json({"ok": False, "error": "unknown agent"}, status=HTTPStatus.NOT_FOUND)
+                    except RuntimeError as exc:
+                        return self._json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return self._json({"ok": True, "agent": agent_state, "state": supervisor.state.snapshot()})
+
+                if parsed.path == "/api/compact":
+                    result = supervisor.compact_context()
+                    return self._json({
+                        "ok": True,
+                        "cleared": result["cleared"],
+                        "injected": result["injected"],
+                        "chosen_agent": result.get("chosen_agent", ""),
+                    })
+
+                if parsed.path == "/api/repo/pull":
+                    try:
+                        git_proc = subprocess.run(
+                            ["git", "pull"],
+                            cwd=str(SCRIPT_DIR),
+                            text=True,
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        chmod_proc = subprocess.run(
+                            ["chmod", "-R", "u+rw,g+rw", "."],
+                            cwd=str(SCRIPT_DIR),
+                            text=True,
+                            capture_output=True,
+                            timeout=15,
+                        )
+                        ok = git_proc.returncode == 0
+                        # Broadcast sync message to transcript
+                        sync_body = f"[SYNC] Repository synced. All agents now share read-write access to {SCRIPT_DIR}."
+                        sync_message = {
+                            "id": secrets.token_urlsafe(16),
+                            "sender": "SYSTEM",
+                            "seq": int(time.time() * 1000),
+                            "type": "sync",
+                            "body": sync_body,
+                            "ts": utc_now(),
+                        }
+                        if not supervisor._send_to_socket(sync_message):
+                            relay.append_tagged_entry(supervisor.workspace["log_path"], "SYSTEM", sync_body)
+                        return self._json({
+                            "ok": ok,
+                            "stdout": git_proc.stdout,
+                            "stderr": git_proc.stderr,
+                            "chmod_ok": chmod_proc.returncode == 0,
+                            "chmod_stderr": chmod_proc.stderr,
+                            "sync_path": str(SCRIPT_DIR),
+                        })
+                    except Exception as exc:
+                        return self._json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
                 self.send_error(HTTPStatus.NOT_FOUND)
 

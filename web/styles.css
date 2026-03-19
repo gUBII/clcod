@@ -206,6 +206,49 @@ button {
   font-size: 0.9rem;
 }
 
+.workspace__tachs {
+  display: flex;
+  gap: 16px;
+  margin-top: 12px;
+  align-items: center;
+}
+
+.htach {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.htach__name {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.compact-btn {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.compact-btn:hover:not(:disabled) {
+  border-color: var(--fg);
+  color: var(--fg);
+}
+
+.compact-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .engines {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -745,6 +788,14 @@ button {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--warn);
+}
+
+.message__time {
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  margin-left: 0.5em;
+  text-transform: none;
 }
 
 .message__body {

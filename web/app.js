@@ -32,6 +32,9 @@ const engineCards = document.getElementById("engineCards");
 const statusGrid = document.getElementById("statusGrid");
 const transcript = document.getElementById("transcript");
 const copyTmux = document.getElementById("copyTmux");
+const compactBtn = document.getElementById("compactBtn");
+const syncRepoBtn = document.getElementById("syncRepoBtn");
+const workspaceTachs = document.getElementById("workspaceTachs");
 const chatForm = document.getElementById("chatForm");
 const senderName = document.getElementById("senderName");
 const chatInput = document.getElementById("chatInput");
@@ -83,6 +86,41 @@ copyTmux.addEventListener("click", async () => {
 });
 
 statusGrid.addEventListener("click", async (event) => {
+  const restartButton = event.target.closest("button[data-agent][data-restart]");
+  if (restartButton && !restartButton.disabled) {
+    const agent = restartButton.dataset.agent;
+    restartButton.disabled = true;
+    restartButton.textContent = "Restarting...";
+    try {
+      const response = await fetch(`/api/agents/${agent}/restart`, { method: "POST" });
+      if (response.ok) {
+        restartButton.textContent = "Restarted";
+      } else {
+        restartButton.textContent = "Failed";
+      }
+    } catch {
+      restartButton.textContent = "Error";
+    }
+    setTimeout(() => { restartButton.textContent = "Restart"; restartButton.disabled = false; }, 3000);
+    return;
+  }
+
+  const inspectButton = event.target.closest("button[data-agent][data-inspect]");
+  if (inspectButton && !inspectButton.disabled) {
+    const paneTarget = inspectButton.dataset.inspect;
+    const attachCmd = latestState?.tmux?.attach_command || "tmux attach -t triagent";
+    const cmd = `tmux select-pane -t ${paneTarget} && ${attachCmd}`;
+    try {
+      await navigator.clipboard.writeText(cmd);
+      inspectButton.textContent = "Copied";
+      setTimeout(() => { inspectButton.textContent = "Inspect Stroker"; }, 1200);
+    } catch {
+      inspectButton.textContent = "Copy failed";
+      setTimeout(() => { inspectButton.textContent = "Inspect Stroker"; }, 1200);
+    }
+    return;
+  }
+
   const button = event.target.closest("button[data-agent][data-kind][data-option]");
   if (!button || button.disabled) {
     return;
@@ -151,6 +189,49 @@ chatForm.addEventListener("submit", async (event) => {
 });
 
 /* Enter on the message input submits the form (default for single-line input in a form). */
+
+compactBtn.addEventListener("click", async () => {
+  compactBtn.disabled = true;
+  compactBtn.textContent = "Compacting...";
+  try {
+    const response = await fetch("/api/compact", { method: "POST" });
+    const result = await response.json();
+    if (result.ok) {
+      compactBtn.textContent = "Compacted";
+      await pollTranscript();
+      setTimeout(() => { compactBtn.textContent = "Compact Context"; }, 3000);
+    } else {
+      compactBtn.textContent = "Failed";
+      setTimeout(() => { compactBtn.textContent = "Compact Context"; }, 3000);
+    }
+  } catch {
+    compactBtn.textContent = "Error";
+    setTimeout(() => { compactBtn.textContent = "Compact Context"; }, 3000);
+  } finally {
+    compactBtn.disabled = false;
+  }
+});
+
+syncRepoBtn.addEventListener("click", async () => {
+  syncRepoBtn.disabled = true;
+  syncRepoBtn.textContent = "Pulling...";
+  try {
+    const response = await fetch("/api/repo/pull", { method: "POST" });
+    const result = await response.json();
+    if (result.ok) {
+      syncRepoBtn.textContent = "Synced";
+      setTimeout(() => { syncRepoBtn.textContent = "Sync Repo"; }, 3000);
+    } else {
+      syncRepoBtn.textContent = "Failed";
+      setTimeout(() => { syncRepoBtn.textContent = "Sync Repo"; }, 3000);
+    }
+  } catch {
+    syncRepoBtn.textContent = "Error";
+    setTimeout(() => { syncRepoBtn.textContent = "Sync Repo"; }, 3000);
+  } finally {
+    syncRepoBtn.disabled = false;
+  }
+});
 
 function startPolling() {
   if (stateTimer) {
@@ -238,6 +319,7 @@ function renderEngines(agents) {
   const entries = Object.entries(agents);
   engineCards.innerHTML = "";
   statusGrid.innerHTML = "";
+  workspaceTachs.innerHTML = "";
 
   for (const [name, payload] of entries) {
     const state = payload.state || "starting";
@@ -268,6 +350,18 @@ function renderEngines(agents) {
     }
     previousStates.set(name, state);
     engineCards.appendChild(card);
+
+    const htach = document.createElement("div");
+    htach.className = `htach control--${state}`;
+    htach.innerHTML = `
+      <span class="htach__name">${name}</span>
+      <div class="control__tach">
+        <div class="tach__dial tach__dial--sm"></div>
+        <div class="tach__needle tach__needle--sm"></div>
+        <div class="tach__mark tach__mark--sm">${state === "ready" ? "REV" : state === "error" ? "ERR" : state === "warming" ? "REV" : "IDLE"}</div>
+      </div>
+    `;
+    workspaceTachs.appendChild(htach);
 
     const control = document.createElement("article");
     control.className = `control control--${state}`;
@@ -305,6 +399,23 @@ function renderEngines(agents) {
           )}
         </div>
       </div>
+      <div class="control__section control__section--actions">
+        <button
+          type="button"
+          class="compact-btn"
+          data-agent="${name}"
+          data-inspect="${payload.pane_target || ""}"
+          ${payload.pane_target ? "" : "disabled"}
+          title="${payload.pane_target ? `Copy: tmux select-pane -t ${payload.pane_target} &amp;&amp; ${latestState?.tmux?.attach_command || "tmux attach -t triagent"}` : "No pane target registered"}"
+        >Inspect Stroker</button>
+        <button
+          type="button"
+          class="compact-btn restart-btn"
+          data-agent="${name}"
+          data-restart="true"
+          title="Kill and restart this agent's mirror process"
+        >Restart</button>
+      </div>
       <p class="control__message" data-control-message>${payload.last_error || ""}</p>
     `;
     statusGrid.appendChild(control);
@@ -341,6 +452,21 @@ function setControlMessage(agent, message) {
   }
 }
 
+function formatTime(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    if (isNaN(d)) return "";
+    let h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, "0");
+    const ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12 || 12;
+    return `${h}:${m} ${ampm}`;
+  } catch {
+    return "";
+  }
+}
+
 function renderTranscript(entries) {
   transcript.innerHTML = "";
   if (!entries.length) {
@@ -348,10 +474,12 @@ function renderTranscript(entries) {
     return;
   }
   for (const entry of entries) {
+    const time = formatTime(entry.ts);
+    const timeSpan = time ? `<span class="message__time">${time}</span>` : "";
     const item = document.createElement("article");
     item.className = "message";
     item.innerHTML = `
-      <header class="message__header">${entry.speaker}</header>
+      <header class="message__header">${entry.speaker} ${timeSpan}</header>
       <pre class="message__body"></pre>
     `;
     item.querySelector(".message__body").textContent = entry.text || "";
