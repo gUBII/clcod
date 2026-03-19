@@ -1033,6 +1033,7 @@ async def run_relay(
                     "type": "transcript",
                     "last_speaker": sender,
                     "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "char_count": len(body),
                 },
             )
             relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")

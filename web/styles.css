@@ -691,6 +691,20 @@ button {
   color: var(--muted);
 }
 
+.fuel-gauge {
+  width: 100%;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 6px 0 4px;
+}
+.fuel-gauge__bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.6s ease, background 0.6s ease;
+}
+
 .control__message {
   min-height: 18px;
   margin: 16px 0 0;

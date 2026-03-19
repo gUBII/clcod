@@ -399,6 +399,21 @@ function renderEngines(agents) {
           )}
         </div>
       </div>
+      ${(() => {
+        const f = payload.fuel || {};
+        const pct = f.pct_remaining != null ? f.pct_remaining : 100;
+        const used = f.tokens_used || 0;
+        const limit = f.limit || 0;
+        const remaining = f.remaining != null ? f.remaining : limit;
+        const color = pct > 50 ? "var(--green, #22c55e)" : pct > 20 ? "var(--amber, #f59e0b)" : "var(--red, #ef4444)";
+        return `<div class="control__section">
+          <p class="control__label">Fuel &mdash; ${Math.round(pct)}% remaining</p>
+          <div class="fuel-gauge">
+            <div class="fuel-gauge__bar" style="width:${pct}%;background:${color}"></div>
+          </div>
+          <p class="control__detail">${used.toLocaleString()} / ${limit.toLocaleString()} tokens used</p>
+        </div>`;
+      })()}
       <div class="control__section control__section--actions">
         <button
           type="button"
