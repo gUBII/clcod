@@ -918,6 +918,7 @@ async def route_to(
                 "session_id": result.session_id,
                 "last_error": None,
                 "last_reply_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "tokens_delta": max(1, len(result.reply) // 4) if result.reply else 0,
             },
         )
     except FileNotFoundError:
@@ -959,6 +960,7 @@ async def run_relay(
     config: dict[str, Any],
     event_callback: EventCallback | None = None,
     stop_event: asyncio.Event | None = None,
+    is_sleeping: Callable[[], bool] | None = None,
 ) -> int:
     workspace = config["workspace"]
     log_path: Path = workspace["log_path"]
@@ -1037,6 +1039,11 @@ async def run_relay(
                 },
             )
             relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
+
+            # Skip routing when sleeping — message is already saved to transcript
+            if is_sleeping and is_sleeping():
+                relay_log(f"sleeping — message from {sender} saved but not routed")
+                return
 
             # Read back context to ensure we get the full log state
             fresh = read_text(log_path)

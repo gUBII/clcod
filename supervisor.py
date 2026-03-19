@@ -86,6 +86,7 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "app": {
             "phase": "booting",
+            "sleeping": False,
             "ui_url": build_ui_url(config),
             "default_sender": config["ui"]["default_sender"],
         },
@@ -246,12 +247,23 @@ class RuntimeSupervisor:
         self.settings_lock = threading.Lock()
         self.apply_saved_preferences()
         self.state = StateStore(config)
+        self._sleeping = False
+        self._sleep_lock = threading.Lock()
         self.stop_event = asyncio.Event()
         self.auth_tokens: set[str] = set()
         self.http_server: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
         self.mirror_keys: dict[str, tuple[str, str | None]] = {}
         self.pane_targets: dict[str, str] = {}
+
+    def is_sleeping(self) -> bool:
+        with self._sleep_lock:
+            return self._sleeping
+
+    def set_sleeping(self, value: bool) -> None:
+        with self._sleep_lock:
+            self._sleeping = value
+        self.state.patch("app", {"sleeping": value})
 
     def password(self) -> str:
         env_name = self.config["ui"]["password_env"]
@@ -711,6 +723,13 @@ class RuntimeSupervisor:
                 values["session_id"] = event["session_id"]
             if "last_reply_at" in event:
                 values["last_reply_at"] = event["last_reply_at"]
+                values["last_activity_ts"] = event["last_reply_at"]
+            if "tokens_delta" in event:
+                values["tokens_delta"] = event["tokens_delta"]
+                # Accumulate reply tokens into the agent's fuel gauge
+                tokens = event["tokens_delta"]
+                if tokens > 0:
+                    self.state.record_agent_usage(event["agent"], tokens)
             self.state.patch_agent(event["agent"], values)
 
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -920,6 +939,34 @@ class RuntimeSupervisor:
                     except Exception as exc:
                         return self._json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
+                if parsed.path == "/api/sleep":
+                    payload = self._payload()
+                    want_sleep = bool(payload.get("sleep", not supervisor.is_sleeping()))
+                    supervisor.set_sleeping(want_sleep)
+                    if not want_sleep:
+                        # Waking up — inject a catch-up message so agents process missed context
+                        wake_body = (
+                            "[WAKE] All agents are back online. Review the messages above that "
+                            "arrived during sleep and continue where we left off."
+                        )
+                        wake_message = {
+                            "id": secrets.token_urlsafe(16),
+                            "sender": "SYSTEM",
+                            "seq": int(time.time() * 1000),
+                            "type": "wake",
+                            "body": wake_body,
+                            "ts": utc_now(),
+                        }
+                        if not supervisor._send_to_socket(wake_message):
+                            relay.append_tagged_entry(
+                                supervisor.workspace["log_path"], "SYSTEM", wake_body
+                            )
+                    return self._json({
+                        "ok": True,
+                        "sleeping": want_sleep,
+                        "state": supervisor.state.snapshot(),
+                    })
+
                 self.send_error(HTTPStatus.NOT_FOUND)
 
         return Handler
@@ -957,6 +1004,7 @@ class RuntimeSupervisor:
                 self.config,
                 event_callback=self.handle_relay_event,
                 stop_event=self.stop_event,
+                is_sleeping=self.is_sleeping,
             )
         )
 

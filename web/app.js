@@ -34,6 +34,7 @@ const transcript = document.getElementById("transcript");
 const copyTmux = document.getElementById("copyTmux");
 const compactBtn = document.getElementById("compactBtn");
 const syncRepoBtn = document.getElementById("syncRepoBtn");
+const sleepBtn = document.getElementById("sleepBtn");
 const workspaceTachs = document.getElementById("workspaceTachs");
 const chatForm = document.getElementById("chatForm");
 const senderName = document.getElementById("senderName");
@@ -212,6 +213,32 @@ compactBtn.addEventListener("click", async () => {
   }
 });
 
+sleepBtn.addEventListener("click", async () => {
+  sleepBtn.disabled = true;
+  const isSleeping = latestState?.app?.sleeping;
+  sleepBtn.textContent = isSleeping ? "Waking..." : "Sleeping...";
+  try {
+    const response = await fetch("/api/sleep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sleep: !isSleeping }),
+    });
+    const result = await response.json();
+    if (result.ok) {
+      renderState(result.state);
+      sleepBtn.textContent = result.sleeping ? "Wake" : "Sleep";
+    } else {
+      sleepBtn.textContent = "Failed";
+      setTimeout(() => { sleepBtn.textContent = isSleeping ? "Wake" : "Sleep"; }, 3000);
+    }
+  } catch {
+    sleepBtn.textContent = "Error";
+    setTimeout(() => { sleepBtn.textContent = isSleeping ? "Wake" : "Sleep"; }, 3000);
+  } finally {
+    sleepBtn.disabled = false;
+  }
+});
+
 syncRepoBtn.addEventListener("click", async () => {
   syncRepoBtn.disabled = true;
   syncRepoBtn.textContent = "Pulling...";
@@ -280,6 +307,7 @@ function renderState(state) {
   workspaceTmux.textContent = tmuxState.textContent;
   tmuxCommand.textContent = state.tmux?.attach_command || "tmux attach -t triagent";
   hydrateSender(state.app?.default_sender || "Operator");
+  sleepBtn.textContent = state.app?.sleeping ? "Wake" : "Sleep";
   renderEngines(state.agents || {});
 
   if (!unlocked) {

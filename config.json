@@ -28,6 +28,7 @@
       ],
       "model_options": [
         "default",
+        "haiku",
         "sonnet",
         "opus"
       ],
