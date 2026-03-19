@@ -22,7 +22,8 @@
 
 body {
   margin: 0;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   color: var(--text);
   font-family: var(--font-display);
   background:
@@ -45,8 +46,10 @@ body::before {
 
 .shell {
   position: relative;
-  min-height: 100vh;
+  height: 100%;
   padding: 28px;
+  display: flex;
+  flex-direction: column;
 }
 
 .chrome,
@@ -101,6 +104,11 @@ body::before {
 
 .main {
   margin-top: 26px;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .hidden {
@@ -172,8 +180,12 @@ button {
 
 .engine-room,
 .workspace {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 22px;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .hero,
@@ -235,23 +247,69 @@ button {
   background: rgba(255, 255, 255, 0.07);
 }
 
-.engine__gauge {
+.engine__tach {
   position: relative;
-  margin: 26px 0 22px;
-  height: 88px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background:
-    radial-gradient(circle at center, rgba(255, 255, 255, 0.06), transparent 60%),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.04), transparent);
+  width: 140px;
+  height: 70px;
+  margin: 26px auto 22px;
+  overflow: hidden;
 }
 
-.engine__beam {
+.tach__dial {
   position: absolute;
-  inset: 18px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.12), transparent 40%, rgba(255, 255, 255, 0.22));
-  transform-origin: left center;
+  top: 0;
+  left: 0;
+  width: 140px;
+  height: 140px;
+  border-radius: 50%;
+  border: 12px solid rgba(255, 255, 255, 0.04);
+  box-sizing: border-box;
+  background: conic-gradient(
+    from -90deg at 50% 100%,
+    rgba(112, 240, 194, 0.12) 0deg 45deg,
+    rgba(255, 196, 107, 0.12) 45deg 135deg,
+    rgba(255, 97, 120, 0.12) 135deg 180deg,
+    transparent 180deg
+  );
+  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 58px, black 60px);
+}
+
+.tach__needle {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  height: 60px;
+  background: var(--hot);
+  transform-origin: bottom center;
+  transition: transform 0.6s cubic-bezier(0.17, 0.67, 0.2, 1.01);
+  transform: translateX(-50%) rotate(-70deg);
+  z-index: 2;
+  box-shadow: 0 0 8px var(--hot);
+}
+
+.tach__needle::after {
+  content: "";
+  position: absolute;
+  bottom: -4px;
+  left: -4px;
+  width: 10px;
+  height: 10px;
+  background: var(--hot);
+  border-radius: 50%;
+  box-shadow: 0 0 10px var(--hot);
+}
+
+.tach__mark {
+  position: absolute;
+  bottom: 4px;
+  width: 100%;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  opacity: 0.8;
 }
 
 .engine__note {
@@ -294,25 +352,52 @@ button {
   background: rgba(112, 240, 194, 0.92);
 }
 
+.engine--error {
+  filter: saturate(0.4) brightness(0.7);
+  border-color: rgba(255, 97, 120, 0.2);
+  background: linear-gradient(180deg, rgba(14, 18, 26, 0.99), rgba(5, 8, 12, 0.98));
+}
+
 .engine--error .engine__spark {
-  background: rgba(255, 97, 120, 0.92);
+  background: rgba(180, 20, 40, 0.95);
+  filter: blur(48px);
+  opacity: 0.45;
 }
 
-.engine--starting .engine__beam,
-.engine--auth .engine__beam {
-  animation: pulse 2s ease-in-out infinite;
+.engine--starting .tach__needle,
+.engine--auth .tach__needle {
+  transform: translateX(-50%) rotate(-20deg);
+  animation: jitter-mid 1.2s ease-in-out infinite;
 }
 
-.engine--warming .engine__beam {
-  animation: pulse 1.1s ease-in-out infinite;
+.engine--warming .tach__needle {
+  transform: translateX(-50%) rotate(72deg);
+  animation: jitter-high 0.12s ease-in-out infinite;
 }
 
-.engine--ready .engine__beam {
-  background: linear-gradient(90deg, rgba(112, 240, 194, 0.18), rgba(112, 240, 194, 0.8));
+.engine--ready .tach__needle {
+  transform: translateX(-50%) rotate(-65deg);
+  animation: jitter-idle 3s ease-in-out infinite;
 }
 
-.engine--error .engine__beam {
-  background: linear-gradient(90deg, rgba(255, 97, 120, 0.18), rgba(255, 97, 120, 0.82));
+.engine--error .tach__needle {
+  transform: translateX(-50%) rotate(-90deg);
+  transition: transform 2s ease-out;
+}
+
+@keyframes jitter-idle {
+  0%, 100% { transform: translateX(-50%) rotate(-65deg); }
+  50% { transform: translateX(-50%) rotate(-63deg); }
+}
+
+@keyframes jitter-mid {
+  0%, 100% { transform: translateX(-50%) rotate(-20deg); }
+  50% { transform: translateX(-50%) rotate(-17deg); }
+}
+
+@keyframes jitter-high {
+  0%, 100% { transform: translateX(-50%) rotate(72deg); }
+  50% { transform: translateX(-50%) rotate(78deg); }
 }
 
 .engine--ignite::after {
@@ -344,7 +429,10 @@ button {
 .workspace__grid {
   display: grid;
   grid-template-columns: 430px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 18px;
+  flex: 1 1 0;
+  min-height: 0;
 }
 
 .panel {
@@ -352,6 +440,8 @@ button {
   border: 1px solid var(--line);
   background: var(--panel-strong);
   padding: 22px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .panel__header {
@@ -380,27 +470,16 @@ button {
     rgba(255, 255, 255, 0.03);
 }
 
-.control__header,
-.composer__top {
+.control__header {
   display: flex;
   justify-content: space-between;
   gap: 14px;
   align-items: start;
 }
 
-.composer__top .field {
-  flex: 1 1 auto;
-}
-
-.composer__top button {
-  align-self: end;
-}
-
 .control__name,
 .control__detail,
 .control__label,
-.composer__meta,
-.composer__status,
 .field__label,
 .transcript__empty {
   margin: 0;
@@ -413,8 +492,6 @@ button {
 }
 
 .control__detail,
-.composer__meta,
-.composer__status,
 .transcript__empty {
   margin-top: 6px;
   color: var(--muted);
@@ -491,23 +568,58 @@ button {
   font-size: 0.78rem;
 }
 
-.panel--composer {
-  padding-top: 18px;
+.chat-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 22px;
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+  backdrop-filter: blur(20px);
+  box-shadow: var(--shadow);
+  flex-shrink: 0;
 }
 
-.composer {
-  display: grid;
-  gap: 18px;
+.chat-bar__sender {
+  width: 120px;
+  flex-shrink: 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 0.85rem;
+}
+
+.chat-bar__message {
+  flex: 1 1 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 0.9rem;
+}
+
+.chat-bar__send {
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 1.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-bar__status {
+  position: absolute;
+  bottom: -20px;
+  left: 14px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
 }
 
 .field {
   display: grid;
   gap: 10px;
-}
-
-.field--message textarea {
-  min-height: 150px;
-  resize: vertical;
 }
 
 .field__label {
@@ -517,21 +629,19 @@ button {
   color: var(--muted);
 }
 
-textarea {
-  width: 100%;
-  padding: 16px 18px;
-  border-radius: 18px;
-  border: 1px solid rgba(140, 199, 255, 0.22);
-  color: var(--text);
-  font: inherit;
-  background: rgba(5, 10, 18, 0.92);
+.panel--transcript {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .transcript {
-  max-height: 66vh;
-  overflow: auto;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
   display: grid;
   gap: 14px;
+  align-content: start;
 }
 
 .message {
@@ -593,10 +703,17 @@ textarea {
   .hero,
   .workspace__header,
   .boot-console,
-  .control__header,
-  .composer__top {
+  .control__header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .chat-bar {
+    flex-wrap: wrap;
+  }
+
+  .chat-bar__sender {
+    width: 100%;
   }
 
   .hero__meta,
