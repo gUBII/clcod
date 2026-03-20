@@ -206,6 +206,111 @@ chatForm.addEventListener("submit", async (event) => {
   setTimeout(() => { pollTranscript(); }, 500);
 });
 
+/* ── @ mention popup ─────────────────────────────────── */
+
+const STATIC_MENTION_TARGETS = ["CLAUDE", "CODEX", "GEMINI"];
+
+function getMentionTargets() {
+  const agentNames = latestState?.agents ? Object.keys(latestState.agents).map(n => n.toUpperCase()) : [];
+  const merged = new Set([...STATIC_MENTION_TARGETS, ...agentNames]);
+  return Array.from(merged);
+}
+
+function getMentionQuery(value, cursorPos) {
+  const before = value.slice(0, cursorPos);
+  const match = before.match(/@(\w*)$/);
+  return match ? match[1] : null;
+}
+
+function showMentionPopup(query) {
+  const targets = getMentionTargets();
+  const filtered = query === ""
+    ? targets
+    : targets.filter(t => t.toLowerCase().startsWith(query.toLowerCase()));
+
+  if (!filtered.length) {
+    hideMentionPopup();
+    return;
+  }
+
+  mentionPopup.innerHTML = "";
+  filtered.forEach((name, i) => {
+    const item = document.createElement("div");
+    item.className = "mention-popup__item";
+    item.dataset.name = name;
+    if (i === 0) item.classList.add("active");
+    item.textContent = `@${name}`;
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      insertMention(name);
+    });
+    mentionPopup.appendChild(item);
+  });
+  mentionPopup.classList.remove("hidden");
+}
+
+function hideMentionPopup() {
+  mentionPopup.classList.add("hidden");
+  mentionPopup.innerHTML = "";
+}
+
+function getActiveMentionItem() {
+  return mentionPopup.querySelector(".active");
+}
+
+function moveMentionSelection(dir) {
+  const items = Array.from(mentionPopup.querySelectorAll(".mention-popup__item"));
+  if (!items.length) return;
+  const current = getActiveMentionItem();
+  const idx = current ? items.indexOf(current) : -1;
+  const next = items[(idx + dir + items.length) % items.length];
+  if (current) current.classList.remove("active");
+  next.classList.add("active");
+}
+
+function insertMention(name) {
+  const value = chatInput.value;
+  const pos = chatInput.selectionStart;
+  const before = value.slice(0, pos).replace(/@\w*$/, `@${name} `);
+  const after = value.slice(pos);
+  chatInput.value = before + after;
+  chatInput.setSelectionRange(before.length, before.length);
+  hideMentionPopup();
+  chatInput.focus();
+}
+
+chatInput.addEventListener("input", () => {
+  const query = getMentionQuery(chatInput.value, chatInput.selectionStart);
+  if (query === null) {
+    hideMentionPopup();
+  } else {
+    showMentionPopup(query);
+  }
+});
+
+chatInput.addEventListener("keydown", (e) => {
+  if (mentionPopup.classList.contains("hidden")) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    moveMentionSelection(1);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    moveMentionSelection(-1);
+  } else if (e.key === "Enter" || e.key === "Tab") {
+    const active = getActiveMentionItem();
+    if (active) {
+      e.preventDefault();
+      insertMention(active.dataset.name);
+    }
+  } else if (e.key === "Escape") {
+    hideMentionPopup();
+  }
+});
+
+chatInput.addEventListener("blur", () => {
+  setTimeout(hideMentionPopup, 150);
+});
+
 /* Enter on the message input submits the form (default for single-line input in a form). */
 
 compactBtn.addEventListener("click", async () => {
