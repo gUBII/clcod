@@ -222,7 +222,7 @@ class SupervisorTests(unittest.TestCase):
             runtime = supervisor.RuntimeSupervisor(config)
             runtime.sse_broadcast = mock.Mock()
 
-            runtime.handle_relay_event({"type": "agent_state", "agent": "CLAUDE", "state": "working"})
+            runtime.handle_relay_event({"type": "agent_state", "agent": "CLAUDE", "state": "warming"})
             runtime.handle_relay_event(
                 {
                     "type": "agent_state",
@@ -236,8 +236,80 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(agent["state"], "ready")
             self.assertIn("pressure", agent)
             self.assertGreaterEqual(agent["pressure"]["last_latency_ms"], 0)
-            runtime.sse_broadcast.assert_any_call("agent_state", {"agent": "CLAUDE", "state": "working"})
-            runtime.sse_broadcast.assert_any_call("agent_state", {"agent": "CLAUDE", "state": "ready"})
+            runtime.sse_broadcast.assert_any_call(
+                "agent_state", {"agent": "CLAUDE", "state": "warming", "last_error": None}
+            )
+            runtime.sse_broadcast.assert_any_call(
+                "agent_state", {"agent": "CLAUDE", "state": "ready", "last_error": None}
+            )
+
+    def test_handle_relay_event_warming_sets_dispatch_ts(self):
+        """BUG-3: Pressure tracking must trigger on 'warming', not 'working'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sse_broadcast = mock.Mock()
+
+            # "warming" should set dispatch_ts > 0
+            runtime.handle_relay_event({"type": "agent_state", "agent": "CLAUDE", "state": "warming"})
+            agent = runtime.state.snapshot()["agents"]["CLAUDE"]
+            self.assertGreater(agent["pressure"]["dispatch_ts"], 0)
+            self.assertEqual(agent["pressure"]["queue_depth"], 1)
+
+    def test_handle_relay_event_dispatcher_enriched_broadcast(self):
+        """BUG-11: Dispatcher SSE must include counter updates."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sse_broadcast = mock.Mock()
+
+            runtime.handle_relay_event({
+                "type": "dispatcher",
+                "action": "absorb",
+                "targets": [],
+            })
+
+            broadcast_call = runtime.sse_broadcast.call_args
+            self.assertEqual(broadcast_call[0][0], "dispatcher")
+            payload = broadcast_call[0][1]
+            self.assertIn("routes_total", payload)
+            self.assertIn("absorbs_total", payload)
+            self.assertIn("tokens_saved", payload)
+            self.assertEqual(payload["absorbs_total"], 1)
 
 
 if __name__ == "__main__":

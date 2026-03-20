@@ -17,6 +17,30 @@
           <div class="chrome__project" id="projectPicker">
             <span class="chrome__project-label">Project</span>
             <span class="chrome__project-name" id="projectName">none</span>
+            <button type="button" class="chrome__project-btn" id="projectMenuBtn" title="Manage project">&#9662;</button>
+            <div class="project-dropdown hidden" id="projectDropdown">
+              <div class="project-dropdown__section">
+                <label class="project-dropdown__label">Local path</label>
+                <div class="project-dropdown__row">
+                  <input id="projectPathInput" type="text" placeholder="/path/to/repo" class="project-dropdown__input">
+                  <button type="button" id="lockPathBtn" class="compact-btn">Lock</button>
+                </div>
+              </div>
+              <div class="project-dropdown__section">
+                <label class="project-dropdown__label">Clone URL</label>
+                <div class="project-dropdown__row">
+                  <input id="projectUrlInput" type="text" placeholder="https://github.com/..." class="project-dropdown__input">
+                  <button type="button" id="cloneUrlBtn" class="compact-btn">Clone</button>
+                </div>
+              </div>
+              <div class="project-dropdown__section">
+                <button type="button" id="unlockProjectBtn" class="compact-btn" style="width:100%">Unlock (return home)</button>
+              </div>
+              <div class="project-dropdown__section">
+                <label class="project-dropdown__label">Saved projects</label>
+                <div id="projectList" class="project-dropdown__list"></div>
+              </div>
+            </div>
           </div>
         </div>
         <div class="chrome__right">
@@ -135,6 +159,25 @@
             <span class="chat-bar__status" id="chatStatus"></span>
           </form>
         </section>
+        <div class="modal-overlay hidden" id="dispatcherModal">
+          <div class="modal-panel">
+            <header class="modal-panel__header">
+              <h3>Dispatcher Health</h3>
+              <button type="button" class="modal-panel__close" title="Close">&times;</button>
+            </header>
+            <div class="modal-panel__body" id="dispatcherModalBody">Loading...</div>
+          </div>
+        </div>
+
+        <div class="modal-overlay hidden" id="agentModal">
+          <div class="modal-panel modal-panel--wide">
+            <header class="modal-panel__header">
+              <h3 id="agentModalHeader">Agent</h3>
+              <button type="button" class="modal-panel__close" title="Close">&times;</button>
+            </header>
+            <div class="modal-panel__body" id="agentModalBody">Loading...</div>
+          </div>
+        </div>
       </main>
     </div>
 

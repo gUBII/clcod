@@ -116,6 +116,12 @@ statusGrid.addEventListener("click", async (event) => {
     return;
   }
 
+  const detailsButton = event.target.closest("button[data-agent][data-details]");
+  if (detailsButton) {
+    openAgentModal(detailsButton.dataset.agent);
+    return;
+  }
+
   const inspectButton = event.target.closest("button[data-agent][data-inspect]");
   if (inspectButton && !inspectButton.disabled) {
     const paneTarget = inspectButton.dataset.inspect;
@@ -196,7 +202,7 @@ chatForm.addEventListener("submit", async (event) => {
   chatInput.value = "";
   chatStatus.textContent = "Message posted to the transcript.";
   renderState(result.state);
-  await pollTranscript();
+  setTimeout(() => { pollTranscript(); }, 500);
 });
 
 /* Enter on the message input submits the form (default for single-line input in a form). */
@@ -311,12 +317,16 @@ function startPolling() {
         case "agent_state":
           if (latestState?.agents?.[data.agent]) {
             latestState.agents[data.agent].state = data.state;
+            if (data.last_error !== undefined) {
+              latestState.agents[data.agent].last_error = data.last_error;
+            }
             renderState(latestState);
           }
           break;
         case "dispatcher":
           if (latestState) {
-            latestState.dispatcher = { ...latestState.dispatcher, ...data };
+            const { type: _t, ...rest } = data;
+            latestState.dispatcher = { ...latestState.dispatcher, ...rest };
             renderDispatcher(latestState);
           }
           break;
@@ -565,6 +575,13 @@ function renderEngines(agents) {
           data-restart="true"
           title="Kill and restart this agent's mirror process"
         >Restart</button>
+        <button
+          type="button"
+          class="compact-btn"
+          data-agent="${name}"
+          data-details="true"
+          title="View detailed agent state, pressure, and logs"
+        >Details</button>
       </div>
       <p class="control__message" data-control-message>${payload.last_error || ""}</p>
     `;
@@ -656,12 +673,276 @@ function showWorkspace() {
   workspace.classList.remove("hidden");
 }
 
-/* ── Project name ────────────────────────────────────── */
+/* ── Project name + picker ────────────────────────────── */
+
+const projectMenuBtn = document.getElementById("projectMenuBtn");
+const projectDropdown = document.getElementById("projectDropdown");
+const projectPathInput = document.getElementById("projectPathInput");
+const lockPathBtn = document.getElementById("lockPathBtn");
+const projectUrlInput = document.getElementById("projectUrlInput");
+const cloneUrlBtn = document.getElementById("cloneUrlBtn");
+const unlockProjectBtn = document.getElementById("unlockProjectBtn");
+const projectList = document.getElementById("projectList");
+
+projectMenuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  projectDropdown.classList.toggle("hidden");
+  if (!projectDropdown.classList.contains("hidden")) {
+    fetchProjects();
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!projectDropdown.contains(e.target) && e.target !== projectMenuBtn) {
+    projectDropdown.classList.add("hidden");
+  }
+});
+
+lockPathBtn.addEventListener("click", async () => {
+  const path = projectPathInput.value.trim();
+  if (!path) return;
+  lockPathBtn.disabled = true;
+  lockPathBtn.textContent = "Locking...";
+  try {
+    const res = await fetch("/api/projects/lock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      projectPathInput.value = "";
+      projectDropdown.classList.add("hidden");
+      pollState();
+    } else {
+      lockPathBtn.textContent = data.error || "Failed";
+      setTimeout(() => { lockPathBtn.textContent = "Lock"; }, 3000);
+    }
+  } catch {
+    lockPathBtn.textContent = "Error";
+    setTimeout(() => { lockPathBtn.textContent = "Lock"; }, 3000);
+  } finally {
+    lockPathBtn.disabled = false;
+    lockPathBtn.textContent = "Lock";
+  }
+});
+
+cloneUrlBtn.addEventListener("click", async () => {
+  const url = projectUrlInput.value.trim();
+  if (!url) return;
+  cloneUrlBtn.disabled = true;
+  cloneUrlBtn.textContent = "Cloning...";
+  try {
+    const res = await fetch("/api/projects/lock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      projectUrlInput.value = "";
+      projectDropdown.classList.add("hidden");
+      pollState();
+    } else {
+      cloneUrlBtn.textContent = data.error || "Failed";
+      setTimeout(() => { cloneUrlBtn.textContent = "Clone"; }, 3000);
+    }
+  } catch {
+    cloneUrlBtn.textContent = "Error";
+    setTimeout(() => { cloneUrlBtn.textContent = "Clone"; }, 3000);
+  } finally {
+    cloneUrlBtn.disabled = false;
+    cloneUrlBtn.textContent = "Clone";
+  }
+});
+
+unlockProjectBtn.addEventListener("click", async () => {
+  unlockProjectBtn.disabled = true;
+  unlockProjectBtn.textContent = "Unlocking...";
+  try {
+    const res = await fetch("/api/projects/unlock", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      projectDropdown.classList.add("hidden");
+      pollState();
+    }
+  } catch { /* ignore */ }
+  finally {
+    unlockProjectBtn.disabled = false;
+    unlockProjectBtn.textContent = "Unlock (return home)";
+  }
+});
+
+async function fetchProjects() {
+  try {
+    const res = await fetch("/api/projects");
+    if (!res.ok) return;
+    const data = await res.json();
+    const projects = data.projects || {};
+    const activeId = data.active;
+    projectList.innerHTML = "";
+    const ids = Object.keys(projects);
+    if (!ids.length) {
+      projectList.innerHTML = `<p class="project-dropdown__empty">No saved projects</p>`;
+      return;
+    }
+    for (const id of ids) {
+      const p = projects[id];
+      const row = document.createElement("div");
+      row.className = `project-dropdown__item${id === activeId ? " project-dropdown__item--active" : ""}`;
+      row.innerHTML = `<span>${p.name || id}</span><button type="button" class="compact-btn" data-lock-id="${id}" data-lock-path="${p.path}">Lock</button>`;
+      projectList.appendChild(row);
+    }
+    projectList.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-lock-path]");
+      if (!btn) return;
+      btn.disabled = true;
+      btn.textContent = "Locking...";
+      try {
+        const res = await fetch("/api/projects/lock", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: btn.dataset.lockPath }),
+        });
+        if (res.ok) {
+          projectDropdown.classList.add("hidden");
+          pollState();
+        }
+      } catch { /* ignore */ }
+      finally { btn.disabled = false; btn.textContent = "Lock"; }
+    });
+  } catch { /* ignore */ }
+}
 
 function renderProjectName(state) {
   const name = state.project?.name || state.project?.active || "none";
   projectName.textContent = name;
 }
+
+/* ── Dispatcher modal ─────────────────────────────────── */
+
+const dispatcherModal = document.getElementById("dispatcherModal");
+const dispatcherModalBody = document.getElementById("dispatcherModalBody");
+
+document.getElementById("dispatcherBar").addEventListener("click", async () => {
+  dispatcherModal.classList.remove("hidden");
+  dispatcherModalBody.innerHTML = "Loading...";
+  try {
+    const res = await fetch("/api/dispatcher/health");
+    if (!res.ok) { dispatcherModalBody.innerHTML = "Failed to load."; return; }
+    const d = await res.json();
+    const ollamaStatus = d.available
+      ? `<span style="color:var(--ready)">Online</span>`
+      : `<span style="color:var(--error)">Offline</span>`;
+    const modelsList = (d.models || []).length
+      ? d.models.map(m => `<div class="modal-kv"><span>${m}</span></div>`).join("")
+      : `<span style="color:var(--muted)">No models loaded</span>`;
+    dispatcherModalBody.innerHTML = `
+      <div class="modal-section">
+        <p class="modal-section__title">Ollama Status</p>
+        <div class="modal-kv"><span>Status</span><span>${ollamaStatus}</span></div>
+        <div class="modal-kv"><span>Router model</span><span>${d.router_model || "none"}</span></div>
+        <div class="modal-kv"><span>Dispatcher state</span><span>${d.state || "unknown"}</span></div>
+      </div>
+      <div class="modal-section">
+        <p class="modal-section__title">Loaded Models</p>
+        ${modelsList}
+      </div>
+      <div class="modal-section">
+        <p class="modal-section__title">Routing Stats</p>
+        <div class="modal-kv"><span>Routes</span><span>${d.routes_total || 0}</span></div>
+        <div class="modal-kv"><span>Absorbed</span><span>${d.absorbs_total || 0}</span></div>
+        <div class="modal-kv"><span>Tokens saved</span><span>${(d.tokens_saved || 0).toLocaleString()}</span></div>
+        <div class="modal-kv"><span>Last action</span><span>${d.last_action || "—"}</span></div>
+        <div class="modal-kv"><span>Last targets</span><span>${(d.last_targets || []).join(", ") || "—"}</span></div>
+      </div>
+    `;
+  } catch { dispatcherModalBody.innerHTML = "Error fetching health."; }
+});
+
+dispatcherModal.querySelector(".modal-panel__close").addEventListener("click", () => {
+  dispatcherModal.classList.add("hidden");
+});
+dispatcherModal.addEventListener("click", (e) => {
+  if (e.target === dispatcherModal) dispatcherModal.classList.add("hidden");
+});
+
+/* ── Agent modal ─────────────────────────────────────── */
+
+const agentModal = document.getElementById("agentModal");
+const agentModalHeader = document.getElementById("agentModalHeader");
+const agentModalBody = document.getElementById("agentModalBody");
+
+async function openAgentModal(name) {
+  agentModal.classList.remove("hidden");
+  agentModalHeader.textContent = name;
+  agentModalBody.innerHTML = "Loading...";
+
+  const snap = latestState?.agents?.[name] || {};
+  const pressure = snap.pressure || {};
+  const fuel = snap.fuel || {};
+
+  let warnings = "";
+  if (snap.state === "warming" && snap.last_reply_at) {
+    const silent = (Date.now() - new Date(snap.last_reply_at).getTime()) / 1000;
+    if (silent > 30) {
+      warnings += `<div class="modal-warning">Silent for ${Math.round(silent)}s while warming — may be stuck</div>`;
+    }
+  }
+  if ((pressure.queue_depth || 0) > 3) {
+    warnings += `<div class="modal-warning">Queue depth is ${pressure.queue_depth} — backpressure building</div>`;
+  }
+
+  let html = warnings;
+  html += `
+    <div class="modal-section">
+      <p class="modal-section__title">State</p>
+      <div class="modal-kv"><span>State</span><span>${snap.state || "unknown"}</span></div>
+      <div class="modal-kv"><span>Session</span><span>${snap.session_id || "—"}</span></div>
+      <div class="modal-kv"><span>Last reply</span><span>${snap.last_reply_at || "—"}</span></div>
+      <div class="modal-kv"><span>Last error</span><span>${snap.last_error || "—"}</span></div>
+      <div class="modal-kv"><span>Pane target</span><span>${snap.pane_target || "—"}</span></div>
+    </div>
+    <div class="modal-section">
+      <p class="modal-section__title">Pressure</p>
+      <div class="modal-kv"><span>Queue depth</span><span>${pressure.queue_depth || 0}</span></div>
+      <div class="modal-kv"><span>Latency</span><span>${pressure.last_latency_ms || 0} ms</span></div>
+      <div class="modal-kv"><span>Tokens/sec</span><span>${pressure.tokens_per_sec || 0}</span></div>
+      <div class="modal-kv"><span>Error rate (5m)</span><span>${pressure.error_rate_5m || 0}</span></div>
+    </div>
+    <div class="modal-section">
+      <p class="modal-section__title">Fuel</p>
+      <div class="modal-kv"><span>Remaining</span><span>${fuel.pct_remaining != null ? Math.round(fuel.pct_remaining) + "%" : "—"}</span></div>
+      <div class="modal-kv"><span>Tokens used</span><span>${(fuel.tokens_used || 0).toLocaleString()}</span></div>
+      <div class="modal-kv"><span>Limit</span><span>${(fuel.limit || 0).toLocaleString()}</span></div>
+    </div>
+  `;
+
+  agentModalBody.innerHTML = html + `<div class="modal-section"><p class="modal-section__title">IO Log (last 30)</p><pre class="modal-log">Loading...</pre></div>`;
+
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/logs?tail=30`);
+    if (res.ok) {
+      const data = await res.json();
+      const logEl = agentModalBody.querySelector(".modal-log");
+      logEl.textContent = (data.lines || []).join("\n") || "(empty)";
+    }
+  } catch { /* ignore */ }
+}
+
+agentModal.querySelector(".modal-panel__close").addEventListener("click", () => {
+  agentModal.classList.add("hidden");
+});
+agentModal.addEventListener("click", (e) => {
+  if (e.target === agentModal) agentModal.classList.add("hidden");
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    dispatcherModal.classList.add("hidden");
+    agentModal.classList.add("hidden");
+  }
+});
 
 /* ── Dispatcher bar ──────────────────────────────────── */
 
@@ -669,7 +950,8 @@ function renderDispatcher(state) {
   const d = state.dispatcher || {};
   const dState = d.state || "disabled";
   dispatcherDot.className = `dispatcher-bar__dot dispatcher-bar__dot--${dState}`;
-  dispatcherLabel.textContent = `Dispatcher: ${dState}`;
+  const modelInfo = d.router_model ? ` (${d.router_model})` : "";
+  dispatcherLabel.textContent = `Dispatcher: ${dState}${modelInfo}`;
   dispatcherRoutes.textContent = String(d.routes_total || 0);
   dispatcherAbsorbs.textContent = String(d.absorbs_total || 0);
   dispatcherTokens.textContent = (d.tokens_saved || 0).toLocaleString();
@@ -682,7 +964,7 @@ let cachedTasks = [];
 function renderTaskBoard(tasks) {
   cachedTasks = tasks;
   const pending = tasks.filter(t => t.status === "pending");
-  const active = tasks.filter(t => t.status === "in_progress");
+  const active = tasks.filter(t => t.status === "assigned" || t.status === "in_progress");
   const done = tasks.filter(t => t.status === "done").slice(-20);
 
   tasksPending.innerHTML = pending.length ? "" : `<p class="task-board__empty">—</p>`;
@@ -736,4 +1018,18 @@ themeToggle.addEventListener("click", () => {
 
 applyTheme(localStorage.getItem(themeKey) || "dark");
 
-showGate();
+(async () => {
+  try {
+    const res = await fetch("/api/state");
+    if (res.ok) {
+      const data = await res.json();
+      if (!data.locked) {
+        unlocked = true;
+        renderState(data);
+        startPolling();
+        return;
+      }
+    }
+  } catch { /* fall through */ }
+  showGate();
+})();

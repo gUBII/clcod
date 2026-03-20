@@ -302,6 +302,7 @@ class RuntimeSupervisor:
         self._sleep_lock = threading.Lock()
         self.stop_event = asyncio.Event()
         self.auth_tokens: set[str] = set()
+        self._load_auth_tokens()
         self.http_server: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
         self.mirror_keys: dict[str, tuple[str, str | None]] = {}
@@ -309,6 +310,18 @@ class RuntimeSupervisor:
         self.projects_path: Path = config["workspace"]["projects_path"]
         self._sse_clients: list[queue.Queue] = []
         self._sse_lock = threading.Lock()
+
+    @property
+    def _auth_tokens_path(self) -> Path:
+        return self.workspace["log_path"].parent / "auth_tokens.json"
+
+    def _load_auth_tokens(self) -> None:
+        data = relay.read_json(self._auth_tokens_path, [])
+        if isinstance(data, list):
+            self.auth_tokens = set(data)
+
+    def _save_auth_tokens(self) -> None:
+        relay.write_json(self._auth_tokens_path, list(self.auth_tokens))
 
     def sse_subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=64)
@@ -833,17 +846,10 @@ class RuntimeSupervisor:
                 "questions, and next actions. Keep it under 120 words. This will replace the "
                 "working context for all agents."
             )
-            message = {
-                "id": secrets.token_urlsafe(16),
-                "sender": "SYSTEM",
-                "seq": int(time.time() * 1000),
-                "type": "compact",
-                "body": summary_request,
-                "ts": utc_now(),
-            }
-            injected = self._send_to_socket(message)
-            if not injected:
-                relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)
+            # Write directly to transcript — skip socket dispatch to avoid
+            # creating a task and broadcasting to all agents (BUG-8).
+            relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)
+            injected = True
 
         return {"cleared": cleared, "injected": injected, "chosen_agent": chosen_agent}
 
@@ -949,10 +955,10 @@ class RuntimeSupervisor:
                 "error_rate_5m": 0,
                 "dispatch_ts": 0,
             })
-            if event["state"] == "working":
+            if event["state"] == "warming":
                 pressure["dispatch_ts"] = now
                 pressure["queue_depth"] = pressure.get("queue_depth", 0) + 1
-            elif event["state"] in ("ready", "idle"):
+            elif event["state"] == "ready":
                 dispatch_ts = pressure.get("dispatch_ts", 0)
                 if dispatch_ts > 0:
                     latency_ms = int((now - dispatch_ts) * 1000)
@@ -973,7 +979,11 @@ class RuntimeSupervisor:
             values["pressure"] = pressure
 
             self.state.patch_agent(event["agent"], values)
-            self.sse_broadcast("agent_state", {"agent": agent_name, "state": event["state"]})
+            self.sse_broadcast("agent_state", {
+                "agent": agent_name,
+                "state": event["state"],
+                "last_error": event.get("last_error"),
+            })
             return
 
         if event["type"] == "dispatcher":
@@ -1001,7 +1011,12 @@ class RuntimeSupervisor:
                 "last_action": action,
                 "last_targets": event.get("targets", []),
             })
-            self.sse_broadcast("dispatcher", {"action": action})
+            self.sse_broadcast("dispatcher", {
+                "action": action,
+                "routes_total": routes,
+                "absorbs_total": absorbs,
+                "tokens_saved": tokens_saved,
+            })
             return
 
         if event["type"] == "task_created":
@@ -1099,6 +1114,55 @@ class RuntimeSupervisor:
                     if status_filter:
                         tasks_list = [t for t in tasks_list if t.get("status") == status_filter]
                     return self._json({"tasks": tasks_list[-100:]})
+                if parsed.path == "/api/dispatcher/health":
+                    if not self._authorized():
+                        return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
+                    dispatcher_config = supervisor.config.get("dispatcher", {})
+                    host = dispatcher_config.get("ollama_host", "http://localhost:11434")
+                    try:
+                        health = asyncio.run(dispatcher_mod.health_check(host))
+                    except Exception:
+                        health = {"available": False, "models": []}
+                    snapshot = supervisor.state.snapshot()
+                    d = snapshot.get("dispatcher", {})
+                    return self._json({
+                        "ok": True,
+                        "available": health.get("available", False),
+                        "models": health.get("models", []),
+                        "router_model": dispatcher_config.get("router_model"),
+                        "state": d.get("state", "disabled"),
+                        "routes_total": d.get("routes_total", 0),
+                        "absorbs_total": d.get("absorbs_total", 0),
+                        "tokens_saved": d.get("tokens_saved", 0),
+                        "last_action": d.get("last_action"),
+                        "last_targets": d.get("last_targets", []),
+                    })
+                if parsed.path.startswith("/api/agents/") and parsed.path.endswith("/logs"):
+                    parts = [p for p in parsed.path.split("/") if p]
+                    if len(parts) != 4:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    if not self._authorized():
+                        return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
+                    agent_name = parts[2]
+                    query = parse_qs(parsed.query)
+                    tail = min(int(query.get("tail", ["30"])[0]), 200)
+                    agent = supervisor.find_agent(agent_name)
+                    if not agent:
+                        return self._json({"ok": False, "error": "unknown agent"}, status=HTTPStatus.NOT_FOUND)
+                    io_log_path = agent.get("io_log_path")
+                    lines: list[str] = []
+                    if io_log_path and Path(io_log_path).exists():
+                        text = relay.read_text(Path(io_log_path))
+                        lines = text.splitlines()[-tail:]
+                    snapshot = supervisor.state.snapshot()
+                    agent_state = snapshot.get("agents", {}).get(agent["name"], {})
+                    return self._json({
+                        "ok": True,
+                        "agent": agent["name"],
+                        "lines": lines,
+                        "state": agent_state,
+                    })
                 if parsed.path == "/api/events":
                     if not self._authorized():
                         self.send_error(HTTPStatus.UNAUTHORIZED)
@@ -1143,8 +1207,9 @@ class RuntimeSupervisor:
 
                     token = secrets.token_urlsafe(24)
                     supervisor.auth_tokens.add(token)
+                    supervisor._save_auth_tokens()
                     headers = {
-                        "Set-Cookie": f"clcod_session={token}; Path=/; HttpOnly; SameSite=Strict"
+                        "Set-Cookie": f"clcod_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800"
                     }
                     return self._json({"ok": True, "state": supervisor.state.snapshot()}, headers=headers)
 
@@ -1160,7 +1225,7 @@ class RuntimeSupervisor:
                     if not raw_message:
                         return self._json({"ok": False, "error": "message is required"}, status=HTTPStatus.BAD_REQUEST)
                     
-                    speaker = raw_name.upper()[:40]
+                    speaker = raw_name[:40]
                     message = {
                         "id": secrets.token_urlsafe(16),
                         "sender": speaker,
@@ -1180,6 +1245,7 @@ class RuntimeSupervisor:
                             "last_updated_at": utc_now(),
                         },
                     )
+                    supervisor.sse_broadcast("transcript", {"last_speaker": speaker})
                     return self._json({"ok": True, "state": supervisor.state.snapshot()})
 
                 if parsed.path.startswith("/api/agents/") and parsed.path.endswith("/settings"):
@@ -1239,18 +1305,9 @@ class RuntimeSupervisor:
                             timeout=15,
                         )
                         ok = git_proc.returncode == 0
-                        # Broadcast sync message to transcript
+                        # Write sync message directly to transcript (BUG-8: skip socket to avoid task/dispatch)
                         sync_body = f"[SYNC] Repository synced. All agents now share read-write access to {SCRIPT_DIR}."
-                        sync_message = {
-                            "id": secrets.token_urlsafe(16),
-                            "sender": "SYSTEM",
-                            "seq": int(time.time() * 1000),
-                            "type": "sync",
-                            "body": sync_body,
-                            "ts": utc_now(),
-                        }
-                        if not supervisor._send_to_socket(sync_message):
-                            relay.append_tagged_entry(supervisor.workspace["log_path"], "SYSTEM", sync_body)
+                        relay.append_tagged_entry(supervisor.workspace["log_path"], "SYSTEM", sync_body)
                         return self._json({
                             "ok": ok,
                             "stdout": git_proc.stdout,
@@ -1267,23 +1324,14 @@ class RuntimeSupervisor:
                     want_sleep = bool(payload.get("sleep", not supervisor.is_sleeping()))
                     supervisor.set_sleeping(want_sleep)
                     if not want_sleep:
-                        # Waking up — inject a catch-up message so agents process missed context
+                        # Write wake message directly to transcript (BUG-8: skip socket to avoid task/dispatch)
                         wake_body = (
                             "[WAKE] All agents are back online. Review the messages above that "
                             "arrived during sleep and continue where we left off."
                         )
-                        wake_message = {
-                            "id": secrets.token_urlsafe(16),
-                            "sender": "SYSTEM",
-                            "seq": int(time.time() * 1000),
-                            "type": "wake",
-                            "body": wake_body,
-                            "ts": utc_now(),
-                        }
-                        if not supervisor._send_to_socket(wake_message):
-                            relay.append_tagged_entry(
-                                supervisor.workspace["log_path"], "SYSTEM", wake_body
-                            )
+                        relay.append_tagged_entry(
+                            supervisor.workspace["log_path"], "SYSTEM", wake_body
+                        )
                     return self._json({
                         "ok": True,
                         "sleeping": want_sleep,
