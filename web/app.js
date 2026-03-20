@@ -420,15 +420,22 @@ function startPolling() {
           }
           break;
         case "transcript":
-          // Refresh on rev change (authoritative signal from server)
+          // Update rev tracking
           if (data.rev !== undefined && data.rev > lastSeenRev) {
+            // Detect gap: if rev jumped by more than 1, we missed events — full refresh
+            const gap = data.rev - lastSeenRev > 1;
             lastSeenRev = data.rev;
-            pollTranscript();
-          } else if (data.message && data.message.seq > lastSeenSeq) {
+            if (gap) {
+              pollTranscript();
+              break;
+            }
+          }
+          // Primary path: instant append when message payload is present
+          if (data.message && data.message.seq > lastSeenSeq) {
             appendMessage(data.message);
             lastSeenSeq = data.message.seq;
-          } else if (data.rev === undefined) {
-            // Fallback: if no rev, try to append single message
+          } else if (!data.message) {
+            // No message payload — reconcile via full fetch
             pollTranscript();
           }
           break;
