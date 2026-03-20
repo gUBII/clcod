@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import dispatcher as dispatcher_mod
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 
@@ -89,6 +91,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sessions_path": ".clcod-runtime/sessions.json",
         "preferences_path": ".clcod-runtime/preferences.json",
         "agent_logs_dir": ".clcod-runtime/agents",
+        "projects_path": ".clcod-runtime/projects.json",
+        "tasks_path": ".clcod-runtime/tasks.json",
     },
     "locks": {
         "ttl": 90,
@@ -104,11 +108,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_sender": "Operator",
         "open_browser": True,
     },
+    "dispatcher": {
+        "enabled": True,
+        "ollama_host": "http://localhost:11434",
+        "router_model": "qwen3.5:latest",
+        "summarizer_model": "qwen3.5:9b",
+        "validator_model": "rnj-1:8b",
+        "router_timeout": 15,
+        "summarizer_timeout": 30,
+        "validator_timeout": 10,
+        "fallback_action": "route",
+    },
 }
 
 PROMPT_TEMPLATE = (
     "You are {name}, one of three AI agents (Claude, Codex, Gemini) sharing a "
-    "real-time terminal chat room. Below is the recent conversation log. "
+    "real-time terminal chat room. Your working directory is {work_dir}. "
+    "Below is the recent conversation log. "
     "Reply naturally as yourself in 2-5 sentences. Do not prefix your reply "
     "with your name or a [TAG].\n\n{context}"
 )
@@ -376,6 +392,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     locks = config.get("locks", {})
     tmux = config.get("tmux", {})
     ui = config.get("ui", {})
+    dispatcher_cfg = config.get("dispatcher", {})
     variables = {
         "script_dir": str(SCRIPT_DIR),
         "config_dir": str(config_dir),
@@ -405,6 +422,12 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "agent_logs_dir": resolve_path(
             config_dir, str(workspace.get("agent_logs_dir", ".clcod-runtime/agents"))
         ),
+        "projects_path": resolve_path(
+            config_dir, str(workspace.get("projects_path", ".clcod-runtime/projects.json"))
+        ),
+        "tasks_path": resolve_path(
+            config_dir, str(workspace.get("tasks_path", ".clcod-runtime/tasks.json"))
+        ),
     }
     variables.update(
         {
@@ -417,6 +440,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "sessions_path": str(normalized_workspace["sessions_path"]),
             "preferences_path": str(normalized_workspace["preferences_path"]),
             "agent_logs_dir": str(normalized_workspace["agent_logs_dir"]),
+            "projects_path": str(normalized_workspace["projects_path"]),
+            "tasks_path": str(normalized_workspace["tasks_path"]),
         }
     )
 
@@ -517,6 +542,17 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "default_sender": str(ui.get("default_sender") or os.environ.get("USER") or "Operator"),
             "open_browser": bool(ui.get("open_browser", True)),
         },
+        "dispatcher": {
+            "enabled": bool(dispatcher_cfg.get("enabled", True)),
+            "ollama_host": str(dispatcher_cfg.get("ollama_host", "http://localhost:11434")),
+            "router_model": str(dispatcher_cfg.get("router_model", "qwen3.5:latest")),
+            "summarizer_model": str(dispatcher_cfg.get("summarizer_model", "qwen3.5:9b")),
+            "validator_model": str(dispatcher_cfg.get("validator_model", "rnj-1:8b")),
+            "router_timeout": int(dispatcher_cfg.get("router_timeout", 15)),
+            "summarizer_timeout": int(dispatcher_cfg.get("summarizer_timeout", 30)),
+            "validator_timeout": int(dispatcher_cfg.get("validator_timeout", 10)),
+            "fallback_action": str(dispatcher_cfg.get("fallback_action", "route")),
+        },
     }
 
 
@@ -530,16 +566,34 @@ def normalize_argv(value: Any, agent_name: str, field_name: str) -> list[str]:
 
 def last_speaker(text: str) -> str:
     last = ""
+    tagged_speaker: str | None = None
+    tagged_body_seen = False
     for line in text.splitlines():
-        line = line.strip()
+        raw_line = line.rstrip()
+        line = raw_line.strip()
         if not line:
+            if tagged_speaker and tagged_body_seen:
+                last = tagged_speaker
+                tagged_speaker = None
+                tagged_body_seen = False
             continue
         try:
             payload = json.loads(line)
             if "sender" in payload:
                 last = payload["sender"]
+            tagged_speaker = None
+            tagged_body_seen = False
         except json.JSONDecodeError:
-            pass
+            if line.startswith("[") and line.endswith("]") and len(line) > 2:
+                if tagged_speaker and tagged_body_seen:
+                    last = tagged_speaker
+                tagged_speaker = line[1:-1].strip()
+                tagged_body_seen = False
+                continue
+            if tagged_speaker:
+                tagged_body_seen = True
+    if tagged_speaker and tagged_body_seen:
+        last = tagged_speaker
     return last
 
 
@@ -670,6 +724,73 @@ class AgentCallResult:
     session_id: str | None
 
 
+DEFAULT_PROJECTS: dict[str, Any] = {"active": None, "projects": {}}
+
+
+def load_projects(path: Path) -> dict[str, Any]:
+    data = read_json(path, DEFAULT_PROJECTS)
+    if not isinstance(data, dict):
+        return copy.deepcopy(DEFAULT_PROJECTS)
+    data.setdefault("active", None)
+    data.setdefault("projects", {})
+    return data
+
+
+def save_projects(path: Path, projects: dict[str, Any]) -> None:
+    write_json(path, projects)
+
+
+# ── Task queue data model ──────────────────────────────────────
+
+DEFAULT_TASKS: dict[str, Any] = {"tasks": [], "next_id": 1}
+
+TASK_STATUSES = {"pending", "assigned", "in_progress", "review", "done", "blocked", "failed"}
+
+
+def load_tasks(path: Path) -> dict[str, Any]:
+    data = read_json(path, DEFAULT_TASKS)
+    if not isinstance(data, dict):
+        return copy.deepcopy(DEFAULT_TASKS)
+    data.setdefault("tasks", [])
+    data.setdefault("next_id", 1)
+    return data
+
+
+def save_tasks(path: Path, tasks: dict[str, Any]) -> None:
+    write_json(path, tasks)
+
+
+def create_task(
+    tasks_path: Path,
+    *,
+    title: str,
+    task_type: str = "general",
+    priority: str = "normal",
+    assigned_to: list[str] | None = None,
+    source_message: str = "",
+) -> dict[str, Any]:
+    """Create a new task and persist it. Returns the created task dict."""
+    store = load_tasks(tasks_path)
+    task_id = store["next_id"]
+    store["next_id"] = task_id + 1
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    task = {
+        "id": task_id,
+        "title": title[:200],
+        "type": task_type,
+        "status": "assigned" if assigned_to else "pending",
+        "priority": priority,
+        "assigned_to": assigned_to or [],
+        "source_message": source_message[:500],
+        "created_at": now,
+        "completed_at": None,
+        "tokens_spent": 0,
+    }
+    store["tasks"].append(task)
+    save_tasks(tasks_path, store)
+    return task
+
+
 def load_sessions(path: Path) -> dict[str, str]:
     data = read_json(path, {})
     if not isinstance(data, dict):
@@ -757,13 +878,15 @@ def build_agent_command(
     agent: dict[str, Any], prompt: str, session_id: str | None
 ) -> tuple[list[str], str | None]:
     effective_session_id = session_id
-    args = agent["args"]
+    work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
+    variables = {"work_dir": work_dir, "script_dir": work_dir}
+    args = [str(a).format_map(SafeFormatDict(variables)) for a in agent["args"]]
 
     if not effective_session_id:
         effective_session_id = resolve_preseed_session_id(agent)
 
     if effective_session_id and agent["invoke_resume_args"]:
-        args = [str(item).format_map({"session_id": effective_session_id}) for item in agent["invoke_resume_args"]]
+        args = [str(item).format_map(SafeFormatDict({"session_id": effective_session_id, "work_dir": work_dir, "script_dir": work_dir})) for item in agent["invoke_resume_args"]]
 
     selection_args = build_selection_args(agent)
     return [agent["cmd"], *selection_args, *args, prompt], effective_session_id
@@ -807,9 +930,10 @@ async def _exec_agent(
     cmd: list[str],
     env: dict[str, str],
 ) -> tuple[bytes, bytes, int]:
+    work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=str(SCRIPT_DIR),
+        cwd=work_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
@@ -966,6 +1090,8 @@ async def run_relay(
     log_path: Path = workspace["log_path"]
     lock_path: Path = workspace["lock_path"]
     sessions_path: Path = workspace["sessions_path"]
+    projects_path: Path = workspace["projects_path"]
+    tasks_path: Path = workspace["tasks_path"]
     poll_sec = workspace["poll_sec"]
     context_len = workspace["context_len"]
     lock_ttl = config["locks"]["ttl"]
@@ -1045,16 +1171,91 @@ async def run_relay(
                 relay_log(f"sleeping — message from {sender} saved but not routed")
                 return
 
+            # Resolve active project work_dir
+            projects = load_projects(projects_path)
+            active_id = projects.get("active")
+            active_project = projects.get("projects", {}).get(active_id or "") if active_id else None
+            work_dir = active_project["path"] if active_project else str(SCRIPT_DIR)
+
+            # Inject work_dir into each agent for this dispatch
+            for agent in enabled_agents:
+                agent["work_dir"] = work_dir
+
             # Read back context to ensure we get the full log state
             fresh = read_text(log_path)
             context = fresh[-context_len:]
+
+            # ── Dispatcher: smart routing via local Ollama models ──
+            dispatch_config = config.get("dispatcher", {})
+            dispatch_targets = enabled_agents  # default: all agents
+            if dispatch_config.get("enabled"):
+                try:
+                    decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
+                    action = decision.get("action", "route")
+                    relay_log(f"dispatcher: action={action} targets={decision.get('targets')} type={decision.get('task_type')}")
+                    emit_event(event_callback, {
+                        "type": "dispatcher",
+                        "action": action,
+                        "targets": decision.get("targets", []),
+                        "task_type": decision.get("task_type"),
+                        "priority": decision.get("priority"),
+                    })
+
+                    if action == "absorb" and decision.get("reply"):
+                        # Handle locally — no cloud call needed
+                        await append_reply(write_lock, log_path, "DISPATCHER", decision["reply"])
+                        relay_log(f"dispatcher absorbed: {decision['reply'][:80]}")
+                        return
+
+                    if action == "clarify" and decision.get("reply"):
+                        await append_reply(write_lock, log_path, "DISPATCHER", decision["reply"])
+                        relay_log(f"dispatcher clarifying: {decision['reply'][:80]}")
+                        return
+
+                    if action == "route" and decision.get("targets"):
+                        target_names = set(decision["targets"])
+                        filtered = [a for a in enabled_agents if a["name"] in target_names]
+                        if filtered:
+                            dispatch_targets = filtered
+                            relay_log(f"dispatcher routed to: {', '.join(a['name'] for a in dispatch_targets)}")
+                except Exception as exc:
+                    relay_log(f"dispatcher error (falling back to broadcast): {exc}")
+
+            # ── Create task for tracking ──
+            task_title = body[:120] if len(body) <= 120 else body[:117] + "..."
+            task_type = "general"
+            task_priority = "normal"
+            if dispatch_config.get("enabled"):
+                try:
+                    task_type = decision.get("task_type", "general")  # type: ignore[possibly-undefined]
+                    task_priority = decision.get("priority", "normal")  # type: ignore[possibly-undefined]
+                except NameError:
+                    pass
+            task = create_task(
+                tasks_path,
+                title=task_title,
+                task_type=task_type,
+                priority=task_priority,
+                assigned_to=[a["name"] for a in dispatch_targets],
+                source_message=body,
+            )
+            relay_log(f"task #{task['id']} created: {task['title'][:60]}")
+            emit_event(event_callback, {
+                "type": "task_created",
+                "task": task,
+            })
+
             prompts = {
-                agent["name"]: PROMPT_TEMPLATE.format(name=agent["name"].capitalize(), context=context)
-                for agent in enabled_agents
+                agent["name"]: PROMPT_TEMPLATE.format(
+                    name=agent["name"].capitalize(),
+                    context=context,
+                    work_dir=work_dir,
+                )
+                for agent in dispatch_targets
             }
 
             if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
-                relay_log("speaker.lock is active; will retry this message")
+                relay_log("speaker.lock is active; skipping this dispatch cycle")
                 return
 
             try:
@@ -1069,7 +1270,7 @@ async def run_relay(
                             session_lock,
                             event_callback,
                         )
-                        for agent in enabled_agents
+                        for agent in dispatch_targets
                     ]
                 )
             finally:
@@ -1086,6 +1287,73 @@ async def run_relay(
             except Exception:
                 pass
 
+    async def batch_pending_tasks() -> None:
+        """Periodically check for pending (unassigned) tasks and dispatch them."""
+        while not internal_stop_event.is_set():
+            try:
+                await asyncio.sleep(30)
+                if is_sleeping and is_sleeping():
+                    continue
+                store = load_tasks(tasks_path)
+                pending = [t for t in store["tasks"] if t["status"] == "pending"]
+                if not pending:
+                    continue
+                # Group pending tasks by type, dispatch as a single batch message
+                batch_body_parts = []
+                batch_ids = []
+                for task in pending[:5]:  # process up to 5 at a time
+                    batch_body_parts.append(f"- [{task['type']}] {task['title']}")
+                    batch_ids.append(task["id"])
+                    task["status"] = "assigned"
+                    task["assigned_to"] = [a["name"] for a in enabled_agents]
+                batch_body = "Batch tasks:\n" + "\n".join(batch_body_parts)
+                save_tasks(tasks_path, store)
+                relay_log(f"batch processing {len(batch_ids)} pending tasks: {batch_ids}")
+
+                fresh = read_text(log_path)
+                context = fresh[-context_len:]
+                work_dir = str(SCRIPT_DIR)
+                projects = load_projects(projects_path)
+                active_id = projects.get("active")
+                if active_id:
+                    active_project = projects.get("projects", {}).get(active_id)
+                    if active_project:
+                        work_dir = active_project["path"]
+                for agent in enabled_agents:
+                    agent["work_dir"] = work_dir
+
+                prompts = {
+                    agent["name"]: PROMPT_TEMPLATE.format(
+                        name=agent["name"].capitalize(),
+                        context=context,
+                        work_dir=work_dir,
+                    )
+                    for agent in enabled_agents
+                }
+
+                if acquire_lock(lock_path, f"relay-batch:{os.getpid()}", lock_ttl):
+                    try:
+                        # Prepend batch body to context via append
+                        await append_reply(write_lock, log_path, "SYSTEM", batch_body)
+                        await asyncio.gather(
+                            *[
+                                route_to(
+                                    agent,
+                                    prompts[agent["name"]],
+                                    log_path,
+                                    write_lock,
+                                    sessions_path,
+                                    session_lock,
+                                    event_callback,
+                                )
+                                for agent in enabled_agents
+                            ]
+                        )
+                    finally:
+                        release_lock(lock_path)
+            except Exception as exc:
+                relay_log(f"batch processing error: {exc}")
+
     if socket_path.exists():
         socket_path.unlink()
         
@@ -1093,9 +1361,15 @@ async def run_relay(
     server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
     relay_log(f"listening on {socket_path}")
 
+    batch_task = asyncio.create_task(batch_pending_tasks())
     try:
         await internal_stop_event.wait()
     finally:
+        batch_task.cancel()
+        try:
+            await batch_task
+        except asyncio.CancelledError:
+            pass
         server.close()
         await server.wait_closed()
         if socket_path.exists():

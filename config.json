@@ -115,7 +115,9 @@
     "state_path": ".clcod-runtime/state.json",
     "sessions_path": ".clcod-runtime/sessions.json",
     "preferences_path": ".clcod-runtime/preferences.json",
-    "agent_logs_dir": ".clcod-runtime/agents"
+    "agent_logs_dir": ".clcod-runtime/agents",
+    "projects_path": ".clcod-runtime/projects.json",
+    "tasks_path": ".clcod-runtime/tasks.json"
   },
   "locks": {
     "ttl": 90
@@ -130,5 +132,16 @@
     "password": "free",
     "default_sender": "Operator",
     "open_browser": true
+  },
+  "dispatcher": {
+    "enabled": true,
+    "ollama_host": "http://localhost:11434",
+    "router_model": "qwen3.5:latest",
+    "summarizer_model": "qwen3.5:9b",
+    "validator_model": "rnj-1:8b",
+    "router_timeout": 15,
+    "summarizer_timeout": 30,
+    "validator_timeout": 10,
+    "fallback_action": "route"
   }
 }

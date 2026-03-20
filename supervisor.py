@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import queue
 import threading
 import time
 from http import HTTPStatus
@@ -27,6 +28,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import relay
+import dispatcher as dispatcher_mod
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEB_DIR = SCRIPT_DIR / "web"
@@ -101,6 +103,25 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
             "attach_command": f"tmux attach -t {session}",
         },
         "agents": agents,
+        "project": {
+            "active": None,
+            "name": None,
+            "path": str(SCRIPT_DIR),
+        },
+        "dispatcher": {
+            "state": "disabled",
+            "router_model": None,
+            "routes_total": 0,
+            "absorbs_total": 0,
+            "tokens_saved": 0,
+        },
+        "tasks": {
+            "total": 0,
+            "pending": 0,
+            "in_progress": 0,
+            "done": 0,
+            "last_created_at": None,
+        },
         "transcript": {
             "path": str(config["workspace"]["log_path"]),
             "last_speaker": "",
@@ -111,40 +132,70 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
 
 def parse_transcript_entries(text: str, limit: int) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
+    tagged_speaker: str | None = None
+    tagged_lines: list[str] = []
+
+    def flush_tagged() -> None:
+        nonlocal tagged_speaker, tagged_lines
+        if tagged_speaker and tagged_lines:
+            entry = {"speaker": tagged_speaker, "text": "\n".join(tagged_lines).strip()}
+            if entry["text"]:
+                entries.append(entry)
+        tagged_speaker = None
+        tagged_lines = []
+
     for line in text.splitlines():
-        line = line.strip()
+        raw_line = line.rstrip()
+        line = raw_line.strip()
         if not line:
+            flush_tagged()
+            continue
+        if line.startswith("[") and line.endswith("]") and len(line) > 2:
+            flush_tagged()
+            tagged_speaker = line[1:-1].strip()
+            continue
+        if tagged_speaker:
+            tagged_lines.append(raw_line)
             continue
         try:
             payload = json.loads(line)
             if "speaker" in payload and "text" in payload:
-                entries.append({"speaker": payload["speaker"], "text": payload["text"], "ts": payload.get("ts", "")})
+                entry = {"speaker": payload["speaker"], "text": payload["text"]}
+                if payload.get("ts"):
+                    entry["ts"] = payload["ts"]
+                entries.append(entry)
             elif "sender" in payload and "body" in payload:
-                entries.append({"speaker": payload["sender"], "text": payload["body"], "ts": payload.get("ts", "")})
+                entry = {"speaker": payload["sender"], "text": payload["body"]}
+                if payload.get("ts"):
+                    entry["ts"] = payload["ts"]
+                entries.append(entry)
         except json.JSONDecodeError:
-            pass
+            continue
+    flush_tagged()
     return entries[-limit:]
 
 
 def build_log_mirror_command(agent: dict[str, Any]) -> str:
     log_path = agent["io_log_path"]
+    work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
     script = (
         f"mkdir -p {shlex.quote(str(log_path.parent))} && "
         f"touch {shlex.quote(str(log_path))} && "
         f"printf '%s\\n\\n' {shlex.quote(f'[{agent['name']}] live log mirror')} && "
         f"exec tail -n 120 -F {shlex.quote(str(log_path))}"
     )
-    return f"cd {shlex.quote(str(SCRIPT_DIR))} && bash -lc {shlex.quote(script)}"
+    return f"cd {shlex.quote(work_dir)} && bash -lc {shlex.quote(script)}"
 
 
 def build_resume_mirror_command(agent: dict[str, Any], session_id: str) -> str:
+    work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
     args = [
-        item.format_map({"session_id": session_id})
+        item.format_map({"session_id": session_id, "work_dir": work_dir, "script_dir": work_dir})
         for item in agent.get("mirror_resume_args", [])
     ]
     cmd = [agent["cmd"], *relay.build_selection_args(agent), *args]
     return "cd {} && exec {}".format(
-        shlex.quote(str(SCRIPT_DIR)),
+        shlex.quote(work_dir),
         " ".join(shlex.quote(part) for part in cmd),
     )
 
@@ -255,6 +306,58 @@ class RuntimeSupervisor:
         self.http_thread: threading.Thread | None = None
         self.mirror_keys: dict[str, tuple[str, str | None]] = {}
         self.pane_targets: dict[str, str] = {}
+        self.projects_path: Path = config["workspace"]["projects_path"]
+        self._sse_clients: list[queue.Queue] = []
+        self._sse_lock = threading.Lock()
+
+    def sse_subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=64)
+        with self._sse_lock:
+            self._sse_clients.append(q)
+        return q
+
+    def sse_unsubscribe(self, q: queue.Queue) -> None:
+        with self._sse_lock:
+            try:
+                self._sse_clients.remove(q)
+            except ValueError:
+                pass
+
+    def sse_broadcast(self, event_type: str, data: dict[str, Any]) -> None:
+        payload = json.dumps({"type": event_type, **data})
+        with self._sse_lock:
+            dead: list[queue.Queue] = []
+            for q in self._sse_clients:
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                try:
+                    self._sse_clients.remove(q)
+                except ValueError:
+                    pass
+
+    def refresh_task_state(self) -> None:
+        tasks_data = relay.load_tasks(self.workspace["tasks_path"])
+        all_tasks = tasks_data.get("tasks", [])
+        total = len(all_tasks)
+        pending = sum(1 for task in all_tasks if task.get("status") == "pending")
+        in_progress = sum(
+            1 for task in all_tasks if task.get("status") in ("assigned", "in_progress")
+        )
+        done = sum(1 for task in all_tasks if task.get("status") == "done")
+        last_created_at = all_tasks[-1].get("created_at") if all_tasks else None
+        self.state.patch(
+            "tasks",
+            {
+                "total": total,
+                "pending": pending,
+                "in_progress": in_progress,
+                "done": done,
+                "last_created_at": last_created_at,
+            },
+        )
 
     def is_sleeping(self) -> bool:
         with self._sleep_lock:
@@ -345,6 +448,87 @@ class RuntimeSupervisor:
         self.sync_agent_mirrors(force=True)
         return self.state.snapshot()["agents"][agent["name"]]
 
+    # ── Project management ──────────────────────────────────────────
+
+    def list_projects(self) -> dict[str, Any]:
+        return relay.load_projects(self.projects_path)
+
+    def lock_project(self, path: str | None = None, url: str | None = None, name: str | None = None) -> dict[str, Any]:
+        """Lock agents to a local path or clone a repo and lock to it."""
+        projects = relay.load_projects(self.projects_path)
+        if url:
+            target_name = name or url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+            target_dir = SCRIPT_DIR / "projects" / target_name
+            if not target_dir.exists():
+                target_dir.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "clone", url, str(target_dir)],
+                    check=True, timeout=120, capture_output=True, text=True,
+                )
+            project_path = str(target_dir.resolve())
+            project_type = "cloned"
+        elif path:
+            resolved = Path(path).expanduser().resolve()
+            if not resolved.is_dir():
+                raise ValueError(f"path does not exist or is not a directory: {path}")
+            project_path = str(resolved)
+            project_type = "local"
+            target_name = name or resolved.name
+        else:
+            raise ValueError("either path or url is required")
+
+        project_id = target_name.lower().replace(" ", "-")
+        projects["projects"][project_id] = {
+            "name": target_name,
+            "path": project_path,
+            "type": project_type,
+            "locked_at": utc_now(),
+            "agents_allowed": [a["name"] for a in self.config["agents"] if a["enabled"]],
+        }
+        projects["active"] = project_id
+        relay.save_projects(self.projects_path, projects)
+
+        # Inject work_dir into runtime agent configs
+        for agent in self.config["agents"]:
+            if agent["enabled"]:
+                agent["work_dir"] = project_path
+        self.mirror_keys.clear()
+        self.sync_agent_mirrors(force=True)
+
+        # Notify transcript
+        lock_body = f"[PROJECT] Locked to: {target_name} ({project_path})"
+        relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", lock_body)
+        return projects
+
+    def unlock_project(self) -> dict[str, Any]:
+        """Release current project lock, agents return to home repo."""
+        projects = relay.load_projects(self.projects_path)
+        projects["active"] = None
+        relay.save_projects(self.projects_path, projects)
+
+        for agent in self.config["agents"]:
+            agent.pop("work_dir", None)
+        self.mirror_keys.clear()
+        self.sync_agent_mirrors(force=True)
+
+        relay.append_tagged_entry(
+            self.workspace["log_path"], "SYSTEM",
+            f"[PROJECT] Unlocked — agents returned to {SCRIPT_DIR}",
+        )
+        return projects
+
+    def delete_project(self, project_id: str) -> dict[str, Any]:
+        projects = relay.load_projects(self.projects_path)
+        if project_id not in projects["projects"]:
+            raise KeyError(project_id)
+        if projects["active"] == project_id:
+            projects["active"] = None
+            for agent in self.config["agents"]:
+                agent.pop("work_dir", None)
+        del projects["projects"][project_id]
+        relay.save_projects(self.projects_path, projects)
+        return projects
+
     def reset_agent_session(self, name: str) -> None:
         sessions = relay.load_sessions(self.workspace["sessions_path"])
         if name in sessions:
@@ -431,6 +615,8 @@ class RuntimeSupervisor:
             self.workspace["state_path"],
             self.workspace["sessions_path"],
             self.workspace["preferences_path"],
+            self.workspace["projects_path"],
+            self.workspace["tasks_path"],
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
         self.workspace["log_path"].touch(exist_ok=True)
@@ -600,7 +786,7 @@ class RuntimeSupervisor:
         return best_name
 
     def compact_context(self) -> dict[str, Any]:
-        """Declutter temp logs and inject a summarization request into the transcript."""
+        """Declutter temp logs and summarize context using local Ollama or cloud fallback."""
         cleared: list[str] = []
 
         # Truncate agent io logs and relay log (not the transcript itself)
@@ -619,27 +805,45 @@ class RuntimeSupervisor:
             tmp.unlink(missing_ok=True)
             cleared.append(str(tmp))
 
-        # Pick the agent with the most remaining capacity
-        chosen_agent = self._pick_compact_agent()
+        dispatcher_config = self.config.get("dispatcher", {})
+        use_local = dispatcher_config.get("enabled", False)
+        summary = ""
+        chosen_agent = "LOCAL"
 
-        # Inject a SYSTEM message asking the chosen agent to summarize
-        summary_request = (
-            f"[COMPACT → {chosen_agent}] Please read the full conversation above and reply with a "
-            "single paragraph that summarises all key decisions, features built, open "
-            "questions, and next actions. Keep it under 120 words. This will replace the "
-            "working context for all agents."
-        )
-        message = {
-            "id": secrets.token_urlsafe(16),
-            "sender": "SYSTEM",
-            "seq": int(time.time() * 1000),
-            "type": "compact",
-            "body": summary_request,
-            "ts": utc_now(),
-        }
-        injected = self._send_to_socket(message)
-        if not injected:
-            relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)
+        if use_local:
+            # Try local Ollama summarization first
+            try:
+                context = relay.read_text(self.workspace["log_path"])
+                summary = asyncio.run(dispatcher_mod.summarize_context(context[-6000:], dispatcher_config))
+            except Exception:
+                summary = ""
+
+        if summary:
+            relay.append_tagged_entry(
+                self.workspace["log_path"], "SYSTEM",
+                f"[COMPACT SUMMARY] {summary}",
+            )
+            injected = True
+        else:
+            # Fall back to cloud agent summarization
+            chosen_agent = self._pick_compact_agent()
+            summary_request = (
+                f"[COMPACT → {chosen_agent}] Please read the full conversation above and reply with a "
+                "single paragraph that summarises all key decisions, features built, open "
+                "questions, and next actions. Keep it under 120 words. This will replace the "
+                "working context for all agents."
+            )
+            message = {
+                "id": secrets.token_urlsafe(16),
+                "sender": "SYSTEM",
+                "seq": int(time.time() * 1000),
+                "type": "compact",
+                "body": summary_request,
+                "ts": utc_now(),
+            }
+            injected = self._send_to_socket(message)
+            if not injected:
+                relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)
 
         return {"cleared": cleared, "injected": injected, "chosen_agent": chosen_agent}
 
@@ -730,7 +934,74 @@ class RuntimeSupervisor:
                 tokens = event["tokens_delta"]
                 if tokens > 0:
                     self.state.record_agent_usage(event["agent"], tokens)
+
+            # ── Pressure metrics ──
+            agent_name = event.get("agent", "")
+            now = time.time()
+            snapshot = self.state.snapshot()
+            agent_snap = snapshot.get("agents", {}).get(agent_name, {})
+            pressure = agent_snap.get("pressure", {
+                "queue_depth": 0,
+                "last_latency_ms": 0,
+                "tokens_per_sec": 0,
+                "error_rate_5m": 0,
+                "dispatch_ts": 0,
+            })
+            if event["state"] == "working":
+                pressure["dispatch_ts"] = now
+                pressure["queue_depth"] = pressure.get("queue_depth", 0) + 1
+            elif event["state"] in ("ready", "idle"):
+                dispatch_ts = pressure.get("dispatch_ts", 0)
+                if dispatch_ts > 0:
+                    latency_ms = int((now - dispatch_ts) * 1000)
+                    pressure["last_latency_ms"] = latency_ms
+                    # Rolling average tokens/sec from latency + token delta
+                    td = event.get("tokens_delta", 0)
+                    elapsed = max(0.1, now - dispatch_ts)
+                    if td > 0:
+                        new_tps = td / elapsed
+                        old_tps = pressure.get("tokens_per_sec", 0)
+                        pressure["tokens_per_sec"] = round(old_tps * 0.6 + new_tps * 0.4, 1)
+                pressure["queue_depth"] = max(0, pressure.get("queue_depth", 0) - 1)
+                pressure["dispatch_ts"] = 0
+            elif event["state"] == "error":
+                pressure["queue_depth"] = max(0, pressure.get("queue_depth", 0) - 1)
+                # Track errors in a simple counter (decay handled in JS)
+                pressure["error_rate_5m"] = pressure.get("error_rate_5m", 0) + 1
+            values["pressure"] = pressure
+
             self.state.patch_agent(event["agent"], values)
+            return
+
+        if event["type"] == "dispatcher":
+            action = event.get("action", "route")
+            snapshot = self.state.snapshot()
+            dispatcher_state = snapshot.get("dispatcher", {})
+            routes = dispatcher_state.get("routes_total", 0)
+            absorbs = dispatcher_state.get("absorbs_total", 0)
+            tokens_saved = dispatcher_state.get("tokens_saved", 0)
+            if action == "absorb":
+                absorbs += 1
+                tokens_saved += 500  # estimated tokens saved per absorbed message
+            elif action == "route":
+                routes += 1
+                # Calculate tokens saved by not broadcasting to all agents
+                all_agents = len([a for a in self.config["agents"] if a["enabled"]])
+                routed = len(event.get("targets", []))
+                if routed < all_agents:
+                    tokens_saved += (all_agents - routed) * 200
+            self.state.patch("dispatcher", {
+                "state": "active",
+                "routes_total": routes,
+                "absorbs_total": absorbs,
+                "tokens_saved": tokens_saved,
+                "last_action": action,
+                "last_targets": event.get("targets", []),
+            })
+            return
+
+        if event["type"] == "task_created":
+            self.refresh_task_state()
 
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
         supervisor = self
@@ -809,6 +1080,20 @@ class RuntimeSupervisor:
                     limit = int(query.get("limit", ["120"])[0])
                     transcript = relay.read_text(supervisor.workspace["log_path"])
                     return self._json({"entries": parse_transcript_entries(transcript, max(1, min(limit, 500)))})
+                if parsed.path == "/api/projects":
+                    if not self._authorized():
+                        return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
+                    return self._json(supervisor.list_projects())
+                if parsed.path == "/api/tasks":
+                    if not self._authorized():
+                        return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
+                    query = parse_qs(parsed.query)
+                    status_filter = query.get("status", [None])[0]
+                    tasks_data = relay.load_tasks(supervisor.workspace["tasks_path"])
+                    tasks_list = tasks_data.get("tasks", [])
+                    if status_filter:
+                        tasks_list = [t for t in tasks_list if t.get("status") == status_filter]
+                    return self._json({"tasks": tasks_list[-100:]})
                 self.send_error(HTTPStatus.NOT_FOUND)
 
             def do_POST(self) -> None:
@@ -967,6 +1252,74 @@ class RuntimeSupervisor:
                         "state": supervisor.state.snapshot(),
                     })
 
+                # ── Project endpoints ──────────────────────────────
+                if parsed.path == "/api/projects/lock":
+                    payload = self._payload()
+                    try:
+                        projects = supervisor.lock_project(
+                            path=str(payload.get("path") or "").strip() or None,
+                            url=str(payload.get("url") or "").strip() or None,
+                            name=str(payload.get("name") or "").strip() or None,
+                        )
+                        supervisor.state.patch("project", {
+                            "active": projects["active"],
+                            "name": projects["projects"].get(projects["active"], {}).get("name"),
+                            "path": projects["projects"].get(projects["active"], {}).get("path", str(SCRIPT_DIR)),
+                        })
+                        return self._json({"ok": True, "projects": projects})
+                    except (ValueError, subprocess.CalledProcessError) as exc:
+                        return self._json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+                if parsed.path == "/api/projects/unlock":
+                    projects = supervisor.unlock_project()
+                    supervisor.state.patch("project", {
+                        "active": None,
+                        "name": None,
+                        "path": str(SCRIPT_DIR),
+                    })
+                    return self._json({"ok": True, "projects": projects})
+
+                # ── Task endpoints ────────────────────────────────
+                if parsed.path == "/api/tasks":
+                    payload = self._payload()
+                    title = str(payload.get("title") or "").strip()
+                    if not title:
+                        return self._json({"ok": False, "error": "title is required"}, status=HTTPStatus.BAD_REQUEST)
+                    task = relay.create_task(
+                        supervisor.workspace["tasks_path"],
+                        title=title,
+                        task_type=str(payload.get("type") or "general"),
+                        priority=str(payload.get("priority") or "normal"),
+                        assigned_to=payload.get("assigned_to") if isinstance(payload.get("assigned_to"), list) else None,
+                        source_message=str(payload.get("source_message") or ""),
+                    )
+                    supervisor.refresh_task_state()
+                    return self._json({"ok": True, "task": task})
+
+                if parsed.path.startswith("/api/tasks/") and not parsed.path.endswith("/"):
+                    parts = [p for p in parsed.path.split("/") if p]
+                    if len(parts) == 3:
+                        try:
+                            task_id = int(parts[2])
+                        except ValueError:
+                            return self._json({"ok": False, "error": "invalid task id"}, status=HTTPStatus.BAD_REQUEST)
+                        payload = self._payload()
+                        tasks_data = relay.load_tasks(supervisor.workspace["tasks_path"])
+                        task = next((t for t in tasks_data["tasks"] if t["id"] == task_id), None)
+                        if not task:
+                            return self._json({"ok": False, "error": "task not found"}, status=HTTPStatus.NOT_FOUND)
+                        if "status" in payload and payload["status"] in relay.TASK_STATUSES:
+                            task["status"] = payload["status"]
+                            if payload["status"] == "done":
+                                task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        if "assigned_to" in payload and isinstance(payload["assigned_to"], list):
+                            task["assigned_to"] = payload["assigned_to"]
+                        if "priority" in payload:
+                            task["priority"] = str(payload["priority"])
+                        relay.save_tasks(supervisor.workspace["tasks_path"], tasks_data)
+                        supervisor.refresh_task_state()
+                        return self._json({"ok": True, "task": task})
+
                 self.send_error(HTTPStatus.NOT_FOUND)
 
         return Handler
@@ -990,6 +1343,21 @@ class RuntimeSupervisor:
         self.prepare_runtime()
         self.start_http_server()
         self.ensure_tmux_layout()
+
+        # Check dispatcher (Ollama) health on startup
+        dispatcher_config = self.config.get("dispatcher", {})
+        if dispatcher_config.get("enabled"):
+            health = await dispatcher_mod.health_check(dispatcher_config.get("ollama_host", "http://localhost:11434"))
+            if health["available"]:
+                self.state.patch("dispatcher", {
+                    "state": "active",
+                    "router_model": dispatcher_config.get("router_model"),
+                    "models_loaded": health["models"],
+                })
+                print(f"[supervisor] dispatcher active — Ollama models: {health['models']}", flush=True)
+            else:
+                self.state.patch("dispatcher", {"state": "unavailable"})
+                print("[supervisor] dispatcher unavailable — Ollama not reachable, falling back to broadcast", flush=True)
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):

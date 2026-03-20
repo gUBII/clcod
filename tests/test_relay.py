@@ -78,6 +78,8 @@ class RelayTests(unittest.TestCase):
             expected_log_path = (config_path.parent / "logs" / "room.txt").resolve()
             self.assertEqual(config["workspace"]["log_path"], expected_log_path)
             self.assertTrue(str(config["workspace"]["preferences_path"]).endswith("preferences.json"))
+            self.assertTrue(str(config["workspace"]["projects_path"]).endswith("projects.json"))
+            self.assertTrue(str(config["workspace"]["tasks_path"]).endswith("tasks.json"))
             self.assertEqual(config["agents"][0]["args"], ["-p"])
             self.assertEqual(config["agents"][0]["preseed_session_id"], "seed-1")
 
@@ -134,6 +136,27 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(
             cmd,
             ["claude", "--model", "sonnet", "--effort", "high", "-p", "hello"],
+        )
+
+    def test_build_agent_command_uses_work_dir_for_formatted_args(self):
+        agent = {
+            "name": "CODEX",
+            "cmd": "codex",
+            "args": ["exec", "-C", "{script_dir}"],
+            "invoke_resume_args": ["exec", "resume", "-C", "{work_dir}", "{session_id}"],
+            "preseed_session_id": False,
+            "work_dir": "/tmp/demo-worktree",
+        }
+
+        cmd, session_id = relay.build_agent_command(agent, "hello", None)
+        self.assertIsNone(session_id)
+        self.assertEqual(cmd, ["codex", "exec", "-C", "/tmp/demo-worktree", "hello"])
+
+        resume_cmd, resume_session_id = relay.build_agent_command(agent, "hello", "session-1")
+        self.assertEqual(resume_session_id, "session-1")
+        self.assertEqual(
+            resume_cmd,
+            ["codex", "exec", "resume", "-C", "/tmp/demo-worktree", "session-1", "hello"],
         )
 
     def test_effective_effort_id_uses_model_safe_codex_default(self):

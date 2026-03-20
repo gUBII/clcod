@@ -1,5 +1,10 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+import relay
 import supervisor
 
 
@@ -71,6 +76,91 @@ class SupervisorTests(unittest.TestCase):
         )
 
         self.assertIn("claude --model sonnet --effort high --resume session-1", command)
+
+    def test_build_log_mirror_command_uses_work_dir(self):
+        command = supervisor.build_log_mirror_command(
+            {
+                "name": "CLAUDE",
+                "io_log_path": Path("/tmp/claude.log"),
+                "work_dir": "/tmp/demo-repo",
+            }
+        )
+
+        self.assertTrue(command.startswith("cd /tmp/demo-repo &&"))
+
+    def test_refresh_task_state_counts_statuses(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            relay.save_tasks(
+                config["workspace"]["tasks_path"],
+                {
+                    "next_id": 4,
+                    "tasks": [
+                        {"id": 1, "status": "pending", "created_at": "2026-03-20T09:00:00Z"},
+                        {"id": 2, "status": "assigned", "created_at": "2026-03-20T09:01:00Z"},
+                        {"id": 3, "status": "done", "created_at": "2026-03-20T09:02:00Z"},
+                    ],
+                },
+            )
+
+            runtime.refresh_task_state()
+            snapshot = runtime.state.snapshot()["tasks"]
+
+            self.assertEqual(snapshot["total"], 3)
+            self.assertEqual(snapshot["pending"], 1)
+            self.assertEqual(snapshot["in_progress"], 1)
+            self.assertEqual(snapshot["done"], 1)
+            self.assertEqual(snapshot["last_created_at"], "2026-03-20T09:02:00Z")
+
+    def test_lock_project_sets_active_project_and_agent_workdirs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sync_agent_mirrors = mock.Mock()
+
+            projects = runtime.lock_project(path=str(repo_dir))
+
+            self.assertEqual(projects["active"], "repo")
+            self.assertEqual(projects["projects"]["repo"]["path"], str(repo_dir.resolve()))
+            self.assertTrue(all(agent.get("work_dir") == str(repo_dir.resolve()) for agent in config["agents"] if agent["enabled"]))
+            runtime.sync_agent_mirrors.assert_called_once_with(force=True)
 
 
 if __name__ == "__main__":
