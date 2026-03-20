@@ -1118,7 +1118,8 @@ class RuntimeSupervisor:
                     query = parse_qs(parsed.query)
                     limit = int(query.get("limit", ["120"])[0])
                     transcript = relay.read_text(supervisor.workspace["log_path"])
-                    return self._json({"entries": parse_transcript_entries(transcript, max(1, min(limit, 500)))})
+                    current_rev = supervisor.state.state.get("transcript", {}).get("rev", 0)
+                    return self._json({"entries": parse_transcript_entries(transcript, max(1, min(limit, 500))), "rev": current_rev})
                 if parsed.path == "/api/projects":
                     if not self._authorized():
                         return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
