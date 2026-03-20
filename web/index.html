@@ -152,12 +152,15 @@
             <span class="dispatcher-bar__stat">Tokens saved <strong id="dispatcherTokens">0</strong></span>
           </div>
 
-          <form id="chatForm" class="chat-bar">
-            <input id="senderName" class="chat-bar__sender" name="senderName" type="text" maxlength="40" placeholder="Operator" required>
-            <input id="chatInput" class="chat-bar__message" name="message" type="text" maxlength="8000" placeholder="Message the room..." required>
-            <button type="submit" id="sendButton" class="chat-bar__send" title="Send">&rarr;</button>
-            <span class="chat-bar__status" id="chatStatus"></span>
-          </form>
+          <div class="chat-bar-wrap">
+            <div id="mentionPopup" class="mention-popup hidden"></div>
+            <form id="chatForm" class="chat-bar">
+              <input id="senderName" class="chat-bar__sender" name="senderName" type="text" maxlength="40" placeholder="Operator" required>
+              <input id="chatInput" class="chat-bar__message" name="message" type="text" maxlength="8000" placeholder="Message the room... (@ to mention)" required autocomplete="off">
+              <button type="submit" id="sendButton" class="chat-bar__send" title="Send">&rarr;</button>
+              <span class="chat-bar__status" id="chatStatus"></span>
+            </form>
+          </div>
         </section>
         <div class="modal-overlay hidden" id="dispatcherModal">
           <div class="modal-panel">
