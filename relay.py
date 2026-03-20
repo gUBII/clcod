@@ -564,6 +564,16 @@ def normalize_argv(value: Any, agent_name: str, field_name: str) -> list[str]:
     raise ValueError(f"{agent_name}: {field_name} must be a string or list")
 
 
+def extract_target(body: str) -> str | None:
+    """Extract explicit @MENTION target from message body.
+    Returns the target name (e.g., 'CLAUDE') or None if no target found."""
+    stripped = body.strip()
+    match = re.match(r"^@(\w+)\b", stripped)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
 def last_speaker(text: str) -> str:
     last = ""
     tagged_speaker: str | None = None
@@ -1204,6 +1214,7 @@ async def run_relay(
                     "last_speaker": sender,
                     "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "char_count": len(body),
+                    "message": payload,
                 },
             )
 
@@ -1264,7 +1275,9 @@ async def run_relay(
                         relay_log(f"/move: task #{move_id} not found")
                 return
 
-            relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
+            # ── Explicit target parsing: @MENTION routing ──
+            explicit_target = extract_target(body)
+            valid_agent_names = {agent["name"] for agent in enabled_agents}
 
             # Skip routing when sleeping — message is already saved to transcript
             if is_sleeping and is_sleeping():
@@ -1285,50 +1298,71 @@ async def run_relay(
             fresh = read_text(log_path)
             context = fresh[-context_len:]
 
-            # ── Dispatcher: smart routing via local Ollama models ──
-            dispatch_config = config.get("dispatcher", {})
+            # ── Determine target agents ──
+            # Priority: explicit @mention > dispatcher > all agents (broadcast)
             dispatch_targets = enabled_agents  # default: all agents
-            if dispatch_config.get("enabled"):
-                try:
-                    decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
-                    action = decision.get("action", "route")
-                    relay_log(f"dispatcher: action={action} targets={decision.get('targets')} type={decision.get('task_type')}")
-                    dispatcher_event: dict[str, Any] = {
-                        "type": "dispatcher",
-                        "action": action,
-                        "targets": decision.get("targets", []),
-                    }
-                    # Only include task metadata when the message is an explicit /task command
-                    if body.strip().lower().startswith("/task"):
-                        dispatcher_event["task_type"] = decision.get("task_type")
-                        dispatcher_event["priority"] = decision.get("priority")
-                    emit_event(event_callback, dispatcher_event)
+            requested_target = None
+            dispatcher_decision = None
 
-                    # /task commands must always reach task-creation and agent
-                    # dispatch — never let the dispatcher absorb or clarify them.
-                    is_slash_task = lower.startswith("/task")
+            if explicit_target:
+                # Explicit @mention: only route to that agent if it exists
+                if explicit_target in valid_agent_names:
+                    dispatch_targets = [a for a in enabled_agents if a["name"] == explicit_target]
+                    requested_target = explicit_target
+                    relay_log(f"[{sender}] @{explicit_target} -> {explicit_target}")
+                else:
+                    # Invalid target mentioned
+                    relay_log(f"[{sender}] mentioned unknown agent @{explicit_target} (valid: {', '.join(sorted(valid_agent_names))})")
+                    # Still route to all since target was invalid/unrecognized
+                    dispatch_targets = enabled_agents
+                    requested_target = explicit_target
+            else:
+                # No explicit target: use dispatcher
+                dispatch_config = config.get("dispatcher", {})
+                if dispatch_config.get("enabled"):
+                    try:
+                        dispatcher_decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
+                        action = dispatcher_decision.get("action", "route")
+                        relay_log(f"dispatcher: action={action} targets={dispatcher_decision.get('targets')} type={dispatcher_decision.get('task_type')}")
+                        dispatcher_event: dict[str, Any] = {
+                            "type": "dispatcher",
+                            "action": action,
+                            "targets": dispatcher_decision.get("targets", []),
+                        }
+                        # Only include task metadata when the message is an explicit /task command
+                        if body.strip().lower().startswith("/task"):
+                            dispatcher_event["task_type"] = dispatcher_decision.get("task_type")
+                            dispatcher_event["priority"] = dispatcher_decision.get("priority")
+                        emit_event(event_callback, dispatcher_event)
 
-                    if action == "absorb" and decision.get("reply"):
-                        # Handle locally — no cloud call needed
-                        await append_reply(write_lock, log_path, "DISPATCHER", decision["reply"])
-                        relay_log(f"dispatcher absorbed: {decision['reply'][:80]}")
-                        if not is_slash_task:
-                            return
+                        # /task commands must always reach task-creation and agent
+                        # dispatch — never let the dispatcher absorb or clarify them.
+                        is_slash_task = lower.startswith("/task")
 
-                    if action == "clarify" and decision.get("reply"):
-                        await append_reply(write_lock, log_path, "DISPATCHER", decision["reply"])
-                        relay_log(f"dispatcher clarifying: {decision['reply'][:80]}")
-                        if not is_slash_task:
-                            return
+                        if action == "absorb" and dispatcher_decision.get("reply"):
+                            # Handle locally — no cloud call needed
+                            await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
+                            relay_log(f"dispatcher absorbed: {dispatcher_decision['reply'][:80]}")
+                            if not is_slash_task:
+                                return
 
-                    if action == "route" and decision.get("targets"):
-                        target_names = set(decision["targets"])
-                        filtered = [a for a in enabled_agents if a["name"] in target_names]
-                        if filtered:
-                            dispatch_targets = filtered
-                            relay_log(f"dispatcher routed to: {', '.join(a['name'] for a in dispatch_targets)}")
-                except Exception as exc:
-                    relay_log(f"dispatcher error (falling back to broadcast): {exc}")
+                        if action == "clarify" and dispatcher_decision.get("reply"):
+                            await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
+                            relay_log(f"dispatcher clarifying: {dispatcher_decision['reply'][:80]}")
+                            if not is_slash_task:
+                                return
+
+                        if action == "route" and dispatcher_decision.get("targets"):
+                            target_names = set(dispatcher_decision["targets"])
+                            filtered = [a for a in enabled_agents if a["name"] in target_names]
+                            if filtered:
+                                dispatch_targets = filtered
+                                requested_target = " ".join(target_names)
+                                relay_log(f"dispatcher routed to: {', '.join(a['name'] for a in dispatch_targets)}")
+                    except Exception as exc:
+                        relay_log(f"dispatcher error (falling back to broadcast): {exc}")
+                else:
+                    relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
             # ── Create task for tracking (only on explicit /task command) ──
             if body.strip().lower().startswith("/task"):

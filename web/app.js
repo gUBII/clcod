@@ -57,6 +57,8 @@ let unlocked = false;
 let transcriptTimer = null;
 let stateTimer = null;
 let latestState = null;
+let lastSeenSeq = 0;
+let lastSeenRev = 0;
 
 unlockForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -418,7 +420,17 @@ function startPolling() {
           }
           break;
         case "transcript":
-          pollTranscript();
+          // Refresh on rev change (authoritative signal from server)
+          if (data.rev !== undefined && data.rev > lastSeenRev) {
+            lastSeenRev = data.rev;
+            pollTranscript();
+          } else if (data.message && data.message.seq > lastSeenSeq) {
+            appendMessage(data.message);
+            lastSeenSeq = data.message.seq;
+          } else if (data.rev === undefined) {
+            // Fallback: if no rev, try to append single message
+            pollTranscript();
+          }
           break;
         case "agent_state":
           if (latestState?.agents?.[data.agent]) {
@@ -504,6 +516,11 @@ function renderState(state) {
   renderEngines(state.agents || {});
   renderProjectName(state);
   renderDispatcher(state);
+
+  // Update transcript revision from initial state
+  if (state.transcript?.rev !== undefined && state.transcript.rev > lastSeenRev) {
+    lastSeenRev = state.transcript.rev;
+  }
 
   if (!unlocked) {
     showGate();
@@ -766,8 +783,35 @@ function renderTranscript(entries) {
     `;
     item.querySelector(".message__body").textContent = entry.text || "";
     transcript.appendChild(item);
+    if (entry.seq && entry.seq > lastSeenSeq) {
+      lastSeenSeq = entry.seq;
+    }
   }
   transcript.scrollTop = transcript.scrollHeight;
+}
+
+function appendMessage(msg) {
+  // Remove "no entries" placeholder if present
+  const empty = transcript.querySelector(".transcript__empty");
+  if (empty) empty.remove();
+
+  const time = formatTime(msg.ts);
+  const timeSpan = time ? `<span class="message__time">${time}</span>` : "";
+  const item = document.createElement("article");
+  item.className = "message";
+  item.innerHTML = `
+    <header class="message__header">${escapeHtml(msg.sender)} ${timeSpan}</header>
+    <pre class="message__body"></pre>
+  `;
+  item.querySelector(".message__body").textContent = msg.body || "";
+  transcript.appendChild(item);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
 }
 
 function showGate() {
