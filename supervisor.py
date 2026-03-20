@@ -126,6 +126,7 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
             "path": str(config["workspace"]["log_path"]),
             "last_speaker": "",
             "last_updated_at": None,
+            "rev": 0,
         },
     }
 
@@ -163,11 +164,15 @@ def parse_transcript_entries(text: str, limit: int) -> list[dict[str, str]]:
                 entry = {"speaker": payload["speaker"], "text": payload["text"]}
                 if payload.get("ts"):
                     entry["ts"] = payload["ts"]
+                if payload.get("seq"):
+                    entry["seq"] = payload["seq"]
                 entries.append(entry)
             elif "sender" in payload and "body" in payload:
                 entry = {"speaker": payload["sender"], "text": payload["body"]}
                 if payload.get("ts"):
                     entry["ts"] = payload["ts"]
+                if payload.get("seq"):
+                    entry["seq"] = payload["seq"]
                 entries.append(entry)
         except json.JSONDecodeError:
             continue
@@ -923,7 +928,8 @@ class RuntimeSupervisor:
             if speaker and speaker in self.state.snapshot()["agents"] and char_count > 0:
                 estimated_tokens = max(1, char_count // 4)
                 self.state.record_agent_usage(speaker, estimated_tokens)
-            self.sse_broadcast("transcript", {"last_speaker": event.get("last_speaker", "")})
+            msg = event.get("message")
+            self.sse_broadcast("transcript", {"last_speaker": event.get("last_speaker", ""), **({"message": msg} if msg else {})})
             return
 
         if event["type"] == "agent_state":
@@ -1249,14 +1255,21 @@ class RuntimeSupervisor:
                     if not supervisor._send_to_socket(message):
                         relay.append_tagged_entry(supervisor.workspace["log_path"], speaker, raw_message[:8000])
 
+                    # Bump transcript revision on every message to signal clients to refresh
+                    current_rev = supervisor.state.state.get("transcript", {}).get("rev", 0)
                     supervisor.state.patch(
                         "transcript",
                         {
                             "last_speaker": speaker,
                             "last_updated_at": utc_now(),
+                            "rev": current_rev + 1,
                         },
                     )
-                    supervisor.sse_broadcast("transcript", {"last_speaker": speaker})
+                    supervisor.sse_broadcast("transcript", {
+                        "last_speaker": speaker,
+                        "rev": current_rev + 1,
+                        "message": message,
+                    })
                     return self._json({"ok": True, "state": supervisor.state.snapshot()})
 
                 if parsed.path.startswith("/api/agents/") and parsed.path.endswith("/settings"):
