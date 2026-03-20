@@ -41,6 +41,16 @@ const senderName = document.getElementById("senderName");
 const chatInput = document.getElementById("chatInput");
 const chatStatus = document.getElementById("chatStatus");
 const sendButton = document.getElementById("sendButton");
+const projectName = document.getElementById("projectName");
+const themeToggle = document.getElementById("themeToggle");
+const tasksPending = document.getElementById("tasksPending");
+const tasksActive = document.getElementById("tasksActive");
+const tasksDone = document.getElementById("tasksDone");
+const dispatcherDot = document.getElementById("dispatcherDot");
+const dispatcherLabel = document.getElementById("dispatcherLabel");
+const dispatcherRoutes = document.getElementById("dispatcherRoutes");
+const dispatcherAbsorbs = document.getElementById("dispatcherAbsorbs");
+const dispatcherTokens = document.getElementById("dispatcherTokens");
 
 let unlocked = false;
 let transcriptTimer = null;
@@ -260,6 +270,8 @@ syncRepoBtn.addEventListener("click", async () => {
   }
 });
 
+let evtSource = null;
+
 function startPolling() {
   if (stateTimer) {
     clearInterval(stateTimer);
@@ -267,11 +279,67 @@ function startPolling() {
   if (transcriptTimer) {
     clearInterval(transcriptTimer);
   }
+  if (evtSource) {
+    evtSource.close();
+    evtSource = null;
+  }
 
-  pollState();
+  evtSource = new EventSource("/api/events");
+
+  evtSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      switch (data.type) {
+        case "init":
+        case "state_refresh":
+          if (data.locked) {
+            unlocked = false;
+            showGate();
+          } else {
+            renderState(data);
+          }
+          break;
+        case "relay_state":
+          if (latestState) {
+            latestState.relay = { ...latestState.relay, state: data.state };
+            renderState(latestState);
+          }
+          break;
+        case "transcript":
+          pollTranscript();
+          break;
+        case "agent_state":
+          if (latestState?.agents?.[data.agent]) {
+            latestState.agents[data.agent].state = data.state;
+            renderState(latestState);
+          }
+          break;
+        case "dispatcher":
+          if (latestState) {
+            latestState.dispatcher = { ...latestState.dispatcher, ...data };
+            renderDispatcher(latestState);
+          }
+          break;
+        case "task_created":
+          fetchTasks();
+          break;
+      }
+    } catch { /* ignore malformed */ }
+  };
+
+  evtSource.onerror = () => {
+    evtSource.close();
+    evtSource = null;
+    // Fall back to polling
+    pollState();
+    pollTranscript();
+    stateTimer = setInterval(pollState, 1500);
+    transcriptTimer = setInterval(pollTranscript, 2500);
+  };
+
+  // Fetch transcript and tasks once on connect; SSE events trigger refreshes
   pollTranscript();
-  stateTimer = setInterval(pollState, 1500);
-  transcriptTimer = setInterval(pollTranscript, 2500);
+  fetchTasks();
 }
 
 async function pollState() {
@@ -309,6 +377,8 @@ function renderState(state) {
   hydrateSender(state.app?.default_sender || "Operator");
   sleepBtn.textContent = state.app?.sleeping ? "Wake" : "Sleep";
   renderEngines(state.agents || {});
+  renderProjectName(state);
+  renderDispatcher(state);
 
   if (!unlocked) {
     showGate();
@@ -585,5 +655,85 @@ function showWorkspace() {
   engineRoom.classList.add("hidden");
   workspace.classList.remove("hidden");
 }
+
+/* ── Project name ────────────────────────────────────── */
+
+function renderProjectName(state) {
+  const name = state.project?.name || state.project?.active || "none";
+  projectName.textContent = name;
+}
+
+/* ── Dispatcher bar ──────────────────────────────────── */
+
+function renderDispatcher(state) {
+  const d = state.dispatcher || {};
+  const dState = d.state || "disabled";
+  dispatcherDot.className = `dispatcher-bar__dot dispatcher-bar__dot--${dState}`;
+  dispatcherLabel.textContent = `Dispatcher: ${dState}`;
+  dispatcherRoutes.textContent = String(d.routes_total || 0);
+  dispatcherAbsorbs.textContent = String(d.absorbs_total || 0);
+  dispatcherTokens.textContent = (d.tokens_saved || 0).toLocaleString();
+}
+
+/* ── Task board ──────────────────────────────────────── */
+
+let cachedTasks = [];
+
+function renderTaskBoard(tasks) {
+  cachedTasks = tasks;
+  const pending = tasks.filter(t => t.status === "pending");
+  const active = tasks.filter(t => t.status === "in_progress");
+  const done = tasks.filter(t => t.status === "done").slice(-20);
+
+  tasksPending.innerHTML = pending.length ? "" : `<p class="task-board__empty">—</p>`;
+  tasksActive.innerHTML = active.length ? "" : `<p class="task-board__empty">—</p>`;
+  tasksDone.innerHTML = done.length ? "" : `<p class="task-board__empty">—</p>`;
+
+  for (const t of pending) tasksPending.appendChild(taskCard(t));
+  for (const t of active) tasksActive.appendChild(taskCard(t));
+  for (const t of done) tasksDone.appendChild(taskCard(t));
+}
+
+function taskCard(t) {
+  const el = document.createElement("div");
+  el.className = `task-card task-card--${t.status}`;
+  const title = document.createElement("p");
+  title.className = "task-card__title";
+  title.textContent = t.title || t.id || "Untitled";
+  el.appendChild(title);
+  if (t.assigned_to?.length) {
+    const meta = document.createElement("p");
+    meta.className = "task-card__meta";
+    meta.textContent = t.assigned_to.join(", ");
+    el.appendChild(meta);
+  }
+  return el;
+}
+
+async function fetchTasks() {
+  try {
+    const res = await fetch("/api/tasks");
+    if (!res.ok) return;
+    const data = await res.json();
+    renderTaskBoard(data.tasks || []);
+  } catch { /* ignore */ }
+}
+
+/* ── Theme toggle ────────────────────────────────────── */
+
+const themeKey = "clcod.theme";
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem(themeKey, theme);
+  themeToggle.textContent = theme === "dark" ? "◐" : "◑";
+}
+
+themeToggle.addEventListener("click", () => {
+  const current = document.documentElement.getAttribute("data-theme") || "dark";
+  applyTheme(current === "dark" ? "light" : "dark");
+});
+
+applyTheme(localStorage.getItem(themeKey) || "dark");
 
 showGate();

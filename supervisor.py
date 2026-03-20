@@ -1372,9 +1372,16 @@ class RuntimeSupervisor:
         self.http_thread.start()
 
     async def refresh_loop(self) -> None:
+        tick = 0
         while not self.stop_event.is_set():
             self.refresh_transcript_state()
             self.refresh_tmux_state()
+            tick += 1
+            if tick % 3 == 0 and self._sse_clients:
+                snapshot = self.state.snapshot()
+                for agent_name in snapshot.get("agents", {}):
+                    snapshot["agents"][agent_name]["fuel"] = self.state.fuel_for_agent(agent_name)
+                self.sse_broadcast("state_refresh", snapshot)
             await asyncio.sleep(1.0)
 
     async def run(self) -> int:

@@ -63,11 +63,58 @@ body::before {
 .chrome {
   display: flex;
   justify-content: space-between;
-  align-items: end;
+  align-items: center;
   padding: 10px 16px;
   border: 1px solid var(--line);
   border-radius: 16px;
   background: rgba(4, 10, 18, 0.72);
+}
+
+.chrome__left,
+.chrome__right {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.chrome__project {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 0.78rem;
+}
+
+.chrome__project-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.62rem;
+}
+
+.chrome__project-name {
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.chrome__theme-toggle {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  font-size: 1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.chrome__theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--text);
 }
 
 .chrome__brand {
@@ -615,7 +662,7 @@ button {
 
 .workspace__grid {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 240px minmax(0, 1fr) 300px;
   grid-template-rows: minmax(0, 1fr);
   gap: 10px;
   flex: 1 1 0;
@@ -911,10 +958,22 @@ button {
   }
 }
 
+@media (max-width: 1200px) {
+  .workspace__grid {
+    grid-template-columns: 200px minmax(0, 1fr);
+  }
+  .panel--status {
+    display: none;
+  }
+}
+
 @media (max-width: 980px) {
   .engines,
   .workspace__grid {
     grid-template-columns: 1fr;
+  }
+  .panel--tasks {
+    display: none;
   }
 
   .hero,
@@ -937,4 +996,132 @@ button {
   .workspace__meta {
     text-align: left;
   }
+}
+
+/* ── Task Board ────────────────────────────────────────── */
+
+.panel--tasks .task-board {
+  flex: 1 1 0;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.task-board__col + .task-board__col {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.task-board__col-title {
+  margin: 0 0 6px;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+
+.task-card {
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 0.78rem;
+}
+
+.task-card__title {
+  margin: 0;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.task-card__meta {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.task-card--pending { border-left: 3px solid var(--warn); }
+.task-card--in_progress { border-left: 3px solid var(--blue); }
+.task-card--done { border-left: 3px solid var(--ready); opacity: 0.65; }
+
+/* ── Dispatcher Bar ────────────────────────────────────── */
+
+.dispatcher-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.dispatcher-bar__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.dispatcher-bar__dot--active { background: var(--ready); }
+.dispatcher-bar__dot--unavailable { background: var(--error); }
+.dispatcher-bar__dot--disabled { background: var(--muted); }
+
+.dispatcher-bar__label {
+  flex: 1;
+}
+
+.dispatcher-bar__stat {
+  white-space: nowrap;
+}
+
+.dispatcher-bar__stat strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ── Light Theme ───────────────────────────────────────── */
+
+[data-theme="light"] {
+  --bg: #f0f2f5;
+  --bg-deep: #e4e7ec;
+  --panel: rgba(255, 255, 255, 0.82);
+  --panel-strong: rgba(255, 255, 255, 0.94);
+  --text: #1a1d24;
+  --muted: #5f6b7a;
+  --line: rgba(0, 0, 0, 0.1);
+  --warn: #d97706;
+  --hot: #ea580c;
+  --ready: #16a34a;
+  --error: #dc2626;
+  --blue: #2563eb;
+  --shadow: 0 28px 120px rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="light"] body {
+  background:
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.08), transparent 32%),
+    radial-gradient(circle at top right, rgba(234, 88, 12, 0.06), transparent 28%),
+    linear-gradient(180deg, var(--bg), var(--bg-deep));
+}
+
+[data-theme="light"] body::before {
+  background:
+    linear-gradient(rgba(0, 0, 0, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.03) 1px, transparent 1px);
+}
+
+[data-theme="light"] .chrome {
+  background: rgba(255, 255, 255, 0.72);
+}
+
+[data-theme="light"] .gate__panel button,
+[data-theme="light"] .compact-btn,
+[data-theme="light"] .chip--active {
+  color: #fff;
 }

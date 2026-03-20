@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,11 +9,20 @@
   <body>
     <div class="shell">
       <div class="chrome">
-        <div class="chrome__brand">
-          <span class="chrome__eyebrow">Local Engine Supervisor</span>
-          <h1>Farhan's Man Cave</h1>
+        <div class="chrome__left">
+          <div class="chrome__brand">
+            <span class="chrome__eyebrow">Local Engine Supervisor</span>
+            <h1>Farhan's Man Cave</h1>
+          </div>
+          <div class="chrome__project" id="projectPicker">
+            <span class="chrome__project-label">Project</span>
+            <span class="chrome__project-name" id="projectName">none</span>
+          </div>
         </div>
-        <div class="chrome__status" id="appPhase">LOCKED</div>
+        <div class="chrome__right">
+          <div class="chrome__status" id="appPhase">LOCKED</div>
+          <button type="button" class="chrome__theme-toggle" id="themeToggle" title="Toggle dark / light mode" aria-label="Toggle theme">◐</button>
+        </div>
       </div>
 
       <main class="main">
@@ -73,12 +82,25 @@
           </div>
 
           <div class="workspace__grid">
-            <section class="panel panel--status">
+            <section class="panel panel--tasks">
               <div class="panel__header">
-                <h3>Engine Control</h3>
-                <span class="panel__hint">model and effort live settings</span>
+                <h3>Task Board</h3>
+                <span class="panel__hint">pending &middot; active &middot; done</span>
               </div>
-              <div id="statusGrid" class="status-grid"></div>
+              <div id="taskBoard" class="task-board">
+                <div class="task-board__col" data-status="pending">
+                  <p class="task-board__col-title">Pending</p>
+                  <div class="task-board__list" id="tasksPending"></div>
+                </div>
+                <div class="task-board__col" data-status="in_progress">
+                  <p class="task-board__col-title">Active</p>
+                  <div class="task-board__list" id="tasksActive"></div>
+                </div>
+                <div class="task-board__col" data-status="done">
+                  <p class="task-board__col-title">Done</p>
+                  <div class="task-board__list" id="tasksDone"></div>
+                </div>
+              </div>
             </section>
 
             <section class="panel panel--transcript">
@@ -88,6 +110,22 @@
               </div>
               <div id="transcript" class="transcript"></div>
             </section>
+
+            <section class="panel panel--status">
+              <div class="panel__header">
+                <h3>Engine Control</h3>
+                <span class="panel__hint">model and effort live settings</span>
+              </div>
+              <div id="statusGrid" class="status-grid"></div>
+            </section>
+          </div>
+
+          <div class="dispatcher-bar" id="dispatcherBar">
+            <span class="dispatcher-bar__dot" id="dispatcherDot"></span>
+            <span class="dispatcher-bar__label" id="dispatcherLabel">Dispatcher: initializing</span>
+            <span class="dispatcher-bar__stat">Routes <strong id="dispatcherRoutes">0</strong></span>
+            <span class="dispatcher-bar__stat">Absorbed <strong id="dispatcherAbsorbs">0</strong></span>
+            <span class="dispatcher-bar__stat">Tokens saved <strong id="dispatcherTokens">0</strong></span>
           </div>
 
           <form id="chatForm" class="chat-bar">
