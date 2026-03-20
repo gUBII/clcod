@@ -1023,6 +1023,17 @@ class RuntimeSupervisor:
             self.refresh_task_state()
             self.sse_broadcast("task_created", event.get("task", {}))
 
+        if event["type"] == "task_updated":
+            self.refresh_task_state()
+            self.sse_broadcast("task_updated", {"task": event.get("task", {})})
+
+        if event["type"] == "tasks_updated":
+            self.refresh_task_state()
+            self.sse_broadcast("tasks_updated", {
+                "tasks": event.get("tasks", []),
+                "new_status": event.get("new_status", ""),
+            })
+
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
         supervisor = self
 
@@ -1404,6 +1415,7 @@ class RuntimeSupervisor:
                             task["priority"] = str(payload["priority"])
                         relay.save_tasks(supervisor.workspace["tasks_path"], tasks_data)
                         supervisor.refresh_task_state()
+                        supervisor.sse_broadcast("task_updated", {"task": task})
                         return self._json({"ok": True, "task": task})
 
                 self.send_error(HTTPStatus.NOT_FOUND)

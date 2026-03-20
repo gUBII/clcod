@@ -791,6 +791,40 @@ def create_task(
     return task
 
 
+def update_task(tasks_path: Path, task_id: int, new_status: str) -> dict[str, Any] | None:
+    """Update a single task's status. Returns the updated task or None if not found."""
+    if new_status not in TASK_STATUSES:
+        return None
+    store = load_tasks(tasks_path)
+    task = next((t for t in store["tasks"] if t["id"] == task_id), None)
+    if task is None:
+        return None
+    task["status"] = new_status
+    if new_status == "done":
+        task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    save_tasks(tasks_path, store)
+    return task
+
+
+def update_all_tasks(tasks_path: Path, new_status: str) -> list[dict[str, Any]]:
+    """Move all non-done tasks to *new_status*. Returns the list of updated tasks."""
+    if new_status not in TASK_STATUSES:
+        return []
+    store = load_tasks(tasks_path)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    updated: list[dict[str, Any]] = []
+    for task in store["tasks"]:
+        if task["status"] == new_status:
+            continue
+        task["status"] = new_status
+        if new_status == "done":
+            task["completed_at"] = now
+        updated.append(task)
+    if updated:
+        save_tasks(tasks_path, store)
+    return updated
+
+
 def load_sessions(path: Path) -> dict[str, str]:
     data = read_json(path, {})
     if not isinstance(data, dict):
@@ -1170,6 +1204,47 @@ async def run_relay(
                 relay_log(f"[{sender}] system message ({msg_type}) saved — skipping dispatch")
                 return
 
+            # ── /move and /moveall: task status mutations ──
+            stripped = body.strip()
+            lower = stripped.lower()
+
+            if lower.startswith("/moveall "):
+                target_status = stripped.split(None, 1)[1].strip().lower().replace(" ", "_")
+                if target_status not in TASK_STATUSES:
+                    relay_log(f"/moveall: invalid status '{target_status}'")
+                else:
+                    updated = update_all_tasks(tasks_path, target_status)
+                    relay_log(f"/moveall -> {target_status}: {len(updated)} task(s) updated")
+                    emit_event(event_callback, {
+                        "type": "tasks_updated",
+                        "tasks": updated,
+                        "new_status": target_status,
+                    })
+                return
+
+            if lower.startswith("/move "):
+                parts = stripped.split()
+                if len(parts) >= 3:
+                    try:
+                        move_id = int(parts[1].lstrip("#"))
+                    except ValueError:
+                        relay_log(f"/move: invalid task id '{parts[1]}'")
+                        return
+                    target_status = parts[2].lower().replace(" ", "_")
+                    if target_status not in TASK_STATUSES:
+                        relay_log(f"/move: invalid status '{target_status}'")
+                        return
+                    task = update_task(tasks_path, move_id, target_status)
+                    if task:
+                        relay_log(f"/move #{move_id} -> {target_status}")
+                        emit_event(event_callback, {
+                            "type": "task_updated",
+                            "task": task,
+                        })
+                    else:
+                        relay_log(f"/move: task #{move_id} not found")
+                return
+
             relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
             # Skip routing when sleeping — message is already saved to transcript
@@ -1210,16 +1285,22 @@ async def run_relay(
                         dispatcher_event["priority"] = decision.get("priority")
                     emit_event(event_callback, dispatcher_event)
 
+                    # /task commands must always reach task-creation and agent
+                    # dispatch — never let the dispatcher absorb or clarify them.
+                    is_slash_task = lower.startswith("/task")
+
                     if action == "absorb" and decision.get("reply"):
                         # Handle locally — no cloud call needed
                         await append_reply(write_lock, log_path, "DISPATCHER", decision["reply"])
                         relay_log(f"dispatcher absorbed: {decision['reply'][:80]}")
-                        return
+                        if not is_slash_task:
+                            return
 
                     if action == "clarify" and decision.get("reply"):
                         await append_reply(write_lock, log_path, "DISPATCHER", decision["reply"])
                         relay_log(f"dispatcher clarifying: {decision['reply'][:80]}")
-                        return
+                        if not is_slash_task:
+                            return
 
                     if action == "route" and decision.get("targets"):
                         target_names = set(decision["targets"])
