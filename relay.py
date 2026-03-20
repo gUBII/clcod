@@ -639,7 +639,7 @@ def release_lock(lock_path: Path) -> None:
         return
 
 
-def append_tagged_entry(log_path: Path, speaker: str, text: str) -> None:
+def append_tagged_entry(log_path: Path, speaker: str, text: str) -> dict:
     message = {
         "id": str(uuid.uuid4()),
         "sender": speaker,
@@ -655,11 +655,12 @@ def append_tagged_entry(log_path: Path, speaker: str, text: str) -> None:
         handle.write(entry)
         handle.flush()
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return message
 
 
-async def append_reply(write_lock: asyncio.Lock, log_path: Path, speaker: str, text: str) -> None:
+async def append_reply(write_lock: asyncio.Lock, log_path: Path, speaker: str, text: str) -> dict:
     async with write_lock:
-        append_tagged_entry(log_path, speaker, text)
+        return append_tagged_entry(log_path, speaker, text)
 
 
 def parse_codex(raw: str) -> str:
@@ -1083,8 +1084,18 @@ async def route_to(
     try:
         result = await call_agent(agent, prompt, sessions_path, session_lock)
         if result.reply:
-            await append_reply(write_lock, log_path, name, result.reply)
+            msg = await append_reply(write_lock, log_path, name, result.reply)
             relay_log(f"{name} replied ({len(result.reply)} chars)")
+            emit_event(
+                event_callback,
+                {
+                    "type": "transcript",
+                    "last_speaker": name,
+                    "last_updated_at": msg["ts"],
+                    "char_count": len(result.reply),
+                    "message": msg,
+                },
+            )
         else:
             relay_log(f"{name}: empty reply")
         emit_event(
@@ -1341,14 +1352,34 @@ async def run_relay(
 
                         if action == "absorb" and dispatcher_decision.get("reply"):
                             # Handle locally — no cloud call needed
-                            await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
+                            msg = await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
                             relay_log(f"dispatcher absorbed: {dispatcher_decision['reply'][:80]}")
+                            emit_event(
+                                event_callback,
+                                {
+                                    "type": "transcript",
+                                    "last_speaker": "DISPATCHER",
+                                    "last_updated_at": msg["ts"],
+                                    "char_count": len(dispatcher_decision["reply"]),
+                                    "message": msg,
+                                },
+                            )
                             if not is_slash_task:
                                 return
 
                         if action == "clarify" and dispatcher_decision.get("reply"):
-                            await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
+                            msg = await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
                             relay_log(f"dispatcher clarifying: {dispatcher_decision['reply'][:80]}")
+                            emit_event(
+                                event_callback,
+                                {
+                                    "type": "transcript",
+                                    "last_speaker": "DISPATCHER",
+                                    "last_updated_at": msg["ts"],
+                                    "char_count": len(dispatcher_decision["reply"]),
+                                    "message": msg,
+                                },
+                            )
                             if not is_slash_task:
                                 return
 
@@ -1481,7 +1512,17 @@ async def run_relay(
                 if acquire_lock(lock_path, f"relay-batch:{os.getpid()}", lock_ttl):
                     try:
                         # Prepend batch body to context via append
-                        await append_reply(write_lock, log_path, "SYSTEM", batch_body)
+                        batch_msg = await append_reply(write_lock, log_path, "SYSTEM", batch_body)
+                        emit_event(
+                            event_callback,
+                            {
+                                "type": "transcript",
+                                "last_speaker": "SYSTEM",
+                                "last_updated_at": batch_msg["ts"],
+                                "char_count": len(batch_body),
+                                "message": batch_msg,
+                            },
+                        )
                         await asyncio.gather(
                             *[
                                 route_to(

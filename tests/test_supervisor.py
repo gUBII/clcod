@@ -191,13 +191,36 @@ class SupervisorTests(unittest.TestCase):
                     "last_speaker": "CODEX",
                     "last_updated_at": "2026-03-20T10:00:00Z",
                     "char_count": 40,
+                    "message": {
+                        "id": "msg-1",
+                        "sender": "CODEX",
+                        "seq": 123,
+                        "type": "message",
+                        "body": "hello",
+                        "ts": "2026-03-20T10:00:00Z",
+                    },
                 }
             )
 
             snapshot = runtime.state.snapshot()["transcript"]
             self.assertEqual(snapshot["last_speaker"], "CODEX")
             self.assertEqual(snapshot["last_updated_at"], "2026-03-20T10:00:00Z")
-            runtime.sse_broadcast.assert_called_once_with("transcript", {"last_speaker": "CODEX"})
+            self.assertEqual(snapshot["rev"], 1)
+            runtime.sse_broadcast.assert_called_once_with(
+                "transcript",
+                {
+                    "last_speaker": "CODEX",
+                    "rev": 1,
+                    "message": {
+                        "id": "msg-1",
+                        "sender": "CODEX",
+                        "seq": 123,
+                        "type": "message",
+                        "body": "hello",
+                        "ts": "2026-03-20T10:00:00Z",
+                    },
+                },
+            )
 
     def test_handle_relay_event_updates_agent_pressure(self):
         with tempfile.TemporaryDirectory() as tmpdir:

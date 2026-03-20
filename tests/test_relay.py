@@ -4,7 +4,9 @@ import tempfile
 import time
 import unittest
 import uuid
+import asyncio
 from pathlib import Path
+from unittest import mock
 
 import relay
 
@@ -244,6 +246,71 @@ class RelayTests(unittest.TestCase):
                 title="unassigned task",
             )
             self.assertEqual(task["status"], "pending")
+
+    def test_append_tagged_entry_returns_message_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "room.txt"
+
+            message = relay.append_tagged_entry(log_path, "CODEX", "payload test")
+
+            self.assertEqual(message["sender"], "CODEX")
+            self.assertEqual(message["body"], "payload test")
+            self.assertEqual(message["type"], "message")
+            self.assertIsInstance(message["seq"], int)
+            self.assertTrue(message["ts"])
+
+            persisted = json.loads(log_path.read_text(encoding="utf-8").strip())
+            self.assertEqual(persisted["id"], message["id"])
+            self.assertEqual(persisted["sender"], message["sender"])
+            self.assertEqual(persisted["body"], message["body"])
+
+    def test_route_to_emits_transcript_event_with_message_payload(self):
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "room.txt"
+                sessions_path = Path(tmpdir) / "sessions.json"
+                relay.save_sessions(sessions_path, {})
+                events: list[dict[str, object]] = []
+
+                with mock.patch(
+                    "relay.call_agent",
+                    new=mock.AsyncMock(
+                        return_value=relay.AgentCallResult(
+                            reply="Agent reply",
+                            raw="",
+                            stderr="",
+                            session_id="session-1",
+                        )
+                    ),
+                ):
+                    await relay.route_to(
+                        {"name": "CODEX"},
+                        "prompt",
+                        log_path,
+                        asyncio.Lock(),
+                        sessions_path,
+                        asyncio.Lock(),
+                        event_callback=events.append,
+                    )
+
+                self.assertEqual(events[0]["type"], "agent_state")
+                self.assertEqual(events[0]["state"], "warming")
+
+                transcript_event = events[1]
+                self.assertEqual(transcript_event["type"], "transcript")
+                self.assertEqual(transcript_event["last_speaker"], "CODEX")
+                self.assertEqual(transcript_event["char_count"], len("Agent reply"))
+                self.assertEqual(transcript_event["message"]["sender"], "CODEX")
+                self.assertEqual(transcript_event["message"]["body"], "Agent reply")
+                self.assertEqual(transcript_event["message"]["type"], "message")
+                self.assertIsInstance(transcript_event["message"]["seq"], int)
+                self.assertTrue(transcript_event["message"]["ts"])
+
+                self.assertEqual(events[2]["type"], "agent_state")
+                self.assertEqual(events[2]["state"], "ready")
+                self.assertEqual(events[2]["session_id"], "session-1")
+
+        asyncio.run(run_case())
 
 
 if __name__ == "__main__":
