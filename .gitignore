@@ -6,5 +6,7 @@ __pycache__/
 *.pyc
 speaker.lock
 clcodgemmix.txt
+transcript-backup-*.txt
+auth_tokens.json
 owner
 profile.pdf

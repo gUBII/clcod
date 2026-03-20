@@ -1108,8 +1108,6 @@ async def run_relay(
     log_path.touch(exist_ok=True)
     if not sessions_path.exists():
         save_sessions(sessions_path, {})
-    last_size = log_path.stat().st_size
-
     relay_log(f"watching {log_path}")
     relay_log(f"routing to: {', '.join(agent['name'] for agent in enabled_agents)}")
     relay_log(
@@ -1154,7 +1152,7 @@ async def run_relay(
                 return
 
             append_tagged_entry(log_path, sender, body)
-            
+
             emit_event(
                 event_callback,
                 {
@@ -1164,6 +1162,14 @@ async def run_relay(
                     "char_count": len(body),
                 },
             )
+
+            # System messages (compact/wake/sync) are saved to transcript but
+            # must NOT create tasks or dispatch to agents (BUG-2, BUG-9).
+            msg_type = payload.get("type", "message")
+            if msg_type != "message":
+                relay_log(f"[{sender}] system message ({msg_type}) saved — skipping dispatch")
+                return
+
             relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
             # Skip routing when sleeping — message is already saved to transcript

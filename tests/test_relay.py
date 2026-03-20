@@ -226,6 +226,25 @@ class RelayTests(unittest.TestCase):
 
         self.assertEqual(session_id, "123e4567-e89b-12d3-a456-426614174000")
 
+    def test_create_task_sets_assigned_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_path = Path(tmpdir) / "tasks.json"
+            task = relay.create_task(
+                tasks_path,
+                title="test task",
+                assigned_to=["CLAUDE", "CODEX"],
+            )
+            self.assertEqual(task["status"], "assigned")
+
+    def test_create_task_sets_pending_without_agents(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_path = Path(tmpdir) / "tasks.json"
+            task = relay.create_task(
+                tasks_path,
+                title="unassigned task",
+            )
+            self.assertEqual(task["status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()
