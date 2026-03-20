@@ -1199,13 +1199,16 @@ async def run_relay(
                     decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
                     action = decision.get("action", "route")
                     relay_log(f"dispatcher: action={action} targets={decision.get('targets')} type={decision.get('task_type')}")
-                    emit_event(event_callback, {
+                    dispatcher_event: dict[str, Any] = {
                         "type": "dispatcher",
                         "action": action,
                         "targets": decision.get("targets", []),
-                        "task_type": decision.get("task_type"),
-                        "priority": decision.get("priority"),
-                    })
+                    }
+                    # Only include task metadata when the message is an explicit /task command
+                    if body.strip().lower().startswith("/task"):
+                        dispatcher_event["task_type"] = decision.get("task_type")
+                        dispatcher_event["priority"] = decision.get("priority")
+                    emit_event(event_callback, dispatcher_event)
 
                     if action == "absorb" and decision.get("reply"):
                         # Handle locally — no cloud call needed
@@ -1227,29 +1230,33 @@ async def run_relay(
                 except Exception as exc:
                     relay_log(f"dispatcher error (falling back to broadcast): {exc}")
 
-            # ── Create task for tracking ──
-            task_title = body[:120] if len(body) <= 120 else body[:117] + "..."
-            task_type = "general"
-            task_priority = "normal"
-            if dispatch_config.get("enabled"):
-                try:
-                    task_type = decision.get("task_type", "general")  # type: ignore[possibly-undefined]
-                    task_priority = decision.get("priority", "normal")  # type: ignore[possibly-undefined]
-                except NameError:
-                    pass
-            task = create_task(
-                tasks_path,
-                title=task_title,
-                task_type=task_type,
-                priority=task_priority,
-                assigned_to=[a["name"] for a in dispatch_targets],
-                source_message=body,
-            )
-            relay_log(f"task #{task['id']} created: {task['title'][:60]}")
-            emit_event(event_callback, {
-                "type": "task_created",
-                "task": task,
-            })
+            # ── Create task for tracking (only on explicit /task command) ──
+            if body.strip().lower().startswith("/task"):
+                task_body = body.strip()[len("/task"):].strip()
+                task_title = task_body[:120] if len(task_body) <= 120 else task_body[:117] + "..."
+                if not task_title:
+                    task_title = "Untitled task"
+                task_type = "general"
+                task_priority = "normal"
+                if dispatch_config.get("enabled"):
+                    try:
+                        task_type = decision.get("task_type", "general")  # type: ignore[possibly-undefined]
+                        task_priority = decision.get("priority", "normal")  # type: ignore[possibly-undefined]
+                    except NameError:
+                        pass
+                task = create_task(
+                    tasks_path,
+                    title=task_title,
+                    task_type=task_type,
+                    priority=task_priority,
+                    assigned_to=[a["name"] for a in dispatch_targets],
+                    source_message=body,
+                )
+                relay_log(f"task #{task['id']} created: {task['title'][:60]}")
+                emit_event(event_callback, {
+                    "type": "task_created",
+                    "task": task,
+                })
 
             prompts = {
                 agent["name"]: PROMPT_TEMPLATE.format(

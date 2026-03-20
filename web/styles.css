@@ -1128,6 +1128,15 @@ button {
   font-size: 0.78rem;
 }
 
+.task-card__id {
+  display: inline-block;
+  font-size: 0.65rem;
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: 2px;
+  font-family: var(--mono, monospace);
+}
+
 .task-card__title {
   margin: 0;
   color: var(--text);

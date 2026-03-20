@@ -979,6 +979,12 @@ function renderTaskBoard(tasks) {
 function taskCard(t) {
   const el = document.createElement("div");
   el.className = `task-card task-card--${t.status}`;
+  if (t.id != null) {
+    const idBadge = document.createElement("span");
+    idBadge.className = "task-card__id";
+    idBadge.textContent = `#${t.id}`;
+    el.appendChild(idBadge);
+  }
   const title = document.createElement("p");
   title.className = "task-card__title";
   title.textContent = t.title || t.id || "Untitled";
