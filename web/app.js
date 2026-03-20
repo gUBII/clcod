@@ -203,9 +203,8 @@ chatForm.addEventListener("submit", async (event) => {
 
   const result = await response.json();
   chatInput.value = "";
-  chatStatus.textContent = "Message posted to the transcript.";
+  chatStatus.textContent = "";
   renderState(result.state);
-  setTimeout(() => { pollTranscript(); }, 500);
 });
 
 /* ── @ mention popup ─────────────────────────────────── */
@@ -410,6 +409,10 @@ function startPolling() {
             unlocked = false;
             showGate();
           } else {
+            // Sync rev from server state so first SSE transcript event doesn't trigger gap detection
+            if (data.transcript && data.transcript.rev !== undefined) {
+              lastSeenRev = data.transcript.rev;
+            }
             renderState(data);
           }
           break;
@@ -506,6 +509,9 @@ async function pollTranscript() {
     return;
   }
   const payload = await response.json();
+  if (payload.rev !== undefined) {
+    lastSeenRev = payload.rev;
+  }
   renderTranscript(payload.entries || []);
 }
 
