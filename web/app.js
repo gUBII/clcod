@@ -41,6 +41,7 @@ const senderName = document.getElementById("senderName");
 const chatInput = document.getElementById("chatInput");
 const chatStatus = document.getElementById("chatStatus");
 const sendButton = document.getElementById("sendButton");
+const mentionPopup = document.getElementById("mentionPopup");
 const projectName = document.getElementById("projectName");
 const themeToggle = document.getElementById("themeToggle");
 const tasksPending = document.getElementById("tasksPending");

@@ -923,6 +923,59 @@ button {
   font-size: 0.78rem;
 }
 
+.chat-bar-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.mention-popup {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 130px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(20px);
+  overflow: hidden;
+  min-width: 160px;
+  z-index: 200;
+}
+
+.mention-popup.hidden {
+  display: none;
+}
+
+.mention-popup__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+  color: var(--text);
+  transition: background 0.1s;
+}
+
+.mention-popup__item:hover,
+.mention-popup__item.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mention-popup__avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 0.65rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
 .chat-bar {
   display: flex;
   align-items: center;
@@ -933,7 +986,6 @@ button {
   background: var(--panel-strong);
   backdrop-filter: blur(20px);
   box-shadow: var(--shadow);
-  flex-shrink: 0;
 }
 
 .chat-bar__sender {
