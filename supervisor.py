@@ -915,11 +915,13 @@ class RuntimeSupervisor:
             return
 
         if event["type"] == "transcript":
+            current_rev = self.state.state.get("transcript", {}).get("rev", 0)
             self.state.patch(
                 "transcript",
                 {
                     "last_speaker": event.get("last_speaker", ""),
                     "last_updated_at": event.get("last_updated_at"),
+                    "rev": current_rev + 1,
                 },
             )
             # Track usage: use character count as token proxy (~4 chars ≈ 1 token)
@@ -929,7 +931,7 @@ class RuntimeSupervisor:
                 estimated_tokens = max(1, char_count // 4)
                 self.state.record_agent_usage(speaker, estimated_tokens)
             msg = event.get("message")
-            self.sse_broadcast("transcript", {"last_speaker": event.get("last_speaker", ""), **({"message": msg} if msg else {})})
+            self.sse_broadcast("transcript", {"last_speaker": event.get("last_speaker", ""), "rev": current_rev + 1, **({"message": msg} if msg else {})})
             return
 
         if event["type"] == "agent_state":
