@@ -333,6 +333,34 @@ function labelForOption(options, optionId, fallback = "default") {
   return match?.label || fallback;
 }
 
+function computePressure(payload) {
+  const fuel = payload.fuel || {};
+  const pressure = payload.pressure || {};
+  const fuelPct = fuel.pct_remaining != null ? fuel.pct_remaining : 100;
+  const queueDepth = pressure.queue_depth || 0;
+  const latencyMs = pressure.last_latency_ms || 0;
+  const tps = pressure.tokens_per_sec || 0;
+  const errorRate = pressure.error_rate_5m || 0;
+
+  // Weighted pressure score 0-100
+  const fuelPressure = Math.max(0, (100 - fuelPct)) * 0.25;
+  const queuePressure = Math.min(queueDepth * 20, 30);
+  const latencyPressure = Math.min(latencyMs / 400, 25);
+  const errorPressure = Math.min(errorRate * 8, 20);
+  const score = Math.min(100, Math.round(fuelPressure + queuePressure + latencyPressure + errorPressure));
+
+  // Map 0-100 to needle angle: -90deg (idle) to +90deg (redline)
+  const angle = -90 + (score / 100) * 180;
+  const level = score > 70 ? "high" : score > 35 ? "mid" : "low";
+  return { score, angle, level, fuelPct };
+}
+
+function needleColor(level) {
+  if (level === "high") return "var(--red, #ef4444)";
+  if (level === "mid") return "var(--amber, #f59e0b)";
+  return "var(--blue, #6cb4ee)";
+}
+
 function allowedEffortIds(payload) {
   const matrix = payload.effort_matrix || {};
   const selectedModel = payload.selected_model || "default";
@@ -351,8 +379,12 @@ function renderEngines(agents) {
 
   for (const [name, payload] of entries) {
     const state = payload.state || "starting";
+    const p = computePressure(payload);
+    const nColor = needleColor(p.level);
+    const fuelAngle = (p.fuelPct / 100) * 180;
     const card = document.createElement("article");
     card.className = `engine engine--${state}`;
+    card.dataset.pressure = p.level;
     card.innerHTML = `
       <div class="engine__spark"></div>
       <div class="engine__header">
@@ -360,9 +392,10 @@ function renderEngines(agents) {
         <span class="engine__badge">${stateLabels[state] || state}</span>
       </div>
       <div class="engine__tach">
-        <div class="tach__dial"></div>
-        <div class="tach__needle"></div>
-        <div class="tach__mark">${state === "ready" ? "REV" : state === "error" ? "ERR" : state === "warming" ? "REV" : "IDLE"}</div>
+        <div class="tach__dial" style="--fuel-angle:${fuelAngle}deg"></div>
+        <div class="tach__fuel-arc" style="--fuel-angle:${fuelAngle}deg"></div>
+        <div class="tach__needle" style="transform:translateX(-50%) rotate(${p.angle}deg);--needle-color:${nColor}"></div>
+        <div class="tach__mark">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
       </div>
       <p class="engine__note">${stateNotes[state] || ""}</p>
       <div class="engine__meta engine__meta--stack">
@@ -381,12 +414,14 @@ function renderEngines(agents) {
 
     const htach = document.createElement("div");
     htach.className = `htach control--${state}`;
+    htach.dataset.pressure = p.level;
     htach.innerHTML = `
       <span class="htach__name">${name}</span>
       <div class="control__tach">
-        <div class="tach__dial tach__dial--sm"></div>
-        <div class="tach__needle tach__needle--sm"></div>
-        <div class="tach__mark tach__mark--sm">${state === "ready" ? "REV" : state === "error" ? "ERR" : state === "warming" ? "REV" : "IDLE"}</div>
+        <div class="tach__dial tach__dial--sm" style="--fuel-angle:${fuelAngle}deg"></div>
+        <div class="tach__fuel-arc tach__fuel-arc--sm" style="--fuel-angle:${fuelAngle}deg"></div>
+        <div class="tach__needle tach__needle--sm" style="transform:translateX(-50%) rotate(${p.angle}deg);--needle-color:${nColor}"></div>
+        <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
       </div>
     `;
     workspaceTachs.appendChild(htach);
@@ -394,6 +429,7 @@ function renderEngines(agents) {
     const control = document.createElement("article");
     control.className = `control control--${state}`;
     control.dataset.agent = name;
+    control.dataset.pressure = p.level;
     control.innerHTML = `
       <div class="control__header">
         <div>
@@ -401,9 +437,10 @@ function renderEngines(agents) {
           <p class="control__detail">${payload.pane_target || "no pane target"}</p>
         </div>
         <div class="control__tach">
-          <div class="tach__dial tach__dial--sm"></div>
-          <div class="tach__needle tach__needle--sm"></div>
-          <div class="tach__mark tach__mark--sm">${state === "ready" ? "REV" : state === "error" ? "ERR" : state === "warming" ? "REV" : "IDLE"}</div>
+          <div class="tach__dial tach__dial--sm" style="--fuel-angle:${fuelAngle}deg"></div>
+          <div class="tach__fuel-arc tach__fuel-arc--sm" style="--fuel-angle:${fuelAngle}deg"></div>
+          <div class="tach__needle tach__needle--sm" style="transform:translateX(-50%) rotate(${p.angle}deg);--needle-color:${nColor}"></div>
+          <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
         </div>
         <div class="control__status">
           <span>${stateLabels[state] || state}</span>

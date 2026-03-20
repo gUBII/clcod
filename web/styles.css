@@ -333,12 +333,12 @@ button {
   left: 50%;
   width: 2px;
   height: 42px;
-  background: var(--hot);
+  background: var(--needle-color, var(--hot));
   transform-origin: bottom center;
   transition: transform 0.6s cubic-bezier(0.17, 0.67, 0.2, 1.01);
   transform: translateX(-50%) rotate(-70deg);
   z-index: 2;
-  box-shadow: 0 0 8px var(--hot);
+  box-shadow: 0 0 8px var(--needle-color, var(--hot));
 }
 
 .tach__needle::after {
@@ -348,9 +348,30 @@ button {
   left: -4px;
   width: 10px;
   height: 10px;
-  background: var(--hot);
+  background: var(--needle-color, var(--hot));
   border-radius: 50%;
-  box-shadow: 0 0 10px var(--hot);
+  box-shadow: 0 0 10px var(--needle-color, var(--hot));
+}
+
+.tach__fuel-arc {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100px;
+  height: 100px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  background: conic-gradient(
+    from -90deg at 50% 100%,
+    rgba(112, 240, 194, 0.35) 0deg,
+    rgba(255, 196, 107, 0.35) calc(var(--fuel-angle, 180deg) * 0.5),
+    rgba(255, 97, 120, 0.35) var(--fuel-angle, 180deg),
+    transparent var(--fuel-angle, 180deg)
+  );
+  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 36px, black 38px, black 42px, transparent 44px);
+  mask: radial-gradient(circle at 50% 100%, transparent 36px, black 38px, black 42px, transparent 44px);
+  transition: --fuel-angle 0.6s ease;
+  pointer-events: none;
 }
 
 .tach__mark {
@@ -395,12 +416,12 @@ button {
   position: absolute;
   bottom: 0; left: 50%;
   width: 2px; height: 52px;
-  background: var(--hot);
+  background: var(--needle-color, var(--hot));
   transform-origin: bottom center;
   transition: transform 0.6s cubic-bezier(0.17, 0.67, 0.2, 1.01);
   transform: translateX(-50%) rotate(-70deg);
   z-index: 2;
-  box-shadow: 0 0 8px var(--hot);
+  box-shadow: 0 0 8px var(--needle-color, var(--hot));
 }
 
 .tach__needle--sm::after {
@@ -408,9 +429,28 @@ button {
   position: absolute;
   bottom: -4px; left: -4px;
   width: 10px; height: 10px;
-  background: var(--hot);
+  background: var(--needle-color, var(--hot));
   border-radius: 50%;
-  box-shadow: 0 0 10px var(--hot);
+  box-shadow: 0 0 10px var(--needle-color, var(--hot));
+}
+
+.tach__fuel-arc--sm {
+  position: absolute;
+  top: 0; left: 0;
+  width: 120px; height: 120px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  background: conic-gradient(
+    from -90deg at 50% 100%,
+    rgba(112, 240, 194, 0.35) 0deg,
+    rgba(255, 196, 107, 0.35) calc(var(--fuel-angle, 180deg) * 0.5),
+    rgba(255, 97, 120, 0.35) var(--fuel-angle, 180deg),
+    transparent var(--fuel-angle, 180deg)
+  );
+  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 42px, black 44px, black 48px, transparent 50px);
+  mask: radial-gradient(circle at 50% 100%, transparent 42px, black 44px, black 48px, transparent 50px);
+  transition: --fuel-angle 0.6s ease;
+  pointer-events: none;
 }
 
 .tach__mark--sm {
@@ -427,22 +467,18 @@ button {
 
 .control--starting .tach__needle--sm,
 .control--auth .tach__needle--sm {
-  transform: translateX(-50%) rotate(-20deg);
-  animation: jitter-mid 1.2s ease-in-out infinite;
+  /* No animation override — driven by JS pressure data */
 }
 
 .control--warming .tach__needle--sm {
-  transform: translateX(-50%) rotate(72deg);
-  animation: jitter-high 0.12s ease-in-out infinite;
+  /* No animation override — driven by JS pressure data */
 }
 
 .control--ready .tach__needle--sm {
-  transform: translateX(-50%) rotate(-65deg);
-  animation: jitter-idle 3s ease-in-out infinite;
+  /* No animation override — driven by JS pressure data */
 }
 
 .control--error .tach__needle--sm {
-  transform: translateX(-50%) rotate(-90deg);
   transition: transform 2s ease-out;
 }
 
@@ -501,22 +537,18 @@ button {
 
 .engine--starting .tach__needle,
 .engine--auth .tach__needle {
-  transform: translateX(-50%) rotate(-20deg);
-  animation: jitter-mid 1.2s ease-in-out infinite;
+  /* No animation override — driven by JS pressure data */
 }
 
 .engine--warming .tach__needle {
-  transform: translateX(-50%) rotate(72deg);
-  animation: jitter-high 0.12s ease-in-out infinite;
+  /* No animation override — driven by JS pressure data */
 }
 
 .engine--ready .tach__needle {
-  transform: translateX(-50%) rotate(-65deg);
-  animation: jitter-idle 3s ease-in-out infinite;
+  /* No animation override — driven by JS pressure data */
 }
 
 .engine--error .tach__needle {
-  transform: translateX(-50%) rotate(-90deg);
   transition: transform 2s ease-out;
 }
 
@@ -533,6 +565,26 @@ button {
 @keyframes jitter-high {
   0%, 100% { transform: translateX(-50%) rotate(72deg); }
   50% { transform: translateX(-50%) rotate(78deg); }
+}
+
+/* Pressure-based redline pulse */
+[data-pressure="high"] .tach__dial,
+[data-pressure="high"] .tach__dial--sm {
+  animation: redline-pulse 0.8s ease-in-out infinite;
+}
+
+@keyframes redline-pulse {
+  0%, 100% { border-color: rgba(255, 97, 120, 0.2); }
+  50% { border-color: rgba(255, 97, 120, 0.5); }
+}
+
+/* Fuel-low card border */
+[data-pressure="high"].control {
+  border-color: rgba(255, 97, 120, 0.3);
+}
+
+[data-pressure="high"].engine {
+  border-color: rgba(255, 97, 120, 0.3);
 }
 
 .engine--ignite::after {
