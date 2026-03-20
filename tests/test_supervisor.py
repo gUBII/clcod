@@ -162,6 +162,83 @@ class SupervisorTests(unittest.TestCase):
             self.assertTrue(all(agent.get("work_dir") == str(repo_dir.resolve()) for agent in config["agents"] if agent["enabled"]))
             runtime.sync_agent_mirrors.assert_called_once_with(force=True)
 
+    def test_handle_relay_event_updates_transcript_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sse_broadcast = mock.Mock()
+
+            runtime.handle_relay_event(
+                {
+                    "type": "transcript",
+                    "last_speaker": "CODEX",
+                    "last_updated_at": "2026-03-20T10:00:00Z",
+                    "char_count": 40,
+                }
+            )
+
+            snapshot = runtime.state.snapshot()["transcript"]
+            self.assertEqual(snapshot["last_speaker"], "CODEX")
+            self.assertEqual(snapshot["last_updated_at"], "2026-03-20T10:00:00Z")
+            runtime.sse_broadcast.assert_called_once_with("transcript", {"last_speaker": "CODEX"})
+
+    def test_handle_relay_event_updates_agent_pressure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sse_broadcast = mock.Mock()
+
+            runtime.handle_relay_event({"type": "agent_state", "agent": "CLAUDE", "state": "working"})
+            runtime.handle_relay_event(
+                {
+                    "type": "agent_state",
+                    "agent": "CLAUDE",
+                    "state": "ready",
+                    "tokens_delta": 24,
+                }
+            )
+
+            agent = runtime.state.snapshot()["agents"]["CLAUDE"]
+            self.assertEqual(agent["state"], "ready")
+            self.assertIn("pressure", agent)
+            self.assertGreaterEqual(agent["pressure"]["last_latency_ms"], 0)
+            runtime.sse_broadcast.assert_any_call("agent_state", {"agent": "CLAUDE", "state": "working"})
+            runtime.sse_broadcast.assert_any_call("agent_state", {"agent": "CLAUDE", "state": "ready"})
+
 
 if __name__ == "__main__":
     unittest.main()

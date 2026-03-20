@@ -900,6 +900,7 @@ class RuntimeSupervisor:
                     "last_error": event.get("last_error"),
                 },
             )
+            self.sse_broadcast("relay_state", {"state": event["state"]})
             return
 
         if event["type"] == "transcript":
@@ -916,6 +917,7 @@ class RuntimeSupervisor:
             if speaker and speaker in self.state.snapshot()["agents"] and char_count > 0:
                 estimated_tokens = max(1, char_count // 4)
                 self.state.record_agent_usage(speaker, estimated_tokens)
+            self.sse_broadcast("transcript", {"last_speaker": event.get("last_speaker", "")})
             return
 
         if event["type"] == "agent_state":
@@ -971,6 +973,7 @@ class RuntimeSupervisor:
             values["pressure"] = pressure
 
             self.state.patch_agent(event["agent"], values)
+            self.sse_broadcast("agent_state", {"agent": agent_name, "state": event["state"]})
             return
 
         if event["type"] == "dispatcher":
@@ -998,10 +1001,12 @@ class RuntimeSupervisor:
                 "last_action": action,
                 "last_targets": event.get("targets", []),
             })
+            self.sse_broadcast("dispatcher", {"action": action})
             return
 
         if event["type"] == "task_created":
             self.refresh_task_state()
+            self.sse_broadcast("task_created", event.get("task", {}))
 
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
         supervisor = self
@@ -1094,6 +1099,39 @@ class RuntimeSupervisor:
                     if status_filter:
                         tasks_list = [t for t in tasks_list if t.get("status") == status_filter]
                     return self._json({"tasks": tasks_list[-100:]})
+                if parsed.path == "/api/events":
+                    if not self._authorized():
+                        self.send_error(HTTPStatus.UNAUTHORIZED)
+                        return
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    q = supervisor.sse_subscribe()
+                    try:
+                        # Send initial full state as first event
+                        snapshot = supervisor.state.snapshot()
+                        for agent_name in snapshot.get("agents", {}):
+                            snapshot["agents"][agent_name]["fuel"] = supervisor.state.fuel_for_agent(agent_name)
+                        init_data = json.dumps({"type": "init", **snapshot})
+                        self.wfile.write(f"data: {init_data}\n\n".encode())
+                        self.wfile.flush()
+                        while True:
+                            try:
+                                payload = q.get(timeout=15)
+                                self.wfile.write(f"data: {payload}\n\n".encode())
+                                self.wfile.flush()
+                            except queue.Empty:
+                                # Send keepalive comment
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    finally:
+                        supervisor.sse_unsubscribe(q)
+                    return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
             def do_POST(self) -> None:
