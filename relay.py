@@ -825,6 +825,16 @@ def update_all_tasks(tasks_path: Path, new_status: str) -> list[dict[str, Any]]:
     return updated
 
 
+def clear_all_tasks(tasks_path: Path) -> int:
+    """Delete all tasks and reset the ID counter. Returns the count of cleared tasks."""
+    store = load_tasks(tasks_path)
+    count = len(store["tasks"])
+    store["tasks"] = []
+    store["next_id"] = 1
+    save_tasks(tasks_path, store)
+    return count
+
+
 def load_sessions(path: Path) -> dict[str, str]:
     data = read_json(path, {})
     if not isinstance(data, dict):
@@ -1207,6 +1217,15 @@ async def run_relay(
             # ── /move and /moveall: task status mutations ──
             stripped = body.strip()
             lower = stripped.lower()
+
+            if lower == "/clearall":
+                count = clear_all_tasks(tasks_path)
+                relay_log(f"/clearall: {count} task(s) removed, board reset")
+                emit_event(event_callback, {
+                    "type": "tasks_cleared",
+                    "tasks": [],
+                })
+                return
 
             if lower.startswith("/moveall "):
                 target_status = stripped.split(None, 1)[1].strip().lower().replace(" ", "_")

@@ -439,6 +439,15 @@ function startPolling() {
         case "task_created":
           fetchTasks();
           break;
+        case "tasks_updated":
+          fetchTasks();
+          break;
+        case "task_updated":
+          fetchTasks();
+          break;
+        case "tasks_cleared":
+          renderTaskBoard([]);
+          break;
       }
     } catch { /* ignore malformed */ }
   };
