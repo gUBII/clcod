@@ -929,6 +929,15 @@ def build_selection_args(agent: dict[str, Any]) -> list[str]:
     return args
 
 
+def _build_sessionless_command(agent: dict[str, Any], prompt: str) -> list[str]:
+    """Build a command with no session ID at all (uses base args, not invoke_resume_args)."""
+    work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
+    variables = {"work_dir": work_dir, "script_dir": work_dir}
+    args = [str(a).format_map(SafeFormatDict(variables)) for a in agent["args"]]
+    selection_args = build_selection_args(agent)
+    return [agent["cmd"], *selection_args, *args, prompt]
+
+
 def build_agent_command(
     agent: dict[str, Any], prompt: str, session_id: str | None
 ) -> tuple[list[str], str | None]:
@@ -1045,10 +1054,26 @@ async def call_agent(
         if stderr_text:
             relay_log(f"{agent['name']}: stderr: {stderr_text}")
 
-    if returncode != 0:
-        raise RuntimeError(f"exit code {returncode}")
+        # If fresh preseed also fails, fall back to sessionless invocation
+        if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
+            relay_log(f"{agent['name']}: fresh session also in use, retrying without session")
+            current_session_id = None
+            cmd = _build_sessionless_command(agent, prompt)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
 
+            stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+    # Salvage stdout even on non-zero exit when session-in-use was the only error
+    # (Claude CLI can produce valid output then exit non-zero due to session cleanup)
     raw = stdout.decode("utf-8", errors="replace")
+    if returncode != 0:
+        if _SESSION_IN_USE_RE.search(stderr_text) and raw.strip():
+            relay_log(f"{agent['name']}: non-zero exit with session error but stdout present, salvaging reply")
+        else:
+            raise RuntimeError(f"exit code {returncode}")
     parser = PARSERS.get(agent["name"], parse_claude)
     current_session_id = extract_session_id(agent, raw, stderr_text, current_session_id)
     if current_session_id:
