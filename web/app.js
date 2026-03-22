@@ -746,24 +746,28 @@ function renderEngines(agents) {
 
 function renderChoiceButtons(agent, kind, options, selectedId) {
   if (!options || options.length === 0) {
-    return `<span class="chip chip--empty">Not supported</span>`;
+    return `
+      <select class="control-select" disabled>
+        <option>Not supported</option>
+      </select>
+    `;
   }
-  return options
-    .map((option) => {
-      const active = option.id === selectedId;
-      return `
-        <button
-          type="button"
-          class="chip ${active ? "chip--active" : ""}"
-          data-agent="${agent}"
-          data-kind="${kind}"
-          data-option="${option.id}"
-          aria-pressed="${active ? "true" : "false"}"
-          title="${option.description || option.label}"
-        >${option.label}</button>
-      `;
-    })
-    .join("");
+  return `
+    <select
+      class="control-select"
+      data-agent="${agent}"
+      data-kind="${kind}"
+      data-action="select"
+      title="Select ${kind}"
+    >
+      ${options
+        .map((option) => {
+          const selected = option.id === selectedId ? "selected" : "";
+          return `<option value="${option.id}" ${selected}>${option.label}</option>`;
+        })
+        .join("")}
+    </select>
+  `;
 }
 
 function setControlMessage(agent, message) {
