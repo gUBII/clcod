@@ -161,6 +161,26 @@ class RelayTests(unittest.TestCase):
             ["codex", "exec", "resume", "-C", "/tmp/demo-worktree", "session-1", "hello"],
         )
 
+    def test_extract_target_supports_slash_task_prefix(self):
+        self.assertEqual(relay.extract_target("/task @CODEX Verify the plan"), "CODEX")
+        self.assertEqual(relay.task_request_from_message("/task @CODEX Verify the plan"), "Verify the plan")
+
+    def test_build_agent_prompt_uses_task_template_for_explicit_tasks(self):
+        prompt = relay.build_agent_prompt(
+            agent_name="CODEX",
+            context="recent transcript",
+            work_dir="/tmp/demo",
+            task={
+                "id": 8,
+                "title": "Verify the Plan thoroughly",
+                "request": "Verify ingress, persistence, and view wiring.",
+            },
+        )
+
+        self.assertIn("This is an explicit task assignment, not casual chat.", prompt)
+        self.assertIn("Task #8: Verify the Plan thoroughly", prompt)
+        self.assertIn("Task request:\nVerify ingress, persistence, and view wiring.", prompt)
+
     def test_effective_effort_id_uses_model_safe_codex_default(self):
         agent = {
             "name": "CODEX",
@@ -311,7 +331,6 @@ class RelayTests(unittest.TestCase):
                 self.assertEqual(events[2]["session_id"], "session-1")
 
         asyncio.run(run_case())
-
 
 if __name__ == "__main__":
     unittest.main()

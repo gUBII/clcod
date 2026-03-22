@@ -66,7 +66,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "mirror_mode": "resume",
             "preseed_session_id": False,
             "selected_effort": "medium",
-            "timeout": 60,
+            "timeout": 180,
         },
         {
             "name": "GEMINI",
@@ -74,7 +74,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "cmd": "gemini",
             "args": ["-p"],
             "model_arg": ["--model", "{value}"],
-            "model_options": ["default", "gemini-2.5-pro", "gemini-2.5-flash"],
+            "model_options": ["default", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
             "mirror_mode": "log",
             "preseed_session_id": False,
             "timeout": 60,
@@ -127,6 +127,23 @@ PROMPT_TEMPLATE = (
     "Below is the recent conversation log. "
     "Reply naturally as yourself in 2-5 sentences. Do not prefix your reply "
     "with your name or a [TAG].\n\n{context}"
+)
+
+TASK_PROMPT_TEMPLATE = (
+    "You are {name}, one of three AI agents (Claude, Codex, Gemini) sharing a "
+    "real-time terminal chat room. Your working directory is {work_dir}. "
+    "This is an explicit task assignment, not casual chat. Use the repository "
+    "and your available tools to do the task now. Read files, inspect code "
+    "paths, run commands, and make changes if the task asks for changes. Do "
+    "not say you are still working, standing by, or verifying unless you "
+    "actually did that work in this invocation and can name what you checked. "
+    "If the task is review or verification, inspect the code directly and cite "
+    "specific files or commands. If blocked, name the exact blocker.\n\n"
+    "Task #{task_id}: {task_title}\n"
+    "Task request:\n{task_request}\n\n"
+    "Recent conversation log:\n{context}\n\n"
+    "Reply with a concise execution report covering what you actually did, the "
+    "result, and any blocker or next step."
 )
 
 SESSION_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -567,11 +584,49 @@ def normalize_argv(value: Any, agent_name: str, field_name: str) -> list[str]:
 def extract_target(body: str) -> str | None:
     """Extract explicit @MENTION target from message body.
     Returns the target name (e.g., 'CLAUDE') or None if no target found."""
-    stripped = body.strip()
+    stripped = strip_task_prefix(body)
     match = re.match(r"^@(\w+)\b", stripped)
     if match:
         return match.group(1).upper()
     return None
+
+
+def strip_task_prefix(body: str) -> str:
+    stripped = body.strip()
+    return re.sub(r"^/task\b", "", stripped, count=1, flags=re.IGNORECASE).strip()
+
+
+def strip_target_prefix(body: str) -> str:
+    stripped = body.strip()
+    return re.sub(r"^@(\w+)\b[\s:,-]*", "", stripped, count=1, flags=re.IGNORECASE).strip()
+
+
+def task_request_from_message(body: str) -> str:
+    return strip_target_prefix(strip_task_prefix(body))
+
+
+def build_agent_prompt(
+    *,
+    agent_name: str,
+    context: str,
+    work_dir: str,
+    task: dict[str, Any] | None = None,
+) -> str:
+    if task:
+        task_request = str(task.get("request") or task.get("source_message") or task.get("title") or "").strip()
+        return TASK_PROMPT_TEMPLATE.format(
+            name=agent_name.capitalize(),
+            context=context,
+            work_dir=work_dir,
+            task_id=task.get("id", "task"),
+            task_title=task.get("title", "Untitled task"),
+            task_request=task_request or "No task request provided.",
+        )
+    return PROMPT_TEMPLATE.format(
+        name=agent_name.capitalize(),
+        context=context,
+        work_dir=work_dir,
+    )
 
 
 def last_speaker(text: str) -> str:
@@ -1314,6 +1369,7 @@ async def run_relay(
             # ── Explicit target parsing: @MENTION routing ──
             explicit_target = extract_target(body)
             valid_agent_names = {agent["name"] for agent in enabled_agents}
+            dispatch_config = config.get("dispatcher", {})
 
             # Skip routing when sleeping — message is already saved to transcript
             if is_sleeping and is_sleeping():
@@ -1354,7 +1410,6 @@ async def run_relay(
                     requested_target = explicit_target
             else:
                 # No explicit target: use dispatcher
-                dispatch_config = config.get("dispatcher", {})
                 if dispatch_config.get("enabled"):
                     try:
                         dispatcher_decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
@@ -1421,19 +1476,18 @@ async def run_relay(
                     relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
             # ── Create task for tracking (only on explicit /task command) ──
+            task: dict[str, Any] | None = None
+            task_prompt: dict[str, Any] | None = None
             if body.strip().lower().startswith("/task"):
-                task_body = body.strip()[len("/task"):].strip()
+                task_body = task_request_from_message(body)
                 task_title = task_body[:120] if len(task_body) <= 120 else task_body[:117] + "..."
                 if not task_title:
                     task_title = "Untitled task"
                 task_type = "general"
                 task_priority = "normal"
-                if dispatch_config.get("enabled"):
-                    try:
-                        task_type = decision.get("task_type", "general")  # type: ignore[possibly-undefined]
-                        task_priority = decision.get("priority", "normal")  # type: ignore[possibly-undefined]
-                    except NameError:
-                        pass
+                if dispatcher_decision:
+                    task_type = dispatcher_decision.get("task_type", "general")
+                    task_priority = dispatcher_decision.get("priority", "normal")
                 task = create_task(
                     tasks_path,
                     title=task_title,
@@ -1447,12 +1501,19 @@ async def run_relay(
                     "type": "task_created",
                     "task": task,
                 })
+                task_prompt = {
+                    "id": task["id"],
+                    "title": task_title,
+                    "request": task_body or body.strip(),
+                    "source_message": body,
+                }
 
             prompts = {
-                agent["name"]: PROMPT_TEMPLATE.format(
-                    name=agent["name"].capitalize(),
+                agent["name"]: build_agent_prompt(
+                    agent_name=agent["name"],
                     context=context,
                     work_dir=work_dir,
+                    task=task_prompt,
                 )
                 for agent in dispatch_targets
             }
@@ -1462,6 +1523,14 @@ async def run_relay(
                 return
 
             try:
+                if task:
+                    updated_task = update_task(tasks_path, task["id"], "in_progress")
+                    if updated_task:
+                        task = updated_task
+                        emit_event(event_callback, {
+                            "type": "task_updated",
+                            "task": updated_task,
+                        })
                 await asyncio.gather(
                     *[
                         route_to(
@@ -1504,14 +1573,24 @@ async def run_relay(
                 # Group pending tasks by type, dispatch as a single batch message
                 batch_body_parts = []
                 batch_ids = []
+                updated_tasks = []
                 for task in pending[:5]:  # process up to 5 at a time
                     batch_body_parts.append(f"- [{task['type']}] {task['title']}")
                     batch_ids.append(task["id"])
-                    task["status"] = "assigned"
+                    task["status"] = "in_progress"
                     task["assigned_to"] = [a["name"] for a in enabled_agents]
+                    updated_tasks.append(dict(task))
                 batch_body = "Batch tasks:\n" + "\n".join(batch_body_parts)
                 save_tasks(tasks_path, store)
                 relay_log(f"batch processing {len(batch_ids)} pending tasks: {batch_ids}")
+                emit_event(
+                    event_callback,
+                    {
+                        "type": "tasks_updated",
+                        "tasks": updated_tasks,
+                        "new_status": "in_progress",
+                    },
+                )
 
                 fresh = read_text(log_path)
                 context = fresh[-context_len:]
@@ -1526,10 +1605,15 @@ async def run_relay(
                     agent["work_dir"] = work_dir
 
                 prompts = {
-                    agent["name"]: PROMPT_TEMPLATE.format(
-                        name=agent["name"].capitalize(),
+                    agent["name"]: build_agent_prompt(
+                        agent_name=agent["name"],
                         context=context,
                         work_dir=work_dir,
+                        task={
+                            "id": "batch",
+                            "title": f"Batch tasks ({len(batch_ids)})",
+                            "request": batch_body,
+                        },
                     )
                     for agent in enabled_agents
                 }
