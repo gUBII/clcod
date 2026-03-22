@@ -4,9 +4,9 @@
 
 ## Dashboard Snapshot
 
-The current local dashboard is shown below. This snapshot reflects the engine-room control deck, live transcript panel, and the in-app room composer introduced in the latest update.
+The current local dashboard is shown below. This is the live browser view of the operator surface, including the engine control strip, per-agent model and effort controls, the task board, transcript stream, route bus, and room composer.
 
-![Dashboard snapshot](docs/dashboard-snapshot.svg)
+![Current local dashboard snapshot](docs/currentsnapshot.png)
 
 The current architecture is intentionally split into two surfaces:
 
