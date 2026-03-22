@@ -1457,8 +1457,20 @@ button {
     grid-template-columns: 1fr;
   }
 
+  /* Engine strip: cap height and scroll so it never crushes transcript/chat */
+  .engine-strip {
+    max-height: clamp(160px, 32vh, 240px);
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+
   .engine-strip__grid {
     grid-template-columns: 1fr;
+  }
+
+  /* Task board can yield space to transcript on constrained heights */
+  .panel--tasks {
+    flex-shrink: 1;
   }
 
   .panel--tasks .task-board {
