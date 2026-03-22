@@ -9,12 +9,12 @@
 ### 1. `assigned_to` Field on Tasks
 - When a task is created via `@agent` mention, **only that agent** appears in `assigned_to` and the active pane — not the whole room.
 - Treat this as **system behavior**, not a UI preference.
-- Owner: Claude (fanout orchestrator) + Codex (event spine integration)
+- Owner: Core (fanout orchestrator) + Codex (event spine integration)
 
 ### 2. Agent Sleep / Wake System
 - Sleeping agents enter a low-resource idle state with a lightweight sentry listener.
 - Sentry listens for wake-up signals or high-priority nudges only.
-- Owner: Claude (dispatcher / lifecycle)
+- Owner: Core (dispatcher / lifecycle)
 
 ---
 
@@ -22,13 +22,13 @@
 
 | Task                              | Owner | Status      |
 |-----------------------------------|-------|-------------|
-| Transcript progress bar           | Claude | In progress |
-| Task fanout orchestrator          | Claude | In progress |
-| Dispatcher health telemetry       | Claude | In progress |
-| Routing visualization spine       | Codex  | In progress |
-| Explicit realtime events          | Codex  | In progress |
-| Synchronized tach timing          | Codex  | In progress |
-| Standby / assist as needed        | Gemini | Active      |
+| Transcript progress bar           | Core  | In progress |
+| Task fanout orchestrator          | Core  | In progress |
+| Dispatcher health telemetry       | Core  | In progress |
+| Routing visualization spine       | Core  | In progress |
+| Explicit realtime events          | Core  | In progress |
+| Synchronized tach timing          | Core  | In progress |
+| Standby / assist as needed        | Core  | Active      |
 
 ---
 

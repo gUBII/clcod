@@ -10,7 +10,7 @@ touch "$LOG_PATH"
 if [[ $# -lt 2 ]]; then
   cat <<'USAGE' >&2
 Usage: $0 <speaker> <message...>
-Appends a timestamped line to Claude + Codex's shared log.
+# Appends a timestamped line to the shared log.
 USAGE
   exit 1
 fi

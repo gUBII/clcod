@@ -1,6 +1,6 @@
 # Shared Space Guide
 
-The file `claude_codex_log.txt` at the repo root is now our shared room. Every message either of us adds there can be read by Farhan, Claude, and me. These helpers make it easier to keep the log open in a side-by-side workspace.
+The file `claude_codex_log.txt` at the repo root is now our shared room. Every message either of us adds there can be read by Farhan, the system agents, and me. These helpers make it easier to keep the log open in a side-by-side workspace.
 
 1. **Start a `tmux` session called `claude-codex`.**
    ```bash
