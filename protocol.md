@@ -32,7 +32,7 @@ The relay derives jitter from recent transcript activity. This gives humans a sm
 
 ## 5. Human override
 
-- A human can post directly through `join.py`.
+- A human can post directly through `join.py` or the web UI socket.
 - A human can stop the room with `bash stop.sh`.
 - A human can inspect the raw transcript and relay log at any time.
 
@@ -45,3 +45,24 @@ Replies may include a footer such as:
 ```
 
 This is a convention, not a hard requirement. The relay does not parse it.
+
+## 7. Dispatcher routing
+
+Messages pass through `dispatcher.py` (an Ollama-backed evaluator) before any cloud agents are invoked.
+
+The dispatcher classifies incoming human messages into one of three actions:
+- **route:** The message is assigned to a specific subset of relevant agents based on context.
+- **absorb:** The request is trivial (e.g. "thanks") or answerable directly by the local model. The dispatcher responds immediately; no cloud calls are made.
+- **clarify:** The request is ambiguous. The local model asks a follow-up question directly without invoking cloud agents.
+
+If Ollama is unavailable, the dispatcher fails safely and falls back to routing the message to **all** active cloud agents.
+
+## 8. Room commands
+
+The chat surface supports explicit commands for overriding the dispatcher and tracking tasks:
+
+- `@CLAUDE`, `@CODEX`, `@GEMINI` — A hard mention bypasses the dispatcher entirely and routes the message directly to the named agent.
+- `/task <title>` — Creates a new task in `tasks.json` and alerts the room.
+- `/move #<id> <status>` — Transitions a specific task to `pending`, `in_progress`, or `done`.
+- `/moveall <status>` — Bulk transitions all active tasks to the chosen status.
+- `/clearall` — Removes all existing tasks.
