@@ -1596,11 +1596,11 @@ button {
 }
 
 .panel--routes .route-lane__title {
-  font-size: clamp(0.74rem, 0.9vw, 0.82rem);
+  font-size: clamp(0.72rem, 0.9vw, 0.82rem);
 }
 
 .panel--routes .route-lane__detail {
-  font-size: clamp(0.66rem, 0.8vw, 0.72rem);
+  font-size: clamp(0.64rem, 0.8vw, 0.72rem);
 }
 
 .panel--routes .route-lane__flow {
@@ -1611,17 +1611,17 @@ button {
 .panel--routes .route-node {
   min-width: 38px;
   padding: 5px 7px;
-  font-size: 0.6rem;
+  font-size: clamp(0.56rem, 0.7vw, 0.62rem);
 }
 
 .panel--routes .route-pill {
   padding: 4px 7px;
-  font-size: 0.6rem;
+  font-size: clamp(0.56rem, 0.7vw, 0.62rem);
 }
 
 .panel--routes .route-lane__meta {
   margin-top: 8px;
-  font-size: 0.6rem;
+  font-size: clamp(0.56rem, 0.7vw, 0.62rem);
   gap: 4px;
 }
 
