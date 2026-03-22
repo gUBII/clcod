@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import dispatcher as dispatcher_mod
+from event_store import EventStore
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
@@ -94,6 +95,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "agent_logs_dir": ".clcod-runtime/agents",
         "projects_path": ".clcod-runtime/projects.json",
         "tasks_path": ".clcod-runtime/tasks.json",
+        "events_db_path": ".clcod-runtime/events.db",
+        "archives_dir": ".clcod-runtime/archives",
     },
     "locks": {
         "ttl": 90,
@@ -446,6 +449,12 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "tasks_path": resolve_path(
             config_dir, str(workspace.get("tasks_path", ".clcod-runtime/tasks.json"))
         ),
+        "events_db_path": resolve_path(
+            config_dir, str(workspace.get("events_db_path", ".clcod-runtime/events.db"))
+        ),
+        "archives_dir": resolve_path(
+            config_dir, str(workspace.get("archives_dir", ".clcod-runtime/archives"))
+        ),
     }
     variables.update(
         {
@@ -460,6 +469,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "agent_logs_dir": str(normalized_workspace["agent_logs_dir"]),
             "projects_path": str(normalized_workspace["projects_path"]),
             "tasks_path": str(normalized_workspace["tasks_path"]),
+            "events_db_path": str(normalized_workspace["events_db_path"]),
+            "archives_dir": str(normalized_workspace["archives_dir"]),
         }
     )
 
@@ -695,15 +706,24 @@ def release_lock(lock_path: Path) -> None:
         return
 
 
-def append_tagged_entry(log_path: Path, speaker: str, text: str) -> dict:
-    message = {
-        "id": str(uuid.uuid4()),
-        "sender": speaker,
-        "seq": int(time.time() * 1000),
-        "type": "message",
-        "body": text.strip(),
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
+def persist_transcript_message(
+    log_path: Path,
+    speaker: str,
+    text: str,
+    *,
+    event_callback: EventCallback | None = None,
+    event_store: EventStore | None = None,
+    message: dict[str, Any] | None = None,
+    message_type: str = "message",
+) -> dict[str, Any]:
+    message = dict(message or {})
+    message.setdefault("id", str(uuid.uuid4()))
+    message.setdefault("sender", speaker)
+    message.setdefault("seq", int(time.time() * 1000))
+    message.setdefault("type", message_type)
+    message["body"] = str(message.get("body", text)).strip()
+    message.setdefault("ts", utc_now())
+
     entry = json.dumps(message) + "\n"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
@@ -711,12 +731,64 @@ def append_tagged_entry(log_path: Path, speaker: str, text: str) -> dict:
         handle.write(entry)
         handle.flush()
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    emit_event(
+        event_callback,
+        {
+            "type": "transcript",
+            "correlation_id": message["id"],
+            "sender": message["sender"],
+            "last_speaker": message["sender"],
+            "last_updated_at": message["ts"],
+            "char_count": len(message["body"]),
+            "message_type": message.get("type", message_type),
+            "message": message,
+        },
+        event_store=event_store,
+    )
     return message
 
 
-async def append_reply(write_lock: asyncio.Lock, log_path: Path, speaker: str, text: str) -> dict:
+def append_tagged_entry(
+    log_path: Path,
+    speaker: str,
+    text: str,
+    *,
+    event_callback: EventCallback | None = None,
+    event_store: EventStore | None = None,
+    message: dict[str, Any] | None = None,
+    message_type: str = "message",
+) -> dict[str, Any]:
+    return persist_transcript_message(
+        log_path,
+        speaker,
+        text,
+        event_callback=event_callback,
+        event_store=event_store,
+        message=message,
+        message_type=message_type,
+    )
+
+
+async def append_reply(
+    write_lock: asyncio.Lock,
+    log_path: Path,
+    speaker: str,
+    text: str,
+    *,
+    event_callback: EventCallback | None = None,
+    event_store: EventStore | None = None,
+    message_type: str = "message",
+) -> dict[str, Any]:
     async with write_lock:
-        return append_tagged_entry(log_path, speaker, text)
+        return persist_transcript_message(
+            log_path,
+            speaker,
+            text,
+            event_callback=event_callback,
+            event_store=event_store,
+            message_type=message_type,
+        )
 
 
 def parse_codex(raw: str) -> str:
@@ -913,10 +985,19 @@ def save_sessions(path: Path, sessions: dict[str, str]) -> None:
     write_json(path, sessions)
 
 
-def emit_event(event_callback: EventCallback | None, event: dict[str, Any]) -> None:
-    if event_callback is None:
-        return
-    event_callback(event)
+def emit_event(
+    event_callback: EventCallback | None,
+    event: dict[str, Any],
+    *,
+    event_store: EventStore | None = None,
+) -> dict[str, Any]:
+    payload = dict(event)
+    if event_store is not None:
+        stored = event_store.append_event(payload)
+        payload["event_id"] = stored["id"]
+    if event_callback is not None:
+        event_callback(payload)
+    return payload
 
 
 def utc_now() -> str:
@@ -1200,12 +1281,16 @@ async def route_to(
     session_lock: asyncio.Lock,
     event_callback: EventCallback | None = None,
     route: dict[str, Any] | None = None,
+    event_store: EventStore | None = None,
 ) -> None:
+    def publish(event: dict[str, Any]) -> dict[str, Any]:
+        return emit_event(event_callback, event, event_store=event_store)
+
     name = agent["name"]
     route_started_at = route.get("started_at", utc_now()) if route else None
+    msg: dict[str, Any] | None = None
     if route:
-        emit_event(
-            event_callback,
+        publish(
             {
                 "type": "route_state",
                 **route,
@@ -1219,31 +1304,26 @@ async def route_to(
                 "reply_chars": 0,
             },
         )
-    emit_event(
-        event_callback,
+    publish(
         {"type": "agent_state", "agent": name, "state": "warming", "last_error": None},
     )
     try:
         result = await call_agent(agent, prompt, sessions_path, session_lock)
         if result.reply:
-            msg = await append_reply(write_lock, log_path, name, result.reply)
-            relay_log(f"{name} replied ({len(result.reply)} chars)")
-            emit_event(
-                event_callback,
-                {
-                    "type": "transcript",
-                    "last_speaker": name,
-                    "last_updated_at": msg["ts"],
-                    "char_count": len(result.reply),
-                    "message": msg,
-                },
+            msg = await append_reply(
+                write_lock,
+                log_path,
+                name,
+                result.reply,
+                event_callback=event_callback,
+                event_store=event_store,
             )
+            relay_log(f"{name} replied ({len(result.reply)} chars)")
         else:
             relay_log(f"{name}: empty reply")
         if route:
             completed_at = msg["ts"] if result.reply else utc_now()
-            emit_event(
-                event_callback,
+            publish(
                 {
                     "type": "route_state",
                     **route,
@@ -1258,8 +1338,7 @@ async def route_to(
                     "session_id": result.session_id,
                 },
             )
-        emit_event(
-            event_callback,
+        publish(
             {
                 "type": "agent_state",
                 "agent": name,
@@ -1274,8 +1353,7 @@ async def route_to(
         relay_log(f"{name}: command not found: {agent['cmd']}")
         if route:
             failed_at = utc_now()
-            emit_event(
-                event_callback,
+            publish(
                 {
                     "type": "route_state",
                     **route,
@@ -1289,8 +1367,7 @@ async def route_to(
                     "reply_chars": 0,
                 },
             )
-        emit_event(
-            event_callback,
+        publish(
             {
                 "type": "agent_state",
                 "agent": name,
@@ -1302,8 +1379,7 @@ async def route_to(
         relay_log(f"{name}: timed out after {agent['timeout']}s")
         if route:
             failed_at = utc_now()
-            emit_event(
-                event_callback,
+            publish(
                 {
                     "type": "route_state",
                     **route,
@@ -1317,8 +1393,7 @@ async def route_to(
                     "reply_chars": 0,
                 },
             )
-        emit_event(
-            event_callback,
+        publish(
             {
                 "type": "agent_state",
                 "agent": name,
@@ -1330,8 +1405,7 @@ async def route_to(
         relay_log(f"{name}: error: {exc}")
         if route:
             failed_at = utc_now()
-            emit_event(
-                event_callback,
+            publish(
                 {
                     "type": "route_state",
                     **route,
@@ -1345,8 +1419,7 @@ async def route_to(
                     "reply_chars": 0,
                 },
             )
-        emit_event(
-            event_callback,
+        publish(
             {
                 "type": "agent_state",
                 "agent": name,
@@ -1361,6 +1434,7 @@ async def run_relay(
     event_callback: EventCallback | None = None,
     stop_event: asyncio.Event | None = None,
     is_sleeping: Callable[[], bool] | None = None,
+    event_store: EventStore | None = None,
 ) -> int:
     workspace = config["workspace"]
     log_path: Path = workspace["log_path"]
@@ -1375,9 +1449,17 @@ async def run_relay(
     managed_names = {agent["name"] for agent in enabled_agents}
     write_lock = asyncio.Lock()
     session_lock = asyncio.Lock()
+    owns_event_store = False
 
     if not enabled_agents:
         raise ValueError("no enabled agents configured")
+
+    if event_store is None:
+        event_store = EventStore(workspace["events_db_path"])
+        owns_event_store = True
+
+    def publish(event: dict[str, Any]) -> dict[str, Any]:
+        return emit_event(event_callback, event, event_store=event_store)
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     sessions_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1391,10 +1473,9 @@ async def run_relay(
         f"{poll_sec}s context_len={context_len} lock_ttl={lock_ttl}s "
         f"timeouts={[agent['timeout'] for agent in enabled_agents]}"
     )
-    emit_event(event_callback, {"type": "relay_state", "state": "running"})
+    publish({"type": "relay_state", "state": "running"})
     for agent in enabled_agents:
-        emit_event(
-            event_callback,
+        publish(
             {
                 "type": "agent_state",
                 "agent": agent["name"],
@@ -1404,8 +1485,6 @@ async def run_relay(
         )
 
     socket_path: Path = workspace["socket_path"]
-    
-    # ... setup code above remains ...
     internal_stop_event = stop_event or asyncio.Event()
     if stop_event is None:
         loop = asyncio.get_running_loop()
@@ -1427,37 +1506,28 @@ async def run_relay(
             if not body:
                 return
 
-            append_tagged_entry(log_path, sender, body)
-
-            emit_event(
-                event_callback,
-                {
-                    "type": "transcript",
-                    "last_speaker": sender,
-                    "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "char_count": len(body),
-                    "message": payload,
-                },
+            message_type = str(payload.get("type") or "message")
+            payload = persist_transcript_message(
+                log_path,
+                sender,
+                body,
+                event_callback=event_callback,
+                event_store=event_store,
+                message=payload,
+                message_type=message_type,
             )
 
-            # System messages (compact/wake/sync) are saved to transcript but
-            # must NOT create tasks or dispatch to agents (BUG-2, BUG-9).
-            msg_type = payload.get("type", "message")
-            if msg_type != "message":
-                relay_log(f"[{sender}] system message ({msg_type}) saved — skipping dispatch")
+            if message_type != "message":
+                relay_log(f"[{sender}] system message ({message_type}) saved — skipping dispatch")
                 return
 
-            # ── /move and /moveall: task status mutations ──
             stripped = body.strip()
             lower = stripped.lower()
 
             if lower == "/clearall":
                 count = clear_all_tasks(tasks_path)
                 relay_log(f"/clearall: {count} task(s) removed, board reset")
-                emit_event(event_callback, {
-                    "type": "tasks_cleared",
-                    "tasks": [],
-                })
+                publish({"type": "tasks_cleared", "tasks": []})
                 return
 
             if lower.startswith("/moveall "):
@@ -1467,11 +1537,13 @@ async def run_relay(
                 else:
                     updated = update_all_tasks(tasks_path, target_status)
                     relay_log(f"/moveall -> {target_status}: {len(updated)} task(s) updated")
-                    emit_event(event_callback, {
-                        "type": "tasks_updated",
-                        "tasks": updated,
-                        "new_status": target_status,
-                    })
+                    publish(
+                        {
+                            "type": "tasks_updated",
+                            "tasks": updated,
+                            "new_status": target_status,
+                        }
+                    )
                 return
 
             if lower.startswith("/move "):
@@ -1489,46 +1561,35 @@ async def run_relay(
                     task = update_task(tasks_path, move_id, target_status)
                     if task:
                         relay_log(f"/move #{move_id} -> {target_status}")
-                        emit_event(event_callback, {
-                            "type": "task_updated",
-                            "task": task,
-                        })
+                        publish({"type": "task_updated", "task": task})
                     else:
                         relay_log(f"/move: task #{move_id} not found")
                 return
 
-            # ── Explicit target parsing: @MENTION routing ──
             explicit_target = extract_target(body)
             valid_agent_names = {agent["name"] for agent in enabled_agents}
             dispatch_config = config.get("dispatcher", {})
 
-            # Skip routing when sleeping — message is already saved to transcript
             if is_sleeping and is_sleeping():
                 relay_log(f"sleeping — message from {sender} saved but not routed")
                 return
 
-            # Resolve active project work_dir
             projects = load_projects(projects_path)
             active_id = projects.get("active")
             active_project = projects.get("projects", {}).get(active_id or "") if active_id else None
             work_dir = active_project["path"] if active_project else str(SCRIPT_DIR)
 
-            # Inject work_dir into each agent for this dispatch
             for agent in enabled_agents:
                 agent["work_dir"] = work_dir
 
-            # Read back context to ensure we get the full log state
             fresh = read_text(log_path)
             context = fresh[-context_len:]
 
-            # ── Determine target agents ──
-            # Priority: explicit @mention > dispatcher > all agents (broadcast)
-            dispatch_targets = enabled_agents  # default: all agents
+            dispatch_targets = enabled_agents
             requested_target = None
             dispatcher_decision = None
 
             if explicit_target and explicit_target.upper() == "DISPATCHER":
-                # Direct conversation with the dispatcher router model
                 stripped_body = strip_target_prefix(body)
                 relay_log(f"[{sender}] @DISPATCHER direct query: {stripped_body[:80]}")
                 if dispatch_config.get("enabled"):
@@ -1542,40 +1603,38 @@ async def run_relay(
                             f"I would route this to: {', '.join(targets)}. "
                             f"Task type: {task_type}. Priority: {priority}."
                         )
-                        msg = await append_reply(write_lock, log_path, "DISPATCHER", reply_text)
-                        emit_event(event_callback, {
-                            "type": "transcript",
-                            "last_speaker": "DISPATCHER",
-                            "last_updated_at": msg["ts"],
-                            "char_count": len(reply_text),
-                        })
+                        await append_reply(
+                            write_lock,
+                            log_path,
+                            "DISPATCHER",
+                            reply_text,
+                            event_callback=event_callback,
+                            event_store=event_store,
+                        )
                         relay_log(f"dispatcher direct reply: {reply_text[:80]}")
                     except Exception as exc:
                         relay_log(f"dispatcher direct query failed: {exc}")
                 else:
-                    msg = await append_reply(write_lock, log_path, "DISPATCHER", "Dispatcher is disabled in config.")
-                    emit_event(event_callback, {
-                        "type": "transcript",
-                        "last_speaker": "DISPATCHER",
-                        "last_updated_at": msg["ts"],
-                        "char_count": 0,
-                    })
+                    await append_reply(
+                        write_lock,
+                        log_path,
+                        "DISPATCHER",
+                        "Dispatcher is disabled in config.",
+                        event_callback=event_callback,
+                        event_store=event_store,
+                    )
                 return
 
             if explicit_target:
-                # Explicit @mention: only route to that agent if it exists
                 if explicit_target in valid_agent_names:
                     dispatch_targets = [a for a in enabled_agents if a["name"] == explicit_target]
                     requested_target = explicit_target
                     relay_log(f"[{sender}] @{explicit_target} -> {explicit_target}")
                 else:
-                    # Invalid target mentioned
                     relay_log(f"[{sender}] mentioned unknown agent @{explicit_target} (valid: {', '.join(sorted(valid_agent_names))})")
-                    # Still route to all since target was invalid/unrecognized
                     dispatch_targets = enabled_agents
                     requested_target = explicit_target
             else:
-                # No explicit target: use dispatcher
                 if dispatch_config.get("enabled"):
                     try:
                         dispatcher_decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
@@ -1590,42 +1649,33 @@ async def run_relay(
                         if body.strip().lower().startswith("/task"):
                             dispatcher_event["task_type"] = dispatcher_decision.get("task_type")
                             dispatcher_event["priority"] = dispatcher_decision.get("priority")
-                        emit_event(event_callback, dispatcher_event)
+                        publish(dispatcher_event)
 
-                        # /task commands must always reach task-creation and agent
-                        # dispatch — never let the dispatcher absorb or clarify them.
                         is_slash_task = lower.startswith("/task")
 
                         if action == "absorb" and dispatcher_decision.get("reply"):
-                            # Handle locally — no cloud call needed
-                            msg = await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
-                            relay_log(f"dispatcher absorbed: {dispatcher_decision['reply'][:80]}")
-                            emit_event(
-                                event_callback,
-                                {
-                                    "type": "transcript",
-                                    "last_speaker": "DISPATCHER",
-                                    "last_updated_at": msg["ts"],
-                                    "char_count": len(dispatcher_decision["reply"]),
-                                    "message": msg,
-                                },
+                            await append_reply(
+                                write_lock,
+                                log_path,
+                                "DISPATCHER",
+                                dispatcher_decision["reply"],
+                                event_callback=event_callback,
+                                event_store=event_store,
                             )
+                            relay_log(f"dispatcher absorbed: {dispatcher_decision['reply'][:80]}")
                             if not is_slash_task:
                                 return
 
                         if action == "clarify" and dispatcher_decision.get("reply"):
-                            msg = await append_reply(write_lock, log_path, "DISPATCHER", dispatcher_decision["reply"])
-                            relay_log(f"dispatcher clarifying: {dispatcher_decision['reply'][:80]}")
-                            emit_event(
-                                event_callback,
-                                {
-                                    "type": "transcript",
-                                    "last_speaker": "DISPATCHER",
-                                    "last_updated_at": msg["ts"],
-                                    "char_count": len(dispatcher_decision["reply"]),
-                                    "message": msg,
-                                },
+                            await append_reply(
+                                write_lock,
+                                log_path,
+                                "DISPATCHER",
+                                dispatcher_decision["reply"],
+                                event_callback=event_callback,
+                                event_store=event_store,
                             )
+                            relay_log(f"dispatcher clarifying: {dispatcher_decision['reply'][:80]}")
                             if not is_slash_task:
                                 return
 
@@ -1641,7 +1691,6 @@ async def run_relay(
                 else:
                     relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
-            # ── Create task for tracking (only on explicit /task command) ──
             task: dict[str, Any] | None = None
             task_prompt: dict[str, Any] | None = None
             if body.strip().lower().startswith("/task"):
@@ -1663,10 +1712,7 @@ async def run_relay(
                     source_message=body,
                 )
                 relay_log(f"task #{task['id']} created: {task['title'][:60]}")
-                emit_event(event_callback, {
-                    "type": "task_created",
-                    "task": task,
-                })
+                publish({"type": "task_created", "task": task})
                 task_prompt = {
                     "id": task["id"],
                     "title": task_title,
@@ -1704,7 +1750,17 @@ async def run_relay(
             }
 
             if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
-                relay_log("speaker.lock is active; skipping this dispatch cycle")
+                reason = "speaker.lock is active; skipping this dispatch cycle"
+                relay_log(reason)
+                publish(
+                    {
+                        "type": "dispatch_skipped",
+                        "reason": reason,
+                        "targets": [agent["name"] for agent in dispatch_targets],
+                        "message_id": payload.get("id"),
+                        "sender": sender,
+                    }
+                )
                 return
 
             try:
@@ -1712,10 +1768,7 @@ async def run_relay(
                     updated_task = update_task(tasks_path, task["id"], "in_progress")
                     if updated_task:
                         task = updated_task
-                        emit_event(event_callback, {
-                            "type": "task_updated",
-                            "task": updated_task,
-                        })
+                        publish({"type": "task_updated", "task": updated_task})
                 await asyncio.gather(
                     *[
                         route_to(
@@ -1727,6 +1780,7 @@ async def run_relay(
                             session_lock,
                             event_callback,
                             route_payloads[agent["name"]],
+                            event_store=event_store,
                         )
                         for agent in dispatch_targets
                     ]
@@ -1756,11 +1810,10 @@ async def run_relay(
                 pending = [t for t in store["tasks"] if t["status"] == "pending"]
                 if not pending:
                     continue
-                # Group pending tasks by type, dispatch as a single batch message
                 batch_body_parts = []
                 batch_ids = []
                 updated_tasks = []
-                for task in pending[:5]:  # process up to 5 at a time
+                for task in pending[:5]:
                     batch_body_parts.append(f"- [{task['type']}] {task['title']}")
                     batch_ids.append(task["id"])
                     task["status"] = "in_progress"
@@ -1769,8 +1822,7 @@ async def run_relay(
                 batch_body = "Batch tasks:\n" + "\n".join(batch_body_parts)
                 save_tasks(tasks_path, store)
                 relay_log(f"batch processing {len(batch_ids)} pending tasks: {batch_ids}")
-                emit_event(
-                    event_callback,
+                publish(
                     {
                         "type": "tasks_updated",
                         "tasks": updated_tasks,
@@ -1818,17 +1870,14 @@ async def run_relay(
 
                 if acquire_lock(lock_path, f"relay-batch:{os.getpid()}", lock_ttl):
                     try:
-                        # Prepend batch body to context via append
-                        batch_msg = await append_reply(write_lock, log_path, "SYSTEM", batch_body)
-                        emit_event(
-                            event_callback,
-                            {
-                                "type": "transcript",
-                                "last_speaker": "SYSTEM",
-                                "last_updated_at": batch_msg["ts"],
-                                "char_count": len(batch_body),
-                                "message": batch_msg,
-                            },
+                        await append_reply(
+                            write_lock,
+                            log_path,
+                            "SYSTEM",
+                            batch_body,
+                            event_callback=event_callback,
+                            event_store=event_store,
+                            message_type="batch",
                         )
                         await asyncio.gather(
                             *[
@@ -1841,12 +1890,23 @@ async def run_relay(
                                     session_lock,
                                     event_callback,
                                     route_payloads[agent["name"]],
+                                    event_store=event_store,
                                 )
                                 for agent in enabled_agents
                             ]
                         )
                     finally:
                         release_lock(lock_path)
+                else:
+                    publish(
+                        {
+                            "type": "dispatch_skipped",
+                            "reason": "speaker.lock is active; skipping this batch dispatch cycle",
+                            "targets": [agent["name"] for agent in enabled_agents],
+                            "batch_ids": batch_ids,
+                            "sender": "SYSTEM",
+                        }
+                    )
             except Exception as exc:
                 relay_log(f"batch processing error: {exc}")
 
@@ -1872,7 +1932,9 @@ async def run_relay(
             socket_path.unlink()
 
     relay_log("stopped")
-    emit_event(event_callback, {"type": "relay_state", "state": "stopped"})
+    publish({"type": "relay_state", "state": "stopped"})
+    if owns_event_store and event_store is not None:
+        event_store.close()
     return 0
 
 

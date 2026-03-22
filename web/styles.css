@@ -384,10 +384,34 @@ button {
   font-size: 0.78rem;
 }
 
-.workspace__tachs {
+.workspace__handler {
   display: flex;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
   align-items: center;
+}
+
+.workspace-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.05);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.workspace-pill__label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.58rem;
+}
+
+.workspace-pill__value {
+  color: var(--text);
 }
 
 /* ── Engine Control Strip ─────────────────────────────── */

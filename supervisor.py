@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import relay
 import dispatcher as dispatcher_mod
+from event_store import EventStore, import_transcript_to_event_store
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEB_DIR = SCRIPT_DIR / "web"
@@ -109,6 +110,17 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
             "name": None,
             "path": str(SCRIPT_DIR),
         },
+        "workspace": {
+            "repo_path": str(SCRIPT_DIR),
+            "branch": None,
+            "dirty": False,
+            "dirty_files": 0,
+            "sync_state": "idle",
+            "last_sync_at": None,
+            "compact_state": "idle",
+            "last_compact_at": None,
+            "last_archive_path": None,
+        },
         "dispatcher": {
             "state": "disabled",
             "router_model": None,
@@ -184,6 +196,21 @@ def parse_transcript_entries(text: str, limit: int) -> list[dict[str, str]]:
             continue
     flush_tagged()
     return entries[-limit:]
+
+
+def fallback_compact_summary(text: str) -> str:
+    entries = parse_transcript_entries(text, 8)
+    if not entries:
+        return "Conversation compacted. No transcript content was available."
+    fragments: list[str] = []
+    for entry in entries[-6:]:
+        speaker = str(entry.get("speaker") or "UNKNOWN")
+        body = relay.truncate_text(str(entry.get("text") or ""), 72)
+        fragments.append(f"{speaker}: {body}")
+    return relay.truncate_text(
+        "Conversation compacted. Recent context: " + " | ".join(fragments),
+        700,
+    )
 
 
 def build_log_mirror_command(agent: dict[str, Any]) -> str:
@@ -315,6 +342,7 @@ class RuntimeSupervisor:
         self.session = config["tmux"]["session"]
         self.workspace = config["workspace"]
         self.settings_lock = threading.Lock()
+        self.event_store = EventStore(config["workspace"]["events_db_path"])
         self.apply_saved_preferences()
         self.state = StateStore(config)
         self._sleeping = False
@@ -355,13 +383,13 @@ class RuntimeSupervisor:
             except ValueError:
                 pass
 
-    def sse_broadcast(self, event_type: str, data: dict[str, Any]) -> None:
-        payload = json.dumps({"type": event_type, **data})
+    def sse_broadcast(self, event_type: str, data: dict[str, Any], event_id: int | None = None) -> None:
+        payload = {"type": event_type, **data}
         with self._sse_lock:
             dead: list[queue.Queue] = []
             for q in self._sse_clients:
                 try:
-                    q.put_nowait(payload)
+                    q.put_nowait({"event_id": event_id, "payload": payload})
                 except queue.Full:
                     dead.append(q)
             for q in dead:
@@ -403,6 +431,74 @@ class RuntimeSupervisor:
     def password(self) -> str:
         env_name = self.config["ui"]["password_env"]
         return os.environ.get(env_name) or self.config["ui"]["password"]
+
+    def current_repo_path(self) -> Path:
+        project_path = self.state.snapshot().get("project", {}).get("path")
+        if project_path:
+            return Path(project_path)
+        return SCRIPT_DIR
+
+    def refresh_workspace_state(self) -> None:
+        repo_path = self.current_repo_path()
+        branch = None
+        dirty = False
+        dirty_files = 0
+        try:
+            branch_proc = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(repo_path),
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            if branch_proc.returncode == 0:
+                branch = branch_proc.stdout.strip() or None
+            status_proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(repo_path),
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            if status_proc.returncode == 0:
+                dirty_files = len([line for line in status_proc.stdout.splitlines() if line.strip()])
+                dirty = dirty_files > 0
+        except Exception:
+            branch = None
+            dirty = False
+            dirty_files = 0
+        self.state.patch(
+            "workspace",
+            {
+                "repo_path": str(repo_path),
+                "branch": branch,
+                "dirty": dirty,
+                "dirty_files": dirty_files,
+            },
+        )
+
+    def emit_local_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(event)
+        stored = self.event_store.append_event(payload)
+        payload["event_id"] = stored["id"]
+        self.handle_relay_event(payload)
+        return payload
+
+    def persist_system_message(
+        self,
+        text: str,
+        *,
+        sender: str = "SYSTEM",
+        message_type: str = "system",
+    ) -> dict[str, Any]:
+        return relay.persist_transcript_message(
+            self.workspace["log_path"],
+            sender,
+            text,
+            event_callback=self.handle_relay_event,
+            event_store=self.event_store,
+            message_type=message_type,
+        )
 
     def preferences_payload(self) -> dict[str, Any]:
         data = relay.read_json(self.workspace["preferences_path"], {"agents": {}})
@@ -527,9 +623,9 @@ class RuntimeSupervisor:
         self.mirror_keys.clear()
         self.sync_agent_mirrors(force=True)
 
-        # Notify transcript
         lock_body = f"[PROJECT] Locked to: {target_name} ({project_path})"
-        relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", lock_body)
+        self.persist_system_message(lock_body, message_type="project")
+        self.refresh_workspace_state()
         return projects
 
     def unlock_project(self) -> dict[str, Any]:
@@ -543,10 +639,11 @@ class RuntimeSupervisor:
         self.mirror_keys.clear()
         self.sync_agent_mirrors(force=True)
 
-        relay.append_tagged_entry(
-            self.workspace["log_path"], "SYSTEM",
+        self.persist_system_message(
             f"[PROJECT] Unlocked — agents returned to {SCRIPT_DIR}",
+            message_type="project",
         )
+        self.refresh_workspace_state()
         return projects
 
     def delete_project(self, project_id: str) -> dict[str, Any]:
@@ -649,8 +746,10 @@ class RuntimeSupervisor:
             self.workspace["preferences_path"],
             self.workspace["projects_path"],
             self.workspace["tasks_path"],
+            self.workspace["events_db_path"],
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
+        self.workspace["archives_dir"].mkdir(parents=True, exist_ok=True)
         self.workspace["log_path"].touch(exist_ok=True)
         if not self.workspace["sessions_path"].exists():
             relay.save_sessions(self.workspace["sessions_path"], {})
@@ -661,6 +760,8 @@ class RuntimeSupervisor:
                 agent["io_log_path"].parent.mkdir(parents=True, exist_ok=True)
                 agent["io_log_path"].touch(exist_ok=True)
         relay.write_text(self.workspace["pid_path"], f"{os.getpid()}\n")
+        import_transcript_to_event_store(self.event_store, self.workspace["log_path"])
+        self.refresh_workspace_state()
 
     def ensure_tmux_layout(self) -> None:
         if self.tmux_session_exists():
@@ -818,10 +919,16 @@ class RuntimeSupervisor:
         return best_name
 
     def compact_context(self) -> dict[str, Any]:
-        """Declutter temp logs and summarize context using local Ollama or cloud fallback."""
+        """Archive transcript context locally and inject a compact summary without dispatching."""
+        self.state.patch("workspace", {"compact_state": "running"})
         cleared: list[str] = []
+        now = utc_now()
+        log_path = self.workspace["log_path"]
+        transcript = relay.read_text(log_path) if log_path.exists() else ""
+        entries = parse_transcript_entries(transcript, 500)
+        archive_stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        archive_path = self.workspace["archives_dir"] / f"transcript-{archive_stamp}.json"
 
-        # Truncate agent io logs and relay log (not the transcript itself)
         for path in [self.workspace["relay_log_path"]] + [
             a["io_log_path"] for a in self.config["agents"] if a.get("io_log_path")
         ]:
@@ -831,49 +938,73 @@ class RuntimeSupervisor:
             except OSError:
                 pass
 
-        # Delete any .tmp files under the runtime dir
         runtime_dir = self.workspace["log_path"].parent
         for tmp in runtime_dir.glob("**/*.tmp"):
             tmp.unlink(missing_ok=True)
             cleared.append(str(tmp))
 
         dispatcher_config = self.config.get("dispatcher", {})
-        use_local = dispatcher_config.get("enabled", False)
         summary = ""
-        chosen_agent = "LOCAL"
-
-        if use_local:
-            # Try local Ollama summarization first
+        if transcript.strip() and dispatcher_config.get("enabled", False):
             try:
-                context = relay.read_text(self.workspace["log_path"])
-                summary = asyncio.run(dispatcher_mod.summarize_context(context[-6000:], dispatcher_config))
+                summary = asyncio.run(dispatcher_mod.summarize_context(transcript[-12000:], dispatcher_config))
             except Exception:
                 summary = ""
+        if not summary:
+            summary = fallback_compact_summary(transcript)
+        summary = relay.truncate_text(summary, 800)
 
-        if summary:
-            relay.write_text(self.workspace["log_path"], "") # Clear existing transcript
-            relay.append_tagged_entry(
-                self.workspace["log_path"], "SYSTEM",
-                f"[COMPACT SUMMARY] {summary}",
-            )
-            injected = True
-        else:
-            # Fall back to cloud agent summarization
-            chosen_agent = self._pick_compact_agent()
-            summary_request = (
-                f"[COMPACT → {chosen_agent}] Please read the full conversation above and reply with a "
-                "single paragraph that summarises all key decisions, features built, open "
-                "questions, and next actions. Keep it under 120 words. This will replace the "
-                "working context for all agents."
-            )
-            # Clear existing transcript before injecting new context
-            relay.write_text(self.workspace["log_path"], "")
-            # Write directly to transcript — skip socket dispatch to avoid
-            # creating a task and broadcasting to all agents (BUG-8).
-            relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)
-            injected = True
+        archive_payload = {
+            "created_at": now,
+            "transcript_path": str(log_path),
+            "project": self.state.snapshot().get("project", {}),
+            "entries": entries,
+            "summary": summary,
+            "transcript": transcript,
+        }
+        relay.write_json(archive_path, archive_payload)
+        self.emit_local_event(
+            {
+                "type": "transcript_compacted",
+                "archive_path": str(archive_path),
+                "created_at": now,
+                "entry_count": len(entries),
+                "char_count": len(transcript),
+                "status": "archived",
+            }
+        )
 
-        return {"cleared": cleared, "injected": injected, "chosen_agent": chosen_agent}
+        relay.write_text(log_path, "")
+        summary_message = self.persist_system_message(
+            f"[COMPACT SUMMARY] {summary}",
+            message_type="compact_summary",
+        )
+        self.emit_local_event(
+            {
+                "type": "transcript_summary_inserted",
+                "archive_path": str(archive_path),
+                "created_at": now,
+                "summary": summary,
+                "message_id": summary_message.get("id"),
+                "status": "inserted",
+            }
+        )
+
+        self.state.patch(
+            "workspace",
+            {
+                "compact_state": "archived",
+                "last_compact_at": now,
+                "last_archive_path": str(archive_path),
+            },
+        )
+        return {
+            "ok": True,
+            "cleared": cleared,
+            "injected": True,
+            "archive_path": str(archive_path),
+            "state": self.state.snapshot(),
+        }
 
     def refresh_transcript_state(self) -> None:
         log_path = self.workspace["log_path"]
@@ -919,6 +1050,7 @@ class RuntimeSupervisor:
         self.state.patch("app", {"phase": app_phase})
 
     def handle_relay_event(self, event: dict[str, Any]) -> None:
+        event_id = event.get("event_id")
         if event["type"] == "relay_state":
             self.state.patch(
                 "relay",
@@ -928,7 +1060,7 @@ class RuntimeSupervisor:
                     "last_error": event.get("last_error"),
                 },
             )
-            self.sse_broadcast("relay_state", {"state": event["state"]})
+            self.sse_broadcast("relay_state", {"state": event["state"]}, event_id)
             return
 
         if event["type"] == "transcript":
@@ -948,7 +1080,15 @@ class RuntimeSupervisor:
                 estimated_tokens = max(1, char_count // 4)
                 self.state.record_agent_usage(speaker, estimated_tokens)
             msg = event.get("message")
-            self.sse_broadcast("transcript", {"last_speaker": event.get("last_speaker", ""), "rev": current_rev + 1, **({"message": msg} if msg else {})})
+            self.sse_broadcast(
+                "transcript",
+                {
+                    "last_speaker": event.get("last_speaker", ""),
+                    "rev": current_rev + 1,
+                    **({"message": msg} if msg else {}),
+                },
+                event_id,
+            )
             return
 
         if event["type"] == "agent_state":
@@ -1004,17 +1144,22 @@ class RuntimeSupervisor:
             values["pressure"] = pressure
 
             self.state.patch_agent(event["agent"], values)
-            self.sse_broadcast("agent_state", {
-                "agent": agent_name,
-                "state": event["state"],
-                "last_error": event.get("last_error"),
-            })
+            self.sse_broadcast(
+                "agent_state",
+                {
+                    "agent": agent_name,
+                    "state": event["state"],
+                    "last_error": event.get("last_error"),
+                },
+                event_id,
+            )
             return
 
         if event["type"] == "dispatcher":
             action = event.get("action", "route")
             snapshot = self.state.snapshot()
             dispatcher_state = snapshot.get("dispatcher", {})
+            dispatcher_config = self.config.get("dispatcher", {})
             routes = dispatcher_state.get("routes_total", 0)
             absorbs = dispatcher_state.get("absorbs_total", 0)
             tokens_saved = dispatcher_state.get("tokens_saved", 0)
@@ -1030,18 +1175,23 @@ class RuntimeSupervisor:
                     tokens_saved += (all_agents - routed) * 200
             self.state.patch("dispatcher", {
                 "state": "active",
+                "router_model": dispatcher_config.get("router_model"),
                 "routes_total": routes,
                 "absorbs_total": absorbs,
                 "tokens_saved": tokens_saved,
                 "last_action": action,
                 "last_targets": event.get("targets", []),
             })
-            self.sse_broadcast("dispatcher", {
-                "action": action,
-                "routes_total": routes,
-                "absorbs_total": absorbs,
-                "tokens_saved": tokens_saved,
-            })
+            self.sse_broadcast(
+                "dispatcher",
+                {
+                    "action": action,
+                    "routes_total": routes,
+                    "absorbs_total": absorbs,
+                    "tokens_saved": tokens_saved,
+                },
+                event_id,
+            )
             return
 
         if event["type"] == "route_state":
@@ -1070,26 +1220,86 @@ class RuntimeSupervisor:
                 "last_route_at": route.get("updated_at") or route.get("started_at"),
             }
             self.state.patch("routing", routing_state)
-            self.sse_broadcast("route_state", {
-                "route": route,
-                **routing_state,
-            })
+            self.sse_broadcast(
+                "route_state",
+                {
+                    "route": route,
+                    **routing_state,
+                },
+                event_id,
+            )
             return
 
         if event["type"] == "task_created":
             self.refresh_task_state()
-            self.sse_broadcast("task_created", event.get("task", {}))
+            self.sse_broadcast("task_created", event.get("task", {}), event_id)
+            return
 
         if event["type"] == "task_updated":
             self.refresh_task_state()
-            self.sse_broadcast("task_updated", {"task": event.get("task", {})})
+            self.sse_broadcast("task_updated", {"task": event.get("task", {})}, event_id)
+            return
 
         if event["type"] == "tasks_updated":
             self.refresh_task_state()
-            self.sse_broadcast("tasks_updated", {
-                "tasks": event.get("tasks", []),
-                "new_status": event.get("new_status", ""),
-            })
+            self.sse_broadcast(
+                "tasks_updated",
+                {
+                    "tasks": event.get("tasks", []),
+                    "new_status": event.get("new_status", ""),
+                },
+                event_id,
+            )
+            return
+
+        if event["type"] == "tasks_cleared":
+            self.refresh_task_state()
+            self.sse_broadcast("tasks_cleared", {"tasks": []}, event_id)
+            return
+
+        if event["type"] == "dispatch_skipped":
+            self.state.patch("relay", {"last_error": event.get("reason")})
+            self.sse_broadcast(
+                "dispatch_skipped",
+                {
+                    "reason": event.get("reason"),
+                    "targets": event.get("targets", []),
+                    "message_id": event.get("message_id"),
+                    "batch_ids": event.get("batch_ids", []),
+                },
+                event_id,
+            )
+            return
+
+        if event["type"] == "transcript_compacted":
+            self.state.patch(
+                "workspace",
+                {
+                    "compact_state": event.get("status", "archived"),
+                    "last_compact_at": event.get("created_at"),
+                    "last_archive_path": event.get("archive_path"),
+                },
+            )
+            self.sse_broadcast(
+                "transcript_compacted",
+                {
+                    "archive_path": event.get("archive_path"),
+                    "entry_count": event.get("entry_count", 0),
+                },
+                event_id,
+            )
+            return
+
+        if event["type"] == "transcript_summary_inserted":
+            self.sse_broadcast(
+                "transcript_summary_inserted",
+                {
+                    "archive_path": event.get("archive_path"),
+                    "message_id": event.get("message_id"),
+                },
+                event_id,
+            )
+            return
 
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
         supervisor = self
@@ -1156,10 +1366,11 @@ class RuntimeSupervisor:
                 if parsed.path == "/api/state":
                     if not self._authorized():
                         return self._json({"locked": True, "app": {"phase": "locked"}})
+                    supervisor.refresh_workspace_state()
                     snapshot = supervisor.state.snapshot()
-                    # Enrich each agent with fuel gauge data
                     for agent_name in snapshot.get("agents", {}):
                         snapshot["agents"][agent_name]["fuel"] = supervisor.state.fuel_for_agent(agent_name)
+                    snapshot["events"] = {"latest_id": supervisor.event_store.latest_event_id()}
                     return self._json(snapshot)
                 if parsed.path == "/api/transcript":
                     if not self._authorized():
@@ -1236,6 +1447,19 @@ class RuntimeSupervisor:
                     if not self._authorized():
                         self.send_error(HTTPStatus.UNAUTHORIZED)
                         return
+                    query = parse_qs(parsed.query)
+                    after_id = int(query.get("after_id", ["0"])[0] or "0")
+                    if after_id > 0 or query.get("format", [""])[0] == "json":
+                        events = supervisor.event_store.list_events(
+                            after_id=after_id,
+                            limit=min(int(query.get("limit", ["200"])[0]), 1000),
+                        )
+                        return self._json(
+                            {
+                                "events": events,
+                                "latest_id": supervisor.event_store.latest_event_id(),
+                            }
+                        )
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -1244,20 +1468,33 @@ class RuntimeSupervisor:
                     self.end_headers()
                     q = supervisor.sse_subscribe()
                     try:
-                        # Send initial full state as first event
+                        supervisor.refresh_workspace_state()
                         snapshot = supervisor.state.snapshot()
                         for agent_name in snapshot.get("agents", {}):
                             snapshot["agents"][agent_name]["fuel"] = supervisor.state.fuel_for_agent(agent_name)
+                        snapshot["events"] = {"latest_id": supervisor.event_store.latest_event_id()}
                         init_data = json.dumps({"type": "init", **snapshot})
                         self.wfile.write(f"data: {init_data}\n\n".encode())
                         self.wfile.flush()
+                        last_event_id = self.headers.get("Last-Event-ID")
+                        if last_event_id and last_event_id.isdigit():
+                            replay = supervisor.event_store.list_events(after_id=int(last_event_id), limit=500)
+                            for item in replay:
+                                event_id = item.get("id")
+                                payload = json.dumps(item)
+                                if event_id is not None:
+                                    self.wfile.write(f"id: {event_id}\n".encode())
+                                self.wfile.write(f"data: {payload}\n\n".encode())
+                            self.wfile.flush()
                         while True:
                             try:
-                                payload = q.get(timeout=15)
+                                frame = q.get(timeout=15)
+                                payload = json.dumps(frame["payload"])
+                                if frame.get("event_id") is not None:
+                                    self.wfile.write(f"id: {frame['event_id']}\n".encode())
                                 self.wfile.write(f"data: {payload}\n\n".encode())
                                 self.wfile.flush()
                             except queue.Empty:
-                                # Send keepalive comment
                                 self.wfile.write(b": keepalive\n\n")
                                 self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
@@ -1305,23 +1542,16 @@ class RuntimeSupervisor:
                     }
                     
                     if not supervisor._send_to_socket(message):
-                        relay.append_tagged_entry(supervisor.workspace["log_path"], speaker, raw_message[:8000])
-
-                    # Bump transcript revision on every message to signal clients to refresh
-                    current_rev = supervisor.state.state.get("transcript", {}).get("rev", 0)
-                    supervisor.state.patch(
-                        "transcript",
-                        {
-                            "last_speaker": speaker,
-                            "last_updated_at": utc_now(),
-                            "rev": current_rev + 1,
-                        },
-                    )
-                    supervisor.sse_broadcast("transcript", {
-                        "last_speaker": speaker,
-                        "rev": current_rev + 1,
-                        "message": message,
-                    })
+                        relay.persist_transcript_message(
+                            supervisor.workspace["log_path"],
+                            speaker,
+                            raw_message[:8000],
+                            event_callback=supervisor.handle_relay_event,
+                            event_store=supervisor.event_store,
+                            message=message,
+                            message_type="message",
+                        )
+                    supervisor.refresh_workspace_state()
                     return self._json({"ok": True, "state": supervisor.state.snapshot()})
 
                 if parsed.path.startswith("/api/agents/") and parsed.path.endswith("/settings"):
@@ -1357,14 +1587,11 @@ class RuntimeSupervisor:
 
                 if parsed.path == "/api/compact":
                     result = supervisor.compact_context()
-                    return self._json({
-                        "ok": True,
-                        "cleared": result["cleared"],
-                        "injected": result["injected"],
-                        "chosen_agent": result.get("chosen_agent", ""),
-                    })
+                    status = HTTPStatus.OK if result.get("ok", False) else HTTPStatus.INTERNAL_SERVER_ERROR
+                    return self._json(result, status=status)
 
                 if parsed.path == "/api/repo/pull":
+                    supervisor.state.patch("workspace", {"sync_state": "running"})
                     try:
                         git_proc = subprocess.run(
                             ["git", "pull"],
@@ -1381,9 +1608,20 @@ class RuntimeSupervisor:
                             timeout=15,
                         )
                         ok = git_proc.returncode == 0
-                        # Write sync message directly to transcript (BUG-8: skip socket to avoid task/dispatch)
-                        sync_body = f"[SYNC] Repository synced. All agents now share read-write access to {SCRIPT_DIR}."
-                        relay.append_tagged_entry(supervisor.workspace["log_path"], "SYSTEM", sync_body)
+                        sync_body = (
+                            f"[SYNC] Repository synced. All agents now share read-write access to {SCRIPT_DIR}."
+                            if ok
+                            else f"[SYNC ERROR] git pull failed for {SCRIPT_DIR}. Review the latest sync output before dispatching more work."
+                        )
+                        supervisor.persist_system_message(sync_body, message_type="sync")
+                        supervisor.refresh_workspace_state()
+                        supervisor.state.patch(
+                            "workspace",
+                            {
+                                "sync_state": "synced" if ok else "error",
+                                "last_sync_at": utc_now(),
+                            },
+                        )
                         return self._json({
                             "ok": ok,
                             "stdout": git_proc.stdout,
@@ -1391,8 +1629,10 @@ class RuntimeSupervisor:
                             "chmod_ok": chmod_proc.returncode == 0,
                             "chmod_stderr": chmod_proc.stderr,
                             "sync_path": str(SCRIPT_DIR),
+                            "state": supervisor.state.snapshot(),
                         })
                     except Exception as exc:
+                        supervisor.state.patch("workspace", {"sync_state": "error"})
                         return self._json({"ok": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
                 if parsed.path == "/api/sleep":
@@ -1400,14 +1640,11 @@ class RuntimeSupervisor:
                     want_sleep = bool(payload.get("sleep", not supervisor.is_sleeping()))
                     supervisor.set_sleeping(want_sleep)
                     if not want_sleep:
-                        # Write wake message directly to transcript (BUG-8: skip socket to avoid task/dispatch)
                         wake_body = (
                             "[WAKE] All agents are back online. Review the messages above that "
                             "arrived during sleep and continue where we left off."
                         )
-                        relay.append_tagged_entry(
-                            supervisor.workspace["log_path"], "SYSTEM", wake_body
-                        )
+                        supervisor.persist_system_message(wake_body, message_type="wake")
                     return self._json({
                         "ok": True,
                         "sleeping": want_sleep,
@@ -1501,11 +1738,14 @@ class RuntimeSupervisor:
         while not self.stop_event.is_set():
             self.refresh_transcript_state()
             self.refresh_tmux_state()
+            if tick % 5 == 0:
+                self.refresh_workspace_state()
             tick += 1
             if tick % 3 == 0 and self._sse_clients:
                 snapshot = self.state.snapshot()
                 for agent_name in snapshot.get("agents", {}):
                     snapshot["agents"][agent_name]["fuel"] = self.state.fuel_for_agent(agent_name)
+                snapshot["events"] = {"latest_id": self.event_store.latest_event_id()}
                 self.sse_broadcast("state_refresh", snapshot)
             await asyncio.sleep(1.0)
 
@@ -1543,6 +1783,7 @@ class RuntimeSupervisor:
                 event_callback=self.handle_relay_event,
                 stop_event=self.stop_event,
                 is_sleeping=self.is_sleeping,
+                event_store=self.event_store,
             )
         )
 
@@ -1563,6 +1804,7 @@ class RuntimeSupervisor:
             if self.http_server is not None:
                 self.http_server.shutdown()
                 self.http_server.server_close()
+            self.event_store.close()
         return result
 
 

@@ -35,7 +35,7 @@ const copyTmux = document.getElementById("copyTmux");
 const compactBtn = document.getElementById("compactBtn");
 const syncRepoBtn = document.getElementById("syncRepoBtn");
 const sleepBtn = document.getElementById("sleepBtn");
-const workspaceTachs = document.getElementById("workspaceTachs");
+const workspaceStatus = document.getElementById("workspaceStatus");
 const chatForm = document.getElementById("chatForm");
 const senderName = document.getElementById("senderName");
 const chatInput = document.getElementById("chatInput");
@@ -377,7 +377,10 @@ compactBtn.addEventListener("click", async () => {
     const response = await fetch("/api/compact", { method: "POST" });
     const result = await response.json();
     if (result.ok) {
-      compactBtn.textContent = "Compacted";
+      if (result.state) {
+        renderState(result.state);
+      }
+      compactBtn.textContent = "Archived";
       await pollTranscript();
       setTimeout(() => { compactBtn.textContent = "Compact Context"; }, 3000);
     } else {
@@ -425,6 +428,9 @@ syncRepoBtn.addEventListener("click", async () => {
     const response = await fetch("/api/repo/pull", { method: "POST" });
     const result = await response.json();
     if (result.ok) {
+      if (result.state) {
+        renderState(result.state);
+      }
       syncRepoBtn.textContent = "Synced";
       setTimeout(() => { syncRepoBtn.textContent = "Sync Repo"; }, 3000);
     } else {
@@ -553,6 +559,14 @@ function startPolling() {
         case "tasks_cleared":
           renderTaskBoard([]);
           break;
+        case "dispatch_skipped":
+          chatStatus.textContent = "Dispatch skipped while the relay was busy. Check Route Bus or relay state.";
+          setTimeout(() => {
+            if (chatStatus.textContent.includes("Dispatch skipped")) {
+              chatStatus.textContent = "";
+            }
+          }, 4000);
+          break;
       }
     } catch { /* ignore malformed */ }
   };
@@ -611,6 +625,7 @@ function renderState(state) {
   sleepBtn.textContent = state.app?.sleeping ? "Wake" : "Sleep";
   renderEngines(state.agents || {});
   renderProjectName(state);
+  renderWorkspaceStatus(state);
   renderRouting(state);
   renderDispatcher(state);
 
@@ -684,7 +699,6 @@ function renderEngines(agents) {
   const entries = Object.entries(agents);
   engineCards.innerHTML = "";
   statusGrid.innerHTML = "";
-  workspaceTachs.innerHTML = "";
 
   let colIdx = 0;
   for (const [name, payload] of entries) {
@@ -724,20 +738,6 @@ function renderEngines(agents) {
     previousStates.set(name, state);
     engineCards.appendChild(card);
     setNeedleTarget(name, p.angle, isDamped);
-
-    const htach = document.createElement("div");
-    htach.className = `htach control--${state}`;
-    htach.dataset.pressure = p.level;
-    htach.innerHTML = `
-      <span class="htach__name">${name}</span>
-      <div class="control__tach">
-        <div class="tach__dial tach__dial--sm" style="--fuel-angle:${fuelAngle}deg"></div>
-        <div class="tach__fuel-arc tach__fuel-arc--sm" style="--fuel-angle:${fuelAngle}deg"></div>
-        <div class="tach__needle tach__needle--sm" data-needle-agent="${name}" style="--needle-color:${nColor}"></div>
-        <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
-      </div>
-    `;
-    workspaceTachs.appendChild(htach);
 
     const control = document.createElement("article");
     control.className = `control control--${state}`;
@@ -838,6 +838,55 @@ function renderEngines(agents) {
 
   refreshNeedleRefs();
   scheduleNeedleTick();
+}
+
+function shortPath(value) {
+  if (!value) return "unknown";
+  const parts = String(value).split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : value;
+}
+
+function renderWorkspaceStatus(state) {
+  const workspaceState = state.workspace || {};
+  const project = state.project || {};
+  const repoPath = workspaceState.repo_path || project.path || "";
+  const projectLabel = project.name || project.active || shortPath(repoPath) || "home";
+  const branch = workspaceState.branch || "no-git";
+  const dirty = workspaceState.dirty
+    ? `${workspaceState.dirty_files || 0} dirty`
+    : "clean";
+  const syncState = workspaceState.sync_state || "idle";
+  const compactState = workspaceState.compact_state || "idle";
+  const archivePath = workspaceState.last_archive_path
+    ? shortPath(workspaceState.last_archive_path)
+    : "none";
+
+  workspaceStatus.innerHTML = `
+    <div class="workspace-pill">
+      <span class="workspace-pill__label">Project</span>
+      <span class="workspace-pill__value">${escapeHtml(projectLabel)}</span>
+    </div>
+    <div class="workspace-pill">
+      <span class="workspace-pill__label">Branch</span>
+      <span class="workspace-pill__value">${escapeHtml(branch)}</span>
+    </div>
+    <div class="workspace-pill">
+      <span class="workspace-pill__label">Tree</span>
+      <span class="workspace-pill__value">${escapeHtml(dirty)}</span>
+    </div>
+    <div class="workspace-pill">
+      <span class="workspace-pill__label">Sync</span>
+      <span class="workspace-pill__value">${escapeHtml(syncState)}</span>
+    </div>
+    <div class="workspace-pill">
+      <span class="workspace-pill__label">Compact</span>
+      <span class="workspace-pill__value">${escapeHtml(compactState)}</span>
+    </div>
+    <div class="workspace-pill">
+      <span class="workspace-pill__label">Archive</span>
+      <span class="workspace-pill__value">${escapeHtml(archivePath)}</span>
+    </div>
+  `;
 }
 
 function renderChoiceButtons(agent, kind, options, selectedId) {
