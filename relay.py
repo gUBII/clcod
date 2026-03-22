@@ -1500,20 +1500,21 @@ async def run_relay(
             if not data:
                 return
             
-            payload = json.loads(data.decode("utf-8"))
-            sender = payload.get("sender", "UNKNOWN")
-            body = payload.get("body", "")
+            incoming = json.loads(data.decode("utf-8"))
+            sender = incoming.get("sender", "UNKNOWN")
+            body = incoming.get("body", "")
             if not body:
                 return
 
-            message_type = str(payload.get("type") or "message")
+            message_type = str(incoming.get("type") or "message")
+            incoming_message_id = incoming.get("id")
             payload = persist_transcript_message(
                 log_path,
                 sender,
                 body,
                 event_callback=event_callback,
                 event_store=event_store,
-                message=payload,
+                message=incoming,
                 message_type=message_type,
             )
 
@@ -1726,68 +1727,29 @@ async def run_relay(
             elif dispatcher_decision is not None:
                 route_source = "dispatcher"
 
-            route_payloads = {
-                agent["name"]: build_route_payload(
-                    sender=sender,
-                    target=agent["name"],
-                    body=body,
-                    task=task,
-                    source=route_source,
-                    requested_target=requested_target,
-                    dispatcher_action=dispatcher_decision.get("action") if dispatcher_decision else None,
-                )
-                for agent in dispatch_targets
-            }
+            target_names = [a["name"] for a in dispatch_targets]
+            queued = event_store.enqueue_dispatch({
+                "sender": sender,
+                "body": body,
+                "targets": target_names,
+                "task": task_prompt,
+                "route_source": route_source,
+                "requested_target": requested_target,
+                "dispatcher_action": dispatcher_decision.get("action") if dispatcher_decision else None,
+                "work_dir": work_dir,
+                "message_id": incoming_message_id,
+                "message_kind": "task" if task else "message",
+            })
+            relay_log(f"dispatch queued (job #{queued['id']}): {', '.join(target_names)}")
+            publish({
+                "type": "dispatch_queued",
+                "job_id": queued["id"],
+                "targets": target_names,
+                "sender": sender,
+                "message_kind": "task" if task else "message",
+                "queue_depth": event_store.queue_depth(),
+            })
 
-            prompts = {
-                agent["name"]: build_agent_prompt(
-                    agent_name=agent["name"],
-                    context=context,
-                    work_dir=work_dir,
-                    task=task_prompt,
-                )
-                for agent in dispatch_targets
-            }
-
-            if not acquire_lock(lock_path, f"relay:{os.getpid()}", lock_ttl):
-                reason = "speaker.lock is active; skipping this dispatch cycle"
-                relay_log(reason)
-                publish(
-                    {
-                        "type": "dispatch_skipped",
-                        "reason": reason,
-                        "targets": [agent["name"] for agent in dispatch_targets],
-                        "message_id": payload.get("id"),
-                        "sender": sender,
-                    }
-                )
-                return
-
-            try:
-                if task:
-                    updated_task = update_task(tasks_path, task["id"], "in_progress")
-                    if updated_task:
-                        task = updated_task
-                        publish({"type": "task_updated", "task": updated_task})
-                await asyncio.gather(
-                    *[
-                        route_to(
-                            agent,
-                            prompts[agent["name"]],
-                            log_path,
-                            write_lock,
-                            sessions_path,
-                            session_lock,
-                            event_callback,
-                            route_payloads[agent["name"]],
-                            event_store=event_store,
-                        )
-                        for agent in dispatch_targets
-                    ]
-                )
-            finally:
-                release_lock(lock_path)
-                
         except json.JSONDecodeError:
             relay_log("received invalid JSON on socket")
         except Exception as e:
@@ -1842,88 +1804,177 @@ async def run_relay(
                 for agent in enabled_agents:
                     agent["work_dir"] = work_dir
 
+                await append_reply(
+                    write_lock,
+                    log_path,
+                    "SYSTEM",
+                    batch_body,
+                    event_callback=event_callback,
+                    event_store=event_store,
+                    message_type="batch",
+                )
+                batch_targets = [a["name"] for a in enabled_agents]
+                queued = event_store.enqueue_dispatch({
+                    "sender": "SYSTEM",
+                    "body": batch_body,
+                    "targets": batch_targets,
+                    "task": {
+                        "id": "batch",
+                        "title": f"Batch tasks ({len(batch_ids)})",
+                        "request": batch_body,
+                    },
+                    "route_source": "batch",
+                    "message_kind": "batch",
+                    "batch_ids": batch_ids,
+                    "work_dir": work_dir,
+                })
+                relay_log(f"batch dispatch queued (job #{queued['id']})")
+                publish({
+                    "type": "dispatch_queued",
+                    "job_id": queued["id"],
+                    "targets": batch_targets,
+                    "sender": "SYSTEM",
+                    "message_kind": "batch",
+                    "batch_ids": batch_ids,
+                    "queue_depth": event_store.queue_depth(),
+                })
+            except Exception as exc:
+                relay_log(f"batch processing error: {exc}")
+
+    async def dispatch_drain_loop() -> None:
+        """Process queued dispatch jobs sequentially, replacing the old speaker.lock mechanism."""
+        # On startup, recover ALL active jobs from a previous crash (they can't be in-flight)
+        recovered = event_store.recover_stale_active(max_age_seconds=0)
+        if recovered:
+            relay_log(f"recovered {recovered} stale active dispatch job(s)")
+
+        while not internal_stop_event.is_set():
+            job: dict[str, Any] | None = None
+            try:
+                job = event_store.claim_next_dispatch()
+                if not job:
+                    await asyncio.sleep(0.3)
+                    continue
+
+                target_names = set(job["targets"])
+                target_agents = [a for a in enabled_agents if a["name"] in target_names]
+                if not target_agents:
+                    event_store.complete_dispatch(job["id"], "failed", "no matching agents")
+                    publish({
+                        "type": "dispatch_failed",
+                        "job_id": job["id"],
+                        "targets": job["targets"],
+                        "error": "no matching agents",
+                        "queue_depth": event_store.queue_depth(),
+                    })
+                    relay_log(f"dispatch job #{job['id']} failed: no matching agents for {job['targets']}")
+                    continue
+
+                work_dir = job.get("work_dir") or str(SCRIPT_DIR)
+                for agent in target_agents:
+                    agent["work_dir"] = work_dir
+
+                fresh = read_text(log_path)
+                context = fresh[-context_len:]
+
+                task = job.get("task")
                 prompts = {
                     agent["name"]: build_agent_prompt(
                         agent_name=agent["name"],
                         context=context,
                         work_dir=work_dir,
-                        task={
-                            "id": "batch",
-                            "title": f"Batch tasks ({len(batch_ids)})",
-                            "request": batch_body,
-                        },
+                        task=task,
                     )
-                    for agent in enabled_agents
+                    for agent in target_agents
                 }
                 route_payloads = {
                     agent["name"]: build_route_payload(
-                        sender="SYSTEM",
+                        sender=job.get("sender", "UNKNOWN"),
                         target=agent["name"],
-                        body=batch_body,
-                        task={"title": f"Batch tasks ({len(batch_ids)})", "id": None},
-                        source="batch",
-                        message_kind="batch",
-                        batch_ids=batch_ids,
+                        body=job["body"],
+                        task=task,
+                        source=job.get("route_source", "broadcast"),
+                        requested_target=job.get("requested_target"),
+                        dispatcher_action=job.get("dispatcher_action"),
+                        batch_ids=job.get("batch_ids", []),
+                        message_kind=job.get("message_kind"),
                     )
-                    for agent in enabled_agents
+                    for agent in target_agents
                 }
 
-                if acquire_lock(lock_path, f"relay-batch:{os.getpid()}", lock_ttl):
-                    try:
-                        await append_reply(
-                            write_lock,
+                if task and isinstance(task.get("id"), int):
+                    updated_task = update_task(tasks_path, task["id"], "in_progress")
+                    if updated_task:
+                        publish({"type": "task_updated", "task": updated_task})
+
+                publish({
+                    "type": "dispatch_started",
+                    "job_id": job["id"],
+                    "targets": job["targets"],
+                    "sender": job.get("sender"),
+                    "queue_depth": event_store.queue_depth(),
+                })
+
+                await asyncio.gather(
+                    *[
+                        route_to(
+                            agent,
+                            prompts[agent["name"]],
                             log_path,
-                            "SYSTEM",
-                            batch_body,
-                            event_callback=event_callback,
+                            write_lock,
+                            sessions_path,
+                            session_lock,
+                            event_callback,
+                            route_payloads[agent["name"]],
                             event_store=event_store,
-                            message_type="batch",
                         )
-                        await asyncio.gather(
-                            *[
-                                route_to(
-                                    agent,
-                                    prompts[agent["name"]],
-                                    log_path,
-                                    write_lock,
-                                    sessions_path,
-                                    session_lock,
-                                    event_callback,
-                                    route_payloads[agent["name"]],
-                                    event_store=event_store,
-                                )
-                                for agent in enabled_agents
-                            ]
-                        )
-                    finally:
-                        release_lock(lock_path)
-                else:
-                    publish(
-                        {
-                            "type": "dispatch_skipped",
-                            "reason": "speaker.lock is active; skipping this batch dispatch cycle",
-                            "targets": [agent["name"] for agent in enabled_agents],
-                            "batch_ids": batch_ids,
-                            "sender": "SYSTEM",
-                        }
-                    )
+                        for agent in target_agents
+                    ]
+                )
+
+                event_store.complete_dispatch(job["id"], "done")
+                publish({
+                    "type": "dispatch_completed",
+                    "job_id": job["id"],
+                    "targets": job["targets"],
+                    "queue_depth": event_store.queue_depth(),
+                })
+                relay_log(f"dispatch completed (job #{job['id']})")
+
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                relay_log(f"batch processing error: {exc}")
+                if job:
+                    event_store.complete_dispatch(job["id"], "failed", str(exc))
+                    publish({
+                        "type": "dispatch_failed",
+                        "job_id": job["id"],
+                        "targets": job.get("targets", []),
+                        "error": str(exc),
+                        "queue_depth": event_store.queue_depth(),
+                    })
+                relay_log(f"dispatch drain error: {exc}")
 
     if socket_path.exists():
         socket_path.unlink()
-        
+
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
     relay_log(f"listening on {socket_path}")
 
     batch_task = asyncio.create_task(batch_pending_tasks())
+    drain_task = asyncio.create_task(dispatch_drain_loop())
     try:
         await internal_stop_event.wait()
     finally:
         batch_task.cancel()
+        drain_task.cancel()
         try:
             await batch_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await drain_task
         except asyncio.CancelledError:
             pass
         server.close()

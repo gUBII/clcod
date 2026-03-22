@@ -220,6 +220,7 @@ class SupervisorTests(unittest.TestCase):
                         "ts": "2026-03-20T10:00:00Z",
                     },
                 },
+                None,
             )
 
     def test_handle_relay_event_updates_agent_pressure(self):
@@ -260,10 +261,10 @@ class SupervisorTests(unittest.TestCase):
             self.assertIn("pressure", agent)
             self.assertGreaterEqual(agent["pressure"]["last_latency_ms"], 0)
             runtime.sse_broadcast.assert_any_call(
-                "agent_state", {"agent": "CLAUDE", "state": "warming", "last_error": None}
+                "agent_state", {"agent": "CLAUDE", "state": "warming", "last_error": None}, None
             )
             runtime.sse_broadcast.assert_any_call(
-                "agent_state", {"agent": "CLAUDE", "state": "ready", "last_error": None}
+                "agent_state", {"agent": "CLAUDE", "state": "ready", "last_error": None}, None
             )
 
     def test_handle_relay_event_warming_sets_dispatch_ts(self):
@@ -441,6 +442,7 @@ class SupervisorTests(unittest.TestCase):
                     ],
                     "last_route_at": "2026-03-22T05:00:03Z",
                 },
+                None,
             )
 
 

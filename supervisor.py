@@ -146,6 +146,14 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
             "last_updated_at": None,
             "rev": 0,
         },
+        "queue": {
+            "depth": 0,
+            "active": 0,
+            "total_processed": 0,
+            "total_failed": 0,
+            "last_job_id": None,
+            "last_completed_at": None,
+        },
     }
 
 
@@ -1271,6 +1279,80 @@ class RuntimeSupervisor:
             )
             return
 
+        if event["type"] == "dispatch_queued":
+            depth = event.get("queue_depth", self.event_store.queue_depth())
+            self.state.patch("queue", {"depth": depth, "last_job_id": event.get("job_id")})
+            self.sse_broadcast(
+                "dispatch_queued",
+                {
+                    "job_id": event.get("job_id"),
+                    "targets": event.get("targets", []),
+                    "sender": event.get("sender"),
+                    "message_kind": event.get("message_kind"),
+                    "queue_depth": depth,
+                },
+                event_id,
+            )
+            return
+
+        if event["type"] == "dispatch_started":
+            snapshot = self.state.snapshot().get("queue", {})
+            depth = event.get("queue_depth", max(0, snapshot.get("depth", 1) - 1))
+            self.state.patch("queue", {
+                "depth": depth,
+                "active": snapshot.get("active", 0) + 1,
+            })
+            self.sse_broadcast(
+                "dispatch_started",
+                {
+                    "job_id": event.get("job_id"),
+                    "targets": event.get("targets", []),
+                    "sender": event.get("sender"),
+                },
+                event_id,
+            )
+            return
+
+        if event["type"] == "dispatch_completed":
+            snapshot = self.state.snapshot().get("queue", {})
+            depth = event.get("queue_depth", max(0, snapshot.get("depth", 0)))
+            self.state.patch("queue", {
+                "depth": depth,
+                "active": max(0, snapshot.get("active", 1) - 1),
+                "total_processed": snapshot.get("total_processed", 0) + 1,
+                "last_job_id": event.get("job_id"),
+                "last_completed_at": utc_now(),
+            })
+            self.sse_broadcast(
+                "dispatch_completed",
+                {
+                    "job_id": event.get("job_id"),
+                    "targets": event.get("targets", []),
+                    "queue_depth": depth,
+                },
+                event_id,
+            )
+            return
+
+        if event["type"] == "dispatch_failed":
+            snapshot = self.state.snapshot().get("queue", {})
+            depth = event.get("queue_depth", snapshot.get("depth", 0))
+            self.state.patch("queue", {
+                "depth": depth,
+                "active": max(0, snapshot.get("active", 1) - 1),
+                "total_failed": snapshot.get("total_failed", 0) + 1,
+            })
+            self.sse_broadcast(
+                "dispatch_failed",
+                {
+                    "job_id": event.get("job_id"),
+                    "targets": event.get("targets", []),
+                    "error": event.get("error"),
+                },
+                event_id,
+            )
+            return
+
         if event["type"] == "transcript_compacted":
             self.state.patch(
                 "workspace",
@@ -1371,6 +1453,11 @@ class RuntimeSupervisor:
                     for agent_name in snapshot.get("agents", {}):
                         snapshot["agents"][agent_name]["fuel"] = supervisor.state.fuel_for_agent(agent_name)
                     snapshot["events"] = {"latest_id": supervisor.event_store.latest_event_id()}
+                    snapshot["queue"] = {
+                        **snapshot.get("queue", {}),
+                        "depth": supervisor.event_store.queue_depth(),
+                        "active": supervisor.event_store.active_dispatch_count(),
+                    }
                     return self._json(snapshot)
                 if parsed.path == "/api/transcript":
                     if not self._authorized():

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 SQLite-backed event spine for clcod.
+
+Schema versions:
+  1 - Phase 1: events table with nullable target
+  2 - Phase 2: dispatch_queue table for queue-backed dispatch
 """
 
 from __future__ import annotations
@@ -12,6 +16,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -116,29 +123,95 @@ class EventStore:
         with self._lock:
             self._conn.close()
 
+    # ── Schema migrations ────────────────────────────────────────
+
     def _init_schema(self) -> None:
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              ts TEXT NOT NULL,
-              type TEXT NOT NULL,
-              correlation_id TEXT,
-              task_id INTEGER,
-              sender TEXT,
-              target TEXT,
-              status TEXT,
-              payload TEXT NOT NULL
-            );
+        current = self._conn.execute("PRAGMA user_version").fetchone()[0]
 
-            CREATE INDEX IF NOT EXISTS events_type_id_idx
-              ON events(type, id);
+        if current < 1:
+            existing = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if existing:
+                pragma_rows = self._conn.execute("PRAGMA table_info(events)").fetchall()
+                needs_migration = any(
+                    row[1] == "target" and row[3] for row in pragma_rows
+                )
+                if needs_migration:
+                    self._conn.executescript(
+                        """
+                        ALTER TABLE events RENAME TO _events_migrate;
+                        CREATE TABLE events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ts TEXT NOT NULL,
+                            type TEXT NOT NULL,
+                            correlation_id TEXT,
+                            task_id INTEGER,
+                            sender TEXT,
+                            target TEXT,
+                            status TEXT,
+                            payload TEXT NOT NULL
+                        );
+                        INSERT INTO events SELECT * FROM _events_migrate;
+                        DROP TABLE _events_migrate;
+                        """
+                    )
+            else:
+                self._conn.executescript(
+                    """
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        correlation_id TEXT,
+                        task_id INTEGER,
+                        sender TEXT,
+                        target TEXT,
+                        status TEXT,
+                        payload TEXT NOT NULL
+                    );
+                    """
+                )
+            self._conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS events_type_id_idx ON events(type, id);
+                CREATE INDEX IF NOT EXISTS events_corr_idx ON events(correlation_id);
+                """
+            )
+            self._conn.execute("PRAGMA user_version = 1")
+            self._conn.commit()
+            current = 1
 
-            CREATE INDEX IF NOT EXISTS events_corr_idx
-              ON events(correlation_id);
-            """
-        )
-        self._conn.commit()
+        if current < 2:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS dispatch_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    sender TEXT,
+                    body TEXT NOT NULL,
+                    targets_json TEXT NOT NULL,
+                    task_json TEXT,
+                    route_source TEXT,
+                    requested_target TEXT,
+                    dispatcher_action TEXT,
+                    work_dir TEXT,
+                    message_id TEXT,
+                    batch_ids_json TEXT,
+                    message_kind TEXT DEFAULT 'message',
+                    started_at TEXT,
+                    completed_at TEXT,
+                    error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS dq_status_idx
+                    ON dispatch_queue(status, id);
+                """
+            )
+            self._conn.execute("PRAGMA user_version = 2")
+            self._conn.commit()
+
+    # ── Event store operations ───────────────────────────────────
 
     def _decode_row(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = json.loads(row["payload"]) if row["payload"] else {}
@@ -246,6 +319,123 @@ class EventStore:
             )
             imported += 1
         return imported
+
+    # ── Dispatch queue operations ────────────────────────────────
+
+    def enqueue_dispatch(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Enqueue a dispatch job. Returns the created queue item with id and status."""
+        ts = utc_now()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO dispatch_queue
+                    (created_at, status, sender, body, targets_json, task_json,
+                     route_source, requested_target, dispatcher_action,
+                     work_dir, message_id, batch_ids_json, message_kind)
+                VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    data.get("sender"),
+                    data["body"],
+                    json.dumps(data.get("targets", [])),
+                    json.dumps(data.get("task")) if data.get("task") else None,
+                    data.get("route_source"),
+                    data.get("requested_target"),
+                    data.get("dispatcher_action"),
+                    data.get("work_dir"),
+                    data.get("message_id"),
+                    json.dumps(data.get("batch_ids", [])),
+                    data.get("message_kind", "message"),
+                ),
+            )
+            self._conn.commit()
+        return {"id": cur.lastrowid, "created_at": ts, "status": "pending"}
+
+    def claim_next_dispatch(self) -> dict[str, Any] | None:
+        """Atomically claim the oldest pending dispatch job. Returns None if queue is empty."""
+        ts = utc_now()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, created_at, sender, body, targets_json, task_json,
+                       route_source, requested_target, dispatcher_action,
+                       work_dir, message_id, batch_ids_json, message_kind
+                FROM dispatch_queue
+                WHERE status = 'pending'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            job_id = row["id"]
+            self._conn.execute(
+                "UPDATE dispatch_queue SET status = 'active', started_at = ? WHERE id = ?",
+                (ts, job_id),
+            )
+            self._conn.commit()
+        return {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "sender": row["sender"],
+            "body": row["body"],
+            "targets": json.loads(row["targets_json"]),
+            "task": json.loads(row["task_json"]) if row["task_json"] else None,
+            "route_source": row["route_source"],
+            "requested_target": row["requested_target"],
+            "dispatcher_action": row["dispatcher_action"],
+            "work_dir": row["work_dir"],
+            "message_id": row["message_id"],
+            "batch_ids": json.loads(row["batch_ids_json"]) if row["batch_ids_json"] else [],
+            "message_kind": row["message_kind"],
+            "status": "active",
+            "started_at": ts,
+        }
+
+    def complete_dispatch(
+        self, job_id: int, status: str = "done", error: str | None = None
+    ) -> None:
+        """Mark a dispatch job as done or failed."""
+        ts = utc_now()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE dispatch_queue SET status = ?, completed_at = ?, error = ? WHERE id = ?",
+                (status, ts, error, job_id),
+            )
+            self._conn.commit()
+
+    def queue_depth(self) -> int:
+        """Count of pending dispatch jobs."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS cnt FROM dispatch_queue WHERE status = 'pending'"
+            ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def active_dispatch_count(self) -> int:
+        """Count of currently active (in-flight) dispatch jobs."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS cnt FROM dispatch_queue WHERE status = 'active'"
+            ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def recover_stale_active(self, max_age_seconds: int = 600) -> int:
+        """Reset active dispatch jobs older than max_age_seconds back to pending."""
+        cutoff = time.time() - max_age_seconds
+        cutoff_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cutoff))
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE dispatch_queue
+                SET status = 'pending', started_at = NULL
+                WHERE status = 'active' AND started_at < ?
+                """,
+                (cutoff_ts,),
+            )
+            self._conn.commit()
+        return cur.rowcount
 
 
 def import_transcript_to_event_store(event_store: EventStore, transcript_path: Path | str) -> int:
