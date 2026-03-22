@@ -516,17 +516,27 @@ function startPolling() {
           break;
         case "route_state":
           if (latestState) {
-            const { type: _t, route, ...rest } = data;
+            const { type: _t, ...rest } = data;
             latestState.routing = { ...latestState.routing, ...rest };
             renderRouting(latestState);
-            // Fire living engine room signals
-            if (route?.target) {
-              if (route.tx_state === "active" || route.status === "transmitting") {
-                fireSignalLight(route.target, "tx");
+            // Fire living engine room signals — route data is nested under rest.route
+            const rTarget = rest.route?.target;
+            if (rTarget) {
+              const txLights = document.querySelectorAll(`.sig-light--tx[data-sig-agent="${rTarget}"]`);
+              if (rest.route?.tx_state === "active" || rest.route?.status === "transmitting") {
+                txLights.forEach(el => el.classList.add("active"));
+                fireSignalLight(rTarget, "tx");
                 pulseHub();
+              } else {
+                txLights.forEach(el => el.classList.remove("active"));
               }
-              if (route.rx_state === "received") {
-                fireSignalLight(route.target, "rx");
+
+              const rxLights = document.querySelectorAll(`.sig-light--rx[data-sig-agent="${rTarget}"]`);
+              if (rest.route?.rx_state === "received") {
+                rxLights.forEach(el => el.classList.add("active"));
+                fireSignalLight(rTarget, "rx");
+              } else {
+                rxLights.forEach(el => el.classList.remove("active"));
               }
             }
           }
@@ -733,6 +743,15 @@ function renderEngines(agents) {
     control.className = `control control--${state}`;
     control.dataset.agent = name;
     control.dataset.pressure = p.level;
+
+    // Find the active route for this agent
+    const agentRoute = latestState?.routing?.active?.find(route => route.target === name);
+    const isTxActive = agentRoute?.tx_state === "active";
+    const isRxActive = agentRoute?.rx_state === "received";
+
+    const txActiveClass = isTxActive ? " active" : "";
+    const rxActiveClass = isRxActive ? " active" : "";
+
     control.innerHTML = `
       <div class="control__header">
         <div>
@@ -749,9 +768,9 @@ function renderEngines(agents) {
           <span>${stateLabels[state] || state}</span>
           <span>${(payload.mirror_view || payload.mirror_mode || "log").toUpperCase()}</span>
           <span class="sig-lights" aria-hidden="true">
-            <span class="sig-light sig-light--tx" data-sig-agent="${name}"></span>
+            <span class="sig-light sig-light--tx${txActiveClass}" data-sig-agent="${name}"></span>
             <span class="sig-label">TX</span>
-            <span class="sig-light sig-light--rx" data-sig-agent="${name}"></span>
+            <span class="sig-light sig-light--rx${rxActiveClass}" data-sig-agent="${name}"></span>
             <span class="sig-label">RX</span>
           </span>
         </div>

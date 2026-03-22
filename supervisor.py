@@ -851,6 +851,7 @@ class RuntimeSupervisor:
                 summary = ""
 
         if summary:
+            relay.write_text(self.workspace["log_path"], "") # Clear existing transcript
             relay.append_tagged_entry(
                 self.workspace["log_path"], "SYSTEM",
                 f"[COMPACT SUMMARY] {summary}",
@@ -865,6 +866,8 @@ class RuntimeSupervisor:
                 "questions, and next actions. Keep it under 120 words. This will replace the "
                 "working context for all agents."
             )
+            # Clear existing transcript before injecting new context
+            relay.write_text(self.workspace["log_path"], "")
             # Write directly to transcript — skip socket dispatch to avoid
             # creating a task and broadcasting to all agents (BUG-8).
             relay.append_tagged_entry(self.workspace["log_path"], "SYSTEM", summary_request)

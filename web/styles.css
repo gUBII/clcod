@@ -68,6 +68,7 @@ body::before {
   border: 1px solid var(--line);
   border-radius: 16px;
   background: rgba(4, 10, 18, 0.72);
+  z-index: 9999;
 }
 
 .chrome__left,
@@ -2092,6 +2093,17 @@ button {
   box-shadow: 0 0 6px var(--ready);
   animation: sig-flash-rx 2s ease-out forwards;
 }
+
+.sig-light--tx.active {
+  background: var(--blue); /* Blue for TX active */
+  opacity: 1;
+}
+
+.sig-light--rx.active {
+  background: var(--ready); /* Green for RX active */
+  opacity: 1;
+}
+
 
 @keyframes sig-flash-tx {
   0%   { opacity: 1; box-shadow: 0 0 8px var(--warn); }
