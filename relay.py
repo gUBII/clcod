@@ -919,6 +919,49 @@ def emit_event(event_callback: EventCallback | None, event: dict[str, Any]) -> N
     event_callback(event)
 
 
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def truncate_text(value: str, limit: int = 160) -> str:
+    compact = " ".join(str(value).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def build_route_payload(
+    *,
+    sender: str,
+    target: str,
+    body: str,
+    task: dict[str, Any] | None,
+    source: str,
+    requested_target: str | None = None,
+    dispatcher_action: str | None = None,
+    message_kind: str | None = None,
+    batch_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    is_task = body.strip().lower().startswith("/task")
+    request_text = task_request_from_message(body) if is_task else body.strip()
+    route_title = task.get("title") if task else truncate_text(request_text or body.strip(), 120)
+    started_at = utc_now()
+    return {
+        "route_id": f"route-{uuid.uuid4().hex[:12]}",
+        "task_id": task.get("id") if task else None,
+        "task_title": route_title or "Untitled route",
+        "body_preview": truncate_text(request_text or body.strip()),
+        "sender": sender,
+        "target": target,
+        "source": source,
+        "requested_target": requested_target,
+        "dispatcher_action": dispatcher_action,
+        "message_kind": message_kind or ("task" if is_task else "message"),
+        "batch_ids": batch_ids or [],
+        "started_at": started_at,
+    }
+
+
 def resolve_preseed_session_id(agent: dict[str, Any]) -> str | None:
     raw_value = agent.get("preseed_session_id")
     if isinstance(raw_value, str):
@@ -1156,8 +1199,26 @@ async def route_to(
     sessions_path: Path,
     session_lock: asyncio.Lock,
     event_callback: EventCallback | None = None,
+    route: dict[str, Any] | None = None,
 ) -> None:
     name = agent["name"]
+    route_started_at = route.get("started_at", utc_now()) if route else None
+    if route:
+        emit_event(
+            event_callback,
+            {
+                "type": "route_state",
+                **route,
+                "started_at": route_started_at,
+                "updated_at": route_started_at,
+                "completed_at": None,
+                "status": "transmitting",
+                "tx_state": "active",
+                "rx_state": "waiting",
+                "last_error": None,
+                "reply_chars": 0,
+            },
+        )
     emit_event(
         event_callback,
         {"type": "agent_state", "agent": name, "state": "warming", "last_error": None},
@@ -1179,6 +1240,24 @@ async def route_to(
             )
         else:
             relay_log(f"{name}: empty reply")
+        if route:
+            completed_at = msg["ts"] if result.reply else utc_now()
+            emit_event(
+                event_callback,
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": completed_at,
+                    "completed_at": completed_at,
+                    "status": "complete",
+                    "tx_state": "sent",
+                    "rx_state": "received" if result.reply else "empty",
+                    "last_error": None,
+                    "reply_chars": len(result.reply or ""),
+                    "session_id": result.session_id,
+                },
+            )
         emit_event(
             event_callback,
             {
@@ -1193,6 +1272,23 @@ async def route_to(
         )
     except FileNotFoundError:
         relay_log(f"{name}: command not found: {agent['cmd']}")
+        if route:
+            failed_at = utc_now()
+            emit_event(
+                event_callback,
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": failed_at,
+                    "completed_at": failed_at,
+                    "status": "error",
+                    "tx_state": "error",
+                    "rx_state": "error",
+                    "last_error": f"command not found: {agent['cmd']}",
+                    "reply_chars": 0,
+                },
+            )
         emit_event(
             event_callback,
             {
@@ -1204,6 +1300,23 @@ async def route_to(
         )
     except asyncio.TimeoutError:
         relay_log(f"{name}: timed out after {agent['timeout']}s")
+        if route:
+            failed_at = utc_now()
+            emit_event(
+                event_callback,
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": failed_at,
+                    "completed_at": failed_at,
+                    "status": "error",
+                    "tx_state": "sent",
+                    "rx_state": "error",
+                    "last_error": f"timed out after {agent['timeout']}s",
+                    "reply_chars": 0,
+                },
+            )
         emit_event(
             event_callback,
             {
@@ -1215,6 +1328,23 @@ async def route_to(
         )
     except Exception as exc:
         relay_log(f"{name}: error: {exc}")
+        if route:
+            failed_at = utc_now()
+            emit_event(
+                event_callback,
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": failed_at,
+                    "completed_at": failed_at,
+                    "status": "error",
+                    "tx_state": "sent",
+                    "rx_state": "error",
+                    "last_error": str(exc),
+                    "reply_chars": 0,
+                },
+            )
         emit_event(
             event_callback,
             {
@@ -1509,6 +1639,25 @@ async def run_relay(
                     "source_message": body,
                 }
 
+            route_source = "broadcast"
+            if explicit_target and explicit_target in valid_agent_names:
+                route_source = "mention"
+            elif dispatcher_decision is not None:
+                route_source = "dispatcher"
+
+            route_payloads = {
+                agent["name"]: build_route_payload(
+                    sender=sender,
+                    target=agent["name"],
+                    body=body,
+                    task=task,
+                    source=route_source,
+                    requested_target=requested_target,
+                    dispatcher_action=dispatcher_decision.get("action") if dispatcher_decision else None,
+                )
+                for agent in dispatch_targets
+            }
+
             prompts = {
                 agent["name"]: build_agent_prompt(
                     agent_name=agent["name"],
@@ -1542,6 +1691,7 @@ async def run_relay(
                             sessions_path,
                             session_lock,
                             event_callback,
+                            route_payloads[agent["name"]],
                         )
                         for agent in dispatch_targets
                     ]
@@ -1618,6 +1768,18 @@ async def run_relay(
                     )
                     for agent in enabled_agents
                 }
+                route_payloads = {
+                    agent["name"]: build_route_payload(
+                        sender="SYSTEM",
+                        target=agent["name"],
+                        body=batch_body,
+                        task={"title": f"Batch tasks ({len(batch_ids)})", "id": None},
+                        source="batch",
+                        message_kind="batch",
+                        batch_ids=batch_ids,
+                    )
+                    for agent in enabled_agents
+                }
 
                 if acquire_lock(lock_path, f"relay-batch:{os.getpid()}", lock_ttl):
                     try:
@@ -1643,6 +1805,7 @@ async def run_relay(
                                     sessions_path,
                                     session_lock,
                                     event_callback,
+                                    route_payloads[agent["name"]],
                                 )
                                 for agent in enabled_agents
                             ]
