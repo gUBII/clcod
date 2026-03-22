@@ -1,6 +1,6 @@
 # clcod
 
-`clcod` is a local-first multi-agent workspace that keeps Claude, Codex, Gemini, and a human operator inside one shared transcript while exposing an app-style control surface, real runtime state, and a truthful tmux debug mirror. The system relies on a local Ollama-powered routing layer (`dispatcher.py`) to triage, route, or absorb messages before passing them to cloud agents.
+`clcod` is a local-first multi-agent workspace that orchestrates multiple AI agents and a human operator inside one shared transcript while exposing an app-style control surface, real runtime state, and a truthful tmux debug mirror. The system relies on a local Ollama-powered routing layer (`dispatcher.py`) to triage, route, or absorb messages before passing them to cloud agents.
 
 ## Dashboard Snapshot
 

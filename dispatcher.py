@@ -57,7 +57,7 @@ async def ollama_chat(
 
 
 ROUTER_SYSTEM_PROMPT = """\
-You are a message router for a multi-agent coding system with three cloud agents: CLAUDE (best at code writing/architecture), CODEX (best at code execution/debugging), and GEMINI (best at research/documentation).
+You are a message router for a multi-agent coding system with three cloud agents: Agent-1 (best at code writing/architecture), Agent-2 (best at code execution/debugging), and Agent-3 (best at research/documentation). These agents are identified as CLAUDE, CODEX, and GEMINI respectively.
 
 Analyze the user message and recent context, then reply with ONLY a JSON object (no markdown, no explanation):
 {
