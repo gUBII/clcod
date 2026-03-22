@@ -247,6 +247,10 @@ body::before {
   font-size: 1.1rem;
 }
 
+.panel__header h3 {
+  font-size: clamp(0.82rem, 1.2vw, 0.95rem);
+}
+
 .chrome__status {
   padding: 6px 12px;
   border-radius: 999px;
@@ -344,12 +348,29 @@ button {
   overflow: hidden;
 }
 
-.hero,
-.workspace__header {
+.hero {
   display: flex;
   justify-content: space-between;
   gap: 10px;
   align-items: end;
+}
+
+.workspace__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.workspace__header-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.workspace__header-left .hero__eyebrow {
+  margin: 0;
 }
 
 .hero__meta,
@@ -364,9 +385,41 @@ button {
 
 .workspace__tachs {
   display: flex;
-  gap: 12px;
-  margin-top: 8px;
+  gap: 10px;
   align-items: center;
+}
+
+/* ── Engine Control Strip ─────────────────────────────── */
+
+.engine-strip {
+  flex-shrink: 0;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(circle at top left, rgba(140, 199, 255, 0.06), transparent 34%),
+    linear-gradient(180deg, rgba(10, 18, 29, 0.94), rgba(6, 13, 22, 0.92));
+  backdrop-filter: blur(20px);
+  box-shadow: var(--shadow);
+}
+
+.engine-strip__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.engine-strip__header h3 {
+  margin: 0;
+  font-size: clamp(0.82rem, 1.2vw, 0.95rem);
+}
+
+.engine-strip__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .routing-stage {
@@ -768,19 +821,19 @@ button {
 
 .control__tach {
   position: relative;
-  width: 120px;
-  height: 60px;
+  width: 80px;
+  height: 40px;
   overflow: hidden;
   flex-shrink: 0;
-  margin-top: 8px;
+  margin-top: 4px;
 }
 
 .tach__dial--sm {
   position: absolute;
   top: 0; left: 0;
-  width: 120px; height: 120px;
+  width: 80px; height: 80px;
   border-radius: 50%;
-  border: 8px solid rgba(255, 255, 255, 0.04);
+  border: 6px solid rgba(255, 255, 255, 0.04);
   box-sizing: border-box;
   background: conic-gradient(
     from -90deg at 50% 100%,
@@ -789,13 +842,13 @@ button {
     rgba(255, 97, 120, 0.12) 135deg 180deg,
     transparent 180deg
   );
-  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 46px, black 48px);
+  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 30px, black 32px);
 }
 
 .tach__needle--sm {
   position: absolute;
   bottom: 0; left: 50%;
-  width: 2px; height: 52px;
+  width: 2px; height: 34px;
   background: var(--needle-color, var(--hot));
   transform-origin: bottom center;
   transition: transform 0.6s cubic-bezier(0.17, 0.67, 0.2, 1.01);
@@ -817,7 +870,7 @@ button {
 .tach__fuel-arc--sm {
   position: absolute;
   top: 0; left: 0;
-  width: 120px; height: 120px;
+  width: 80px; height: 80px;
   border-radius: 50%;
   box-sizing: border-box;
   background: conic-gradient(
@@ -827,19 +880,19 @@ button {
     rgba(255, 97, 120, 0.35) var(--fuel-angle, 180deg),
     transparent var(--fuel-angle, 180deg)
   );
-  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 42px, black 44px, black 48px, transparent 50px);
-  mask: radial-gradient(circle at 50% 100%, transparent 42px, black 44px, black 48px, transparent 50px);
+  -webkit-mask: radial-gradient(circle at 50% 100%, transparent 26px, black 28px, black 32px, transparent 34px);
+  mask: radial-gradient(circle at 50% 100%, transparent 26px, black 28px, black 32px, transparent 34px);
   transition: --fuel-angle 0.6s ease;
   pointer-events: none;
 }
 
 .tach__mark--sm {
   position: absolute;
-  bottom: 2px;
+  bottom: 1px;
   width: 100%;
   text-align: center;
   font-family: var(--font-mono);
-  font-size: 0.6rem;
+  font-size: 0.52rem;
   letter-spacing: 0.08em;
   color: var(--muted);
   opacity: 0.8;
@@ -995,11 +1048,19 @@ button {
 
 .workspace__grid {
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr) clamp(240px, 22vw, 320px);
   grid-template-rows: minmax(0, 1fr);
   gap: 10px;
   flex: 1 1 0;
   min-height: 0;
+}
+
+.workspace__primary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .panel {
@@ -1013,7 +1074,8 @@ button {
   flex-direction: column;
 }
 
-.panel--status .status-grid {
+.panel--status .status-grid,
+.panel--routes .routes__body {
   overflow-y: auto;
   min-height: 0;
   flex: 1 1 0;
@@ -1024,7 +1086,8 @@ button {
   justify-content: space-between;
   align-items: baseline;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
 }
 
 .panel__header h3 {
@@ -1043,12 +1106,15 @@ button {
   background:
     radial-gradient(circle at top right, rgba(140, 199, 255, 0.09), transparent 32%),
     rgba(255, 255, 255, 0.03);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .control__header {
   display: flex;
   justify-content: space-between;
-  gap: 14px;
+  gap: 8px;
   align-items: start;
 }
 
@@ -1062,42 +1128,44 @@ button {
 
 .control__name {
   font-weight: 700;
-  font-size: 0.88rem;
+  font-size: clamp(0.78rem, 1vw, 0.88rem);
   letter-spacing: 0.08em;
 }
 
 .control__detail,
 .transcript__empty {
-  margin-top: 4px;
+  margin-top: 3px;
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: clamp(0.64rem, 0.85vw, 0.72rem);
 }
 
 .control__status {
-  display: grid;
-  gap: 8px;
-  justify-items: end;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .control__status span {
-  padding: 6px 10px;
+  padding: 4px 8px;
   border-radius: 999px;
-  font-size: 0.72rem;
+  font-size: clamp(0.62rem, 0.8vw, 0.72rem);
   font-family: var(--font-mono);
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.1em;
   background: rgba(255, 255, 255, 0.07);
+  white-space: nowrap;
 }
 
 .control__section {
-  margin-top: 10px;
+  margin-top: 8px;
 }
 
 .control__label {
-  margin-bottom: 10px;
-  font-size: 0.76rem;
-  letter-spacing: 0.16em;
+  margin-bottom: 6px;
+  font-size: clamp(0.64rem, 0.85vw, 0.74rem);
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--muted);
 }
@@ -1105,16 +1173,16 @@ button {
 .chip-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 6px;
 }
 
 .chip {
-  padding: 10px 14px;
+  padding: 6px 10px;
   border-radius: 999px;
   border: 1px solid rgba(140, 199, 255, 0.16);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: clamp(0.68rem, 0.9vw, 0.78rem);
   letter-spacing: 0.04em;
   text-transform: none;
   background: rgba(11, 19, 31, 0.9);
@@ -1137,24 +1205,35 @@ button {
 
 .fuel-gauge {
   width: 100%;
-  height: 8px;
+  height: 6px;
   background: rgba(255, 255, 255, 0.08);
-  border-radius: 4px;
+  border-radius: 3px;
   overflow: hidden;
-  margin: 6px 0 4px;
+  margin: 4px 0 3px;
 }
 .fuel-gauge__bar {
   height: 100%;
-  border-radius: 4px;
+  border-radius: 3px;
   transition: width 0.6s ease, background 0.6s ease;
 }
 
 .control__message {
-  min-height: 18px;
-  margin: 16px 0 0;
+  min-height: 14px;
+  margin: 8px 0 0;
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: clamp(0.66rem, 0.85vw, 0.76rem);
+}
+
+.control__section--actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.control__section--actions .compact-btn {
+  font-size: clamp(0.66rem, 0.85vw, 0.76rem);
+  padding: 3px 8px;
 }
 
 .chat-bar-wrap {
@@ -1274,6 +1353,7 @@ button {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  flex: 1 1 0;
 }
 
 .transcript {
@@ -1281,31 +1361,34 @@ button {
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  gap: 14px;
+  gap: clamp(12px, 1.5vw, 18px);
   align-content: start;
+  padding-right: 4px;
 }
 
 .message {
-  padding: 16px 18px;
-  border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(255, 255, 255, 0.025);
+  padding: clamp(14px, 2vw, 20px) clamp(16px, 2vw, 22px);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .message__header {
-  margin-bottom: 10px;
-  font-size: 0.82rem;
-  letter-spacing: 0.12em;
+  margin-bottom: clamp(6px, 1vw, 10px);
+  font-size: clamp(0.74rem, 1.1vw, 0.84rem);
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--warn);
+  font-weight: 600;
 }
 
 .message__time {
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: clamp(0.66rem, 0.9vw, 0.74rem);
   letter-spacing: 0.06em;
   margin-left: 0.5em;
   text-transform: none;
+  font-weight: 400;
 }
 
 .message__body {
@@ -1313,9 +1396,10 @@ button {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--font-mono);
-  font-size: 0.88rem;
-  line-height: 1.5;
+  font-size: clamp(0.82rem, 1.2vw, 0.94rem);
+  line-height: 1.65;
   color: var(--text);
+  letter-spacing: 0.01em;
 }
 
 @keyframes pulse {
@@ -1356,20 +1440,40 @@ button {
 
 @media (max-width: 1200px) {
   .workspace__grid {
-    grid-template-columns: 200px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) clamp(200px, 20vw, 280px);
   }
-  .panel--status {
-    display: none;
+  .engine-strip__grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
   }
 }
 
 @media (max-width: 980px) {
-  .engines,
+  .engines {
+    grid-template-columns: 1fr;
+  }
+
   .workspace__grid {
     grid-template-columns: 1fr;
   }
-  .panel--tasks {
-    display: none;
+
+  .engine-strip__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .panel--tasks .task-board {
+    grid-template-columns: 1fr;
+  }
+
+  .task-board__col + .task-board__col {
+    border-left: none;
+    padding-left: 0;
+    border-top: 1px solid var(--line);
+    padding-top: 8px;
+  }
+
+  .panel--routes {
+    max-height: 200px;
   }
 
   .hero,
@@ -1397,21 +1501,31 @@ button {
 
 /* ── Task Board ────────────────────────────────────────── */
 
+.panel--tasks {
+  flex-shrink: 0;
+  max-height: clamp(180px, 28vh, 280px);
+}
+
 .panel--tasks .task-board {
   flex: 1 1 0;
   overflow-y: auto;
   min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .task-board__col + .task-board__col {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+  border-left: 1px solid var(--line);
+  padding-left: 10px;
 }
 
 .task-board__col-title {
   margin: 0 0 6px;
-  font-size: 0.62rem;
+  font-size: clamp(0.62rem, 0.8vw, 0.72rem);
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--muted);
@@ -1423,12 +1537,12 @@ button {
   border-radius: 8px;
   border: 1px solid var(--line);
   background: var(--panel);
-  font-size: 0.78rem;
+  font-size: clamp(0.74rem, 1vw, 0.82rem);
 }
 
 .task-card__id {
   display: inline-block;
-  font-size: 0.65rem;
+  font-size: clamp(0.6rem, 0.8vw, 0.68rem);
   color: var(--muted);
   font-weight: 600;
   margin-bottom: 2px;
@@ -1439,18 +1553,81 @@ button {
   margin: 0;
   color: var(--text);
   font-weight: 500;
+  line-height: 1.35;
 }
 
 .task-card__meta {
   margin: 3px 0 0;
   color: var(--muted);
-  font-size: 0.68rem;
+  font-size: clamp(0.62rem, 0.8vw, 0.7rem);
 }
 
 .task-card--pending { border-left: 3px solid var(--warn); }
 .task-card--assigned { border-left: 3px solid var(--blue); }
 .task-card--in_progress { border-left: 3px solid var(--blue); }
 .task-card--done { border-left: 3px solid var(--ready); opacity: 0.65; }
+
+/* ── Route Bus (side panel) ───────────────────────────── */
+
+.panel--routes {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel--routes .routes__body {
+  overflow-y: auto;
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.panel--routes .route-groups {
+  gap: 10px;
+}
+
+.panel--routes .route-group__grid {
+  grid-template-columns: 1fr;
+}
+
+.panel--routes .route-lane {
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.panel--routes .route-lane__title {
+  font-size: clamp(0.72rem, 0.9vw, 0.82rem);
+}
+
+.panel--routes .route-lane__detail {
+  font-size: clamp(0.64rem, 0.8vw, 0.72rem);
+}
+
+.panel--routes .route-lane__flow {
+  margin-top: 8px;
+  gap: 6px;
+}
+
+.panel--routes .route-node {
+  min-width: 38px;
+  padding: 5px 7px;
+  font-size: clamp(0.56rem, 0.7vw, 0.62rem);
+}
+
+.panel--routes .route-pill {
+  padding: 4px 7px;
+  font-size: clamp(0.56rem, 0.7vw, 0.62rem);
+}
+
+.panel--routes .route-lane__meta {
+  margin-top: 8px;
+  font-size: clamp(0.56rem, 0.7vw, 0.62rem);
+  gap: 4px;
+}
+
+.panel--routes .route-lane__meta span {
+  padding: 3px 6px;
+}
 
 /* ── Dispatcher Bar ────────────────────────────────────── */
 
@@ -1715,4 +1892,14 @@ button {
 
 [data-theme="light"] .modal-log {
   background: #f0f2f5;
+}
+
+[data-theme="light"] .engine-strip {
+  background:
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.04), transparent 34%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(240, 242, 245, 0.96));
+}
+
+[data-theme="light"] .panel--routes .route-lane {
+  background: rgba(255, 255, 255, 0.6);
 }

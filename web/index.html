@@ -91,9 +91,8 @@
 
         <section class="workspace hidden" id="workspace">
           <div class="workspace__header">
-            <div>
+            <div class="workspace__header-left">
               <p class="hero__eyebrow">Live Workspace</p>
-              <h2>Transcript, engine control, and room input</h2>
               <div class="workspace__tachs" id="workspaceTachs"></div>
             </div>
             <div class="workspace__meta">
@@ -105,54 +104,58 @@
             </div>
           </div>
 
-          <section class="routing-stage" id="routingStage">
-            <div class="routing-stage__header">
+          <section class="engine-strip" id="engineStrip">
+            <div class="engine-strip__header">
               <div>
-                <p class="hero__eyebrow">Route Bus</p>
-                <h3>Dispatcher to engine traffic</h3>
+                <p class="hero__eyebrow">Engine Control</p>
+                <h3>Model, effort, and fuel across all engines</h3>
               </div>
-              <span class="panel__hint">TXX &rarr; RXX live route state</span>
+              <span class="panel__hint">live settings &middot; 3 agents</span>
             </div>
-            <p class="routing-stage__empty" id="routingEmpty">No routed traffic yet.</p>
-            <div class="route-groups" id="routeLanes"></div>
+            <div id="statusGrid" class="engine-strip__grid"></div>
           </section>
 
           <div class="workspace__grid">
-            <section class="panel panel--tasks">
-              <div class="panel__header">
-                <h3>Task Board</h3>
-                <span class="panel__hint">pending &middot; active &middot; done</span>
-              </div>
-              <div id="taskBoard" class="task-board">
-                <div class="task-board__col" data-status="pending">
-                  <p class="task-board__col-title">Pending</p>
-                  <div class="task-board__list" id="tasksPending"></div>
+            <div class="workspace__primary">
+              <section class="panel panel--tasks">
+                <div class="panel__header">
+                  <h3>Task Board</h3>
+                  <span class="panel__hint">pending &middot; active &middot; done</span>
                 </div>
-                <div class="task-board__col" data-status="in_progress">
-                  <p class="task-board__col-title">Active</p>
-                  <div class="task-board__list" id="tasksActive"></div>
+                <div id="taskBoard" class="task-board">
+                  <div class="task-board__col" data-status="pending">
+                    <p class="task-board__col-title">Pending</p>
+                    <div class="task-board__list" id="tasksPending"></div>
+                  </div>
+                  <div class="task-board__col" data-status="in_progress">
+                    <p class="task-board__col-title">Active</p>
+                    <div class="task-board__list" id="tasksActive"></div>
+                  </div>
+                  <div class="task-board__col" data-status="done">
+                    <p class="task-board__col-title">Done</p>
+                    <div class="task-board__list" id="tasksDone"></div>
+                  </div>
                 </div>
-                <div class="task-board__col" data-status="done">
-                  <p class="task-board__col-title">Done</p>
-                  <div class="task-board__list" id="tasksDone"></div>
-                </div>
-              </div>
-            </section>
+              </section>
 
-            <section class="panel panel--transcript">
-              <div class="panel__header">
-                <h3>Transcript</h3>
-                <span class="panel__hint">latest room traffic</span>
-              </div>
-              <div id="transcript" class="transcript"></div>
-            </section>
+              <section class="panel panel--transcript">
+                <div class="panel__header">
+                  <h3>Transcript</h3>
+                  <span class="panel__hint">latest room traffic</span>
+                </div>
+                <div id="transcript" class="transcript"></div>
+              </section>
+            </div>
 
-            <section class="panel panel--status">
+            <section class="panel panel--routes" id="routingStage">
               <div class="panel__header">
-                <h3>Engine Control</h3>
-                <span class="panel__hint">model and effort live settings</span>
+                <h3>Route Bus</h3>
+                <span class="panel__hint">TXX &rarr; RXX live</span>
               </div>
-              <div id="statusGrid" class="status-grid"></div>
+              <div class="routes__body">
+                <p class="routing-stage__empty" id="routingEmpty">No routed traffic yet.</p>
+                <div class="route-groups" id="routeLanes"></div>
+              </div>
             </section>
           </div>
 
