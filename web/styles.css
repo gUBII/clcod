@@ -1915,3 +1915,280 @@ button {
 [data-theme="light"] .panel--routes .route-lane {
   background: rgba(255, 255, 255, 0.6);
 }
+
+/* ═══════════════════════════════════════════════════════
+   LIVING ENGINE ROOM — Signal System
+   ═══════════════════════════════════════════════════════ */
+
+/* ── Needle: disable CSS transition, JS inertia handles it ── */
+.tach__needle,
+.tach__needle--sm {
+  transition: none;
+}
+
+/* ── Signal Bus (hub rail between header and grid) ───── */
+.signal-bus {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  height: 26px;
+  margin-bottom: 6px;
+  position: relative;
+  align-items: center;
+}
+
+.signal-bus::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: calc(100% / 6);
+  right: calc(100% / 6);
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(140, 199, 255, 0.12) 12%,
+    rgba(140, 199, 255, 0.12) 88%,
+    transparent
+  );
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.signal-bus__col {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+/* Vertical stub connector dropping toward the card below */
+.signal-bus__col::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  bottom: -7px;
+  left: 50%;
+  width: 1px;
+  background: rgba(140, 199, 255, 0.07);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.signal-bus__node {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1px solid rgba(140, 199, 255, 0.16);
+  background: rgba(8, 14, 22, 0.9);
+  position: relative;
+  z-index: 1;
+}
+
+.signal-bus__hub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px 2px 4px;
+  border-radius: 999px;
+  border: 1px solid rgba(140, 199, 255, 0.18);
+  background: rgba(5, 10, 18, 0.92);
+  z-index: 1;
+  position: relative;
+  cursor: default;
+  user-select: none;
+}
+
+.signal-bus__hub-core {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(140, 199, 255, 0.55);
+  box-shadow: 0 0 5px rgba(140, 199, 255, 0.35);
+  flex-shrink: 0;
+}
+
+.signal-bus__hub-label {
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.signal-bus__hub.pulsing .signal-bus__hub-core {
+  animation: hub-pulse 0.65s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes hub-pulse {
+  0%   { transform: scale(1);   box-shadow: 0 0 5px rgba(140, 199, 255, 0.35); }
+  30%  { transform: scale(2.4); box-shadow: 0 0 14px rgba(140, 199, 255, 0.8), 0 0 28px rgba(140, 199, 255, 0.15); }
+  100% { transform: scale(1);   box-shadow: 0 0 5px rgba(140, 199, 255, 0.35); }
+}
+
+/* ── Wire packet (spawned dynamically, travels hub → card) ── */
+.signal-packet-el {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 10px;
+  transform: translateX(-50%) translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+  border-radius: 1px;
+  z-index: 2;
+  background: linear-gradient(180deg, transparent, var(--warn), transparent);
+}
+
+.signal-packet-el.traveling {
+  animation: packet-travel 0.42s cubic-bezier(0.25, 0, 0.7, 1) forwards;
+}
+
+@keyframes packet-travel {
+  0%   { opacity: 0; transform: translateX(-50%) translateY(-50%); }
+  12%  { opacity: 1; }
+  80%  { opacity: 0.7; }
+  100% { opacity: 0; transform: translateX(-50%) translateY(320%); }
+}
+
+/* ── TX / RX Signal Lights ───────────────────────────── */
+.sig-lights {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.sig-light {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.25;
+}
+
+.sig-label {
+  font-family: var(--font-mono);
+  font-size: 0.48rem;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  opacity: 0.5;
+  text-transform: uppercase;
+}
+
+.sig-light--tx.firing {
+  background: var(--warn);
+  opacity: 1;
+  box-shadow: 0 0 6px var(--warn);
+  animation: sig-flash-tx 2s ease-out forwards;
+}
+
+.sig-light--rx.firing {
+  background: var(--ready);
+  opacity: 1;
+  box-shadow: 0 0 6px var(--ready);
+  animation: sig-flash-rx 2s ease-out forwards;
+}
+
+@keyframes sig-flash-tx {
+  0%   { opacity: 1; box-shadow: 0 0 8px var(--warn); }
+  15%  { opacity: 1; box-shadow: 0 0 12px var(--warn); }
+  100% { opacity: 0.25; box-shadow: none; background: var(--muted); }
+}
+
+@keyframes sig-flash-rx {
+  0%   { opacity: 1; box-shadow: 0 0 8px var(--ready); }
+  15%  { opacity: 1; box-shadow: 0 0 12px var(--ready); }
+  100% { opacity: 0.25; box-shadow: none; background: var(--muted); }
+}
+
+/* ── Control card route fire (top glow on TX, bottom on RX) ── */
+.control.route-fire-tx {
+  animation: card-fire-tx 0.9s ease-out forwards;
+}
+
+.control.route-fire-rx {
+  animation: card-fire-rx 0.9s ease-out forwards;
+}
+
+@keyframes card-fire-tx {
+  0%   { box-shadow: inset 0 2px 12px rgba(255, 196, 107, 0); }
+  20%  { box-shadow: inset 0 2px 16px rgba(255, 196, 107, 0.4); }
+  100% { box-shadow: inset 0 2px 12px rgba(255, 196, 107, 0); }
+}
+
+@keyframes card-fire-rx {
+  0%   { box-shadow: inset 0 -2px 12px rgba(112, 240, 194, 0); }
+  20%  { box-shadow: inset 0 -2px 16px rgba(112, 240, 194, 0.4); }
+  100% { box-shadow: inset 0 -2px 12px rgba(112, 240, 194, 0); }
+}
+
+/* ── Route lane smooth entry ─────────────────────────── */
+.route-lane {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+.route-lane--entering {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+/* ── Transcript message smooth entry ─────────────────── */
+.message--entering {
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+/* ── Idle heartbeat needle micro-jitter ──────────────── */
+.tach__needle.heartbeat,
+.tach__needle--sm.heartbeat {
+  animation: needle-heartbeat 3.5s ease-in-out infinite;
+}
+
+@keyframes needle-heartbeat {
+  0%, 100% { filter: brightness(1); }
+  50%      { filter: brightness(1.3); }
+}
+
+/* ── Signal bus node pulse (on fire) ─────────────────── */
+.signal-bus__node.firing {
+  animation: node-fire 0.5s ease-out forwards;
+}
+
+@keyframes node-fire {
+  0%   { background: rgba(255, 196, 107, 0); border-color: rgba(140, 199, 255, 0.16); }
+  25%  { background: rgba(255, 196, 107, 0.7); border-color: rgba(255, 196, 107, 0.6); box-shadow: 0 0 8px rgba(255, 196, 107, 0.4); }
+  100% { background: rgba(8, 14, 22, 0.9); border-color: rgba(140, 199, 255, 0.16); box-shadow: none; }
+}
+
+/* ── Light theme overrides for signal system ─────────── */
+[data-theme="light"] .signal-bus::before {
+  background: linear-gradient(90deg, transparent, rgba(37, 99, 235, 0.1) 12%, rgba(37, 99, 235, 0.1) 88%, transparent);
+}
+
+[data-theme="light"] .signal-bus__col::after {
+  background: rgba(37, 99, 235, 0.06);
+}
+
+[data-theme="light"] .signal-bus__hub {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(37, 99, 235, 0.15);
+}
+
+[data-theme="light"] .signal-bus__hub-core {
+  background: rgba(37, 99, 235, 0.5);
+  box-shadow: 0 0 5px rgba(37, 99, 235, 0.25);
+}
+
+[data-theme="light"] .signal-bus__node {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(37, 99, 235, 0.12);
+}
+
+[data-theme="light"] .sig-lights {
+  background: rgba(0, 0, 0, 0.06);
+}

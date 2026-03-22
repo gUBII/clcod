@@ -1527,6 +1527,41 @@ async def run_relay(
             requested_target = None
             dispatcher_decision = None
 
+            if explicit_target and explicit_target.upper() == "DISPATCHER":
+                # Direct conversation with the dispatcher router model
+                stripped_body = strip_target_prefix(body)
+                relay_log(f"[{sender}] @DISPATCHER direct query: {stripped_body[:80]}")
+                if dispatch_config.get("enabled"):
+                    try:
+                        decision = await dispatcher_mod.classify_message(stripped_body, context, dispatch_config)
+                        action = decision.get("action", "route")
+                        targets = decision.get("targets", [])
+                        task_type = decision.get("task_type", "")
+                        priority = decision.get("priority", "")
+                        reply_text = decision.get("reply") or (
+                            f"I would route this to: {', '.join(targets)}. "
+                            f"Task type: {task_type}. Priority: {priority}."
+                        )
+                        msg = await append_reply(write_lock, log_path, "DISPATCHER", reply_text)
+                        emit_event(event_callback, {
+                            "type": "transcript",
+                            "last_speaker": "DISPATCHER",
+                            "last_updated_at": msg["ts"],
+                            "char_count": len(reply_text),
+                        })
+                        relay_log(f"dispatcher direct reply: {reply_text[:80]}")
+                    except Exception as exc:
+                        relay_log(f"dispatcher direct query failed: {exc}")
+                else:
+                    msg = await append_reply(write_lock, log_path, "DISPATCHER", "Dispatcher is disabled in config.")
+                    emit_event(event_callback, {
+                        "type": "transcript",
+                        "last_speaker": "DISPATCHER",
+                        "last_updated_at": msg["ts"],
+                        "char_count": 0,
+                    })
+                return
+
             if explicit_target:
                 # Explicit @mention: only route to that agent if it exists
                 if explicit_target in valid_agent_names:

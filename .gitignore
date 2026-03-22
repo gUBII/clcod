@@ -10,3 +10,10 @@ transcript-backup-*.txt
 auth_tokens.json
 owner
 profile.pdf
+
+# Testing & Node
+node_modules/
+playwright-report/
+test-results/
+shared-room/transcript-archived-*.jsonl
+shared-room/transcript.jsonl

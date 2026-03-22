@@ -62,6 +62,15 @@ let latestState = null;
 let lastSeenSeq = 0;
 let lastSeenRev = 0;
 
+/* ── Living Engine Room: signal system state ─────────── */
+const needleInertia = new Map();   // agentName → { current, target, velocity, damped }
+const needleEls = new Map();       // agentName → [HTMLElement]
+const agentColIndex = new Map();   // agentName → 0|1|2
+let needleRafId = null;
+let hubPulseTimer = 0;
+const signalHub = document.getElementById("signalHub");
+const signalBus = document.getElementById("signalBus");
+
 unlockForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   unlockError.hidden = true;
@@ -178,6 +187,51 @@ statusGrid.addEventListener("click", async (event) => {
   setControlMessage(agent, `${kind} set to ${option}.`);
 });
 
+
+
+/* ── Select dropdown change handler ─────────────────────────────────── */
+
+statusGrid.addEventListener("change", async (event) => {
+  const select = event.target.closest(".control-select[data-agent][data-kind]");
+  if (select) {
+    (async () => {
+    const agent = select.dataset.agent;
+    const kind = select.dataset.kind;
+    const option = select.value;
+    const payload = latestState?.agents?.[agent];
+
+    if (!payload) {
+      return;
+    }
+
+    // Build the value to send (account for disabled/not supported options)
+    if (option === "Not supported") {
+      return;
+    }
+
+    const body = {
+      selected_model: kind === "model" ? option : payload.selected_model,
+      selected_effort: kind === "effort" ? option : payload.selected_effort,
+    };
+
+    setControlMessage(agent, `Updating ${kind}...`);
+    const response = await fetch(`/api/agents/${agent}/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      setControlMessage(agent, "Update failed.");
+      return;
+    }
+
+    const result = await response.json();
+    renderState(result.state);
+    setControlMessage(agent, `${kind} set to ${option}.`);
+    })();
+  }
+});
 chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = String(senderName.value || "").trim();
@@ -211,7 +265,7 @@ chatForm.addEventListener("submit", async (event) => {
 
 /* ── @ mention popup ─────────────────────────────────── */
 
-const STATIC_MENTION_TARGETS = ["CLAUDE", "CODEX", "GEMINI"];
+const STATIC_MENTION_TARGETS = ["CLAUDE", "CODEX", "GEMINI", "DISPATCHER"];
 
 function getMentionTargets() {
   const agentNames = latestState?.agents ? Object.keys(latestState.agents).map(n => n.toUpperCase()) : [];
@@ -462,9 +516,19 @@ function startPolling() {
           break;
         case "route_state":
           if (latestState) {
-            const { type: _t, route: _route, ...rest } = data;
+            const { type: _t, route, ...rest } = data;
             latestState.routing = { ...latestState.routing, ...rest };
             renderRouting(latestState);
+            // Fire living engine room signals
+            if (route?.target) {
+              if (route.tx_state === "active" || route.status === "transmitting") {
+                fireSignalLight(route.target, "tx");
+                pulseHub();
+              }
+              if (route.rx_state === "received") {
+                fireSignalLight(route.target, "rx");
+              }
+            }
           }
           break;
         case "task_created":
@@ -612,11 +676,14 @@ function renderEngines(agents) {
   statusGrid.innerHTML = "";
   workspaceTachs.innerHTML = "";
 
+  let colIdx = 0;
   for (const [name, payload] of entries) {
+    agentColIndex.set(name, colIdx++);
     const state = payload.state || "starting";
     const p = computePressure(payload);
     const nColor = needleColor(p.level);
     const fuelAngle = (p.fuelPct / 100) * 180;
+    const isDamped = state === "error";
     const card = document.createElement("article");
     card.className = `engine engine--${state}`;
     card.dataset.pressure = p.level;
@@ -629,7 +696,7 @@ function renderEngines(agents) {
       <div class="engine__tach">
         <div class="tach__dial" style="--fuel-angle:${fuelAngle}deg"></div>
         <div class="tach__fuel-arc" style="--fuel-angle:${fuelAngle}deg"></div>
-        <div class="tach__needle" style="transform:translateX(-50%) rotate(${p.angle}deg);--needle-color:${nColor}"></div>
+        <div class="tach__needle" data-needle-agent="${name}" style="--needle-color:${nColor}"></div>
         <div class="tach__mark">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
       </div>
       <p class="engine__note">${stateNotes[state] || ""}</p>
@@ -646,6 +713,7 @@ function renderEngines(agents) {
     }
     previousStates.set(name, state);
     engineCards.appendChild(card);
+    setNeedleTarget(name, p.angle, isDamped);
 
     const htach = document.createElement("div");
     htach.className = `htach control--${state}`;
@@ -655,7 +723,7 @@ function renderEngines(agents) {
       <div class="control__tach">
         <div class="tach__dial tach__dial--sm" style="--fuel-angle:${fuelAngle}deg"></div>
         <div class="tach__fuel-arc tach__fuel-arc--sm" style="--fuel-angle:${fuelAngle}deg"></div>
-        <div class="tach__needle tach__needle--sm" style="transform:translateX(-50%) rotate(${p.angle}deg);--needle-color:${nColor}"></div>
+        <div class="tach__needle tach__needle--sm" data-needle-agent="${name}" style="--needle-color:${nColor}"></div>
         <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
       </div>
     `;
@@ -674,12 +742,18 @@ function renderEngines(agents) {
         <div class="control__tach">
           <div class="tach__dial tach__dial--sm" style="--fuel-angle:${fuelAngle}deg"></div>
           <div class="tach__fuel-arc tach__fuel-arc--sm" style="--fuel-angle:${fuelAngle}deg"></div>
-          <div class="tach__needle tach__needle--sm" style="transform:translateX(-50%) rotate(${p.angle}deg);--needle-color:${nColor}"></div>
+          <div class="tach__needle tach__needle--sm" data-needle-agent="${name}" style="--needle-color:${nColor}"></div>
           <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
         </div>
         <div class="control__status">
           <span>${stateLabels[state] || state}</span>
           <span>${(payload.mirror_view || payload.mirror_mode || "log").toUpperCase()}</span>
+          <span class="sig-lights" aria-hidden="true">
+            <span class="sig-light sig-light--tx" data-sig-agent="${name}"></span>
+            <span class="sig-label">TX</span>
+            <span class="sig-light sig-light--rx" data-sig-agent="${name}"></span>
+            <span class="sig-label">RX</span>
+          </span>
         </div>
       </div>
       <div class="control__section">
@@ -742,6 +816,9 @@ function renderEngines(agents) {
     `;
     statusGrid.appendChild(control);
   }
+
+  refreshNeedleRefs();
+  scheduleNeedleTick();
 }
 
 function renderChoiceButtons(agent, kind, options, selectedId) {
@@ -776,6 +853,157 @@ function setControlMessage(agent, message) {
   if (target) {
     target.textContent = message;
   }
+}
+
+/* ── Needle inertia engine (spring-damper model) ─────── */
+
+function setNeedleTarget(name, targetAngle, damped) {
+  let state = needleInertia.get(name);
+  if (!state) {
+    state = { current: targetAngle, target: targetAngle, velocity: 0, damped: !!damped };
+    needleInertia.set(name, state);
+  } else {
+    state.target = targetAngle;
+    state.damped = !!damped;
+  }
+  scheduleNeedleTick();
+}
+
+function scheduleNeedleTick() {
+  if (!needleRafId) {
+    needleRafId = requestAnimationFrame(tickNeedles);
+  }
+}
+
+function tickNeedles() {
+  needleRafId = null;
+  let anyActive = false;
+
+  for (const [name, state] of needleInertia) {
+    const delta = state.target - state.current;
+    const stiffness = state.damped ? 0.03 : 0.1;
+    state.velocity = state.velocity * 0.78 + delta * stiffness;
+    state.current += state.velocity;
+
+    if (Math.abs(state.velocity) < 0.04 && Math.abs(delta) < 0.1) {
+      state.current = state.target;
+      state.velocity = 0;
+    } else {
+      anyActive = true;
+    }
+
+    const angle = state.current;
+    const score = Math.round(((angle + 90) / 180) * 100);
+    const level = score > 70 ? "high" : score > 35 ? "mid" : "low";
+    const color = needleColor(level);
+
+    const els = needleEls.get(name);
+    if (els) {
+      for (const el of els) {
+        el.style.transform = `translateX(-50%) rotate(${angle}deg)`;
+        el.style.setProperty("--needle-color", color);
+      }
+    }
+  }
+
+  if (anyActive) {
+    needleRafId = requestAnimationFrame(tickNeedles);
+  }
+}
+
+function refreshNeedleRefs() {
+  needleEls.clear();
+  for (const name of needleInertia.keys()) {
+    const els = Array.from(document.querySelectorAll(`[data-needle-agent="${name}"]`));
+    needleEls.set(name, els);
+  }
+}
+
+/* ── Idle heartbeat: micro-nudge needles when engines idle ── */
+
+setInterval(() => {
+  if (!latestState?.agents) return;
+  for (const [name, payload] of Object.entries(latestState.agents)) {
+    const p = computePressure(payload);
+    if (p.score < 8 && payload.state === "ready") {
+      const state = needleInertia.get(name);
+      if (state && Math.abs(state.velocity) < 0.1) {
+        state.target += 2.5;
+        scheduleNeedleTick();
+        setTimeout(() => {
+          state.target -= 2.5;
+          scheduleNeedleTick();
+        }, 350);
+      }
+    }
+  }
+}, 4000);
+
+/* ── Signal system: TX/RX lights, hub pulse, wire packets ── */
+
+function fireSignalLight(agentName, type) {
+  // TX/RX dot flash
+  document.querySelectorAll(`.sig-light--${type}[data-sig-agent="${agentName}"]`).forEach((el) => {
+    el.classList.remove("firing");
+    void el.offsetWidth;
+    el.classList.add("firing");
+  });
+
+  // Card border glow
+  const card = statusGrid.querySelector(`[data-agent="${agentName}"]`);
+  if (card) {
+    card.classList.remove(`route-fire-${type}`);
+    void card.offsetWidth;
+    card.classList.add(`route-fire-${type}`);
+    card.addEventListener("animationend", () => card.classList.remove(`route-fire-${type}`), { once: true });
+  }
+
+  // Needle bump on TX
+  if (type === "tx") {
+    const state = needleInertia.get(agentName);
+    if (state) {
+      state.velocity += 8;
+      scheduleNeedleTick();
+    }
+    fireWirePacket(agentName);
+  }
+}
+
+function pulseHub() {
+  const now = Date.now();
+  if (now - hubPulseTimer < 300) return;
+  hubPulseTimer = now;
+  if (!signalHub) return;
+  signalHub.classList.remove("pulsing");
+  void signalHub.offsetWidth;
+  signalHub.classList.add("pulsing");
+  signalHub.addEventListener("animationend", () => signalHub.classList.remove("pulsing"), { once: true });
+}
+
+function fireWirePacket(agentName) {
+  const colIdx = agentColIndex.get(agentName);
+  if (colIdx == null || !signalBus) return;
+  const cols = signalBus.querySelectorAll(".signal-bus__col");
+  const col = cols[colIdx];
+  if (!col) return;
+
+  // Fire the node indicator
+  const node = col.querySelector(".signal-bus__node, .signal-bus__hub");
+  if (node && !node.classList.contains("signal-bus__hub")) {
+    node.classList.remove("firing");
+    void node.offsetWidth;
+    node.classList.add("firing");
+    node.addEventListener("animationend", () => node.classList.remove("firing"), { once: true });
+  }
+
+  // Spawn traveling packet element
+  const packet = document.createElement("div");
+  packet.className = "signal-packet-el";
+  col.appendChild(packet);
+  requestAnimationFrame(() => {
+    packet.classList.add("traveling");
+    packet.addEventListener("animationend", () => packet.remove(), { once: true });
+  });
 }
 
 function formatTime(ts) {
@@ -825,13 +1053,14 @@ function appendMessage(msg) {
   const time = formatTime(msg.ts);
   const timeSpan = time ? `<span class="message__time">${time}</span>` : "";
   const item = document.createElement("article");
-  item.className = "message";
+  item.className = "message message--entering";
   item.innerHTML = `
     <header class="message__header">${escapeHtml(msg.sender)} ${timeSpan}</header>
     <pre class="message__body"></pre>
   `;
   item.querySelector(".message__body").textContent = msg.body || "";
   transcript.appendChild(item);
+  requestAnimationFrame(() => item.classList.remove("message--entering"));
   transcript.scrollTop = transcript.scrollHeight;
 }
 
