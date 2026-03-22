@@ -334,6 +334,115 @@ class SupervisorTests(unittest.TestCase):
             self.assertIn("tokens_saved", payload)
             self.assertEqual(payload["absorbs_total"], 1)
 
+    def test_handle_relay_event_tracks_active_and_completed_routes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sse_broadcast = mock.Mock()
+
+            runtime.handle_relay_event(
+                {
+                    "type": "route_state",
+                    "route_id": "route-42",
+                    "task_id": 42,
+                    "task_title": "Verify route bus",
+                    "sender": "FARHAN",
+                    "target": "CODEX",
+                    "source": "dispatcher",
+                    "message_kind": "task",
+                    "started_at": "2026-03-22T05:00:00Z",
+                    "updated_at": "2026-03-22T05:00:00Z",
+                    "status": "transmitting",
+                    "tx_state": "active",
+                    "rx_state": "waiting",
+                }
+            )
+
+            routing = runtime.state.snapshot()["routing"]
+            self.assertEqual(len(routing["active"]), 1)
+            self.assertEqual(routing["active"][0]["route_id"], "route-42")
+            self.assertEqual(routing["recent"], [])
+
+            runtime.handle_relay_event(
+                {
+                    "type": "route_state",
+                    "route_id": "route-42",
+                    "task_id": 42,
+                    "task_title": "Verify route bus",
+                    "sender": "FARHAN",
+                    "target": "CODEX",
+                    "source": "dispatcher",
+                    "message_kind": "task",
+                    "started_at": "2026-03-22T05:00:00Z",
+                    "updated_at": "2026-03-22T05:00:03Z",
+                    "completed_at": "2026-03-22T05:00:03Z",
+                    "status": "complete",
+                    "tx_state": "sent",
+                    "rx_state": "received",
+                }
+            )
+
+            routing = runtime.state.snapshot()["routing"]
+            self.assertEqual(routing["active"], [])
+            self.assertEqual(len(routing["recent"]), 1)
+            self.assertEqual(routing["recent"][0]["route_id"], "route-42")
+            runtime.sse_broadcast.assert_any_call(
+                "route_state",
+                {
+                    "route": {
+                        "route_id": "route-42",
+                        "task_id": 42,
+                        "task_title": "Verify route bus",
+                        "sender": "FARHAN",
+                        "target": "CODEX",
+                        "source": "dispatcher",
+                        "message_kind": "task",
+                        "started_at": "2026-03-22T05:00:00Z",
+                        "updated_at": "2026-03-22T05:00:03Z",
+                        "completed_at": "2026-03-22T05:00:03Z",
+                        "status": "complete",
+                        "tx_state": "sent",
+                        "rx_state": "received",
+                    },
+                    "active": [],
+                    "recent": [
+                        {
+                            "route_id": "route-42",
+                            "task_id": 42,
+                            "task_title": "Verify route bus",
+                            "sender": "FARHAN",
+                            "target": "CODEX",
+                            "source": "dispatcher",
+                            "message_kind": "task",
+                            "started_at": "2026-03-22T05:00:00Z",
+                            "updated_at": "2026-03-22T05:00:03Z",
+                            "completed_at": "2026-03-22T05:00:03Z",
+                            "status": "complete",
+                            "tx_state": "sent",
+                            "rx_state": "received",
+                        }
+                    ],
+                    "last_route_at": "2026-03-22T05:00:03Z",
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,8 @@ const dispatcherLabel = document.getElementById("dispatcherLabel");
 const dispatcherRoutes = document.getElementById("dispatcherRoutes");
 const dispatcherAbsorbs = document.getElementById("dispatcherAbsorbs");
 const dispatcherTokens = document.getElementById("dispatcherTokens");
+const routeLanes = document.getElementById("routeLanes");
+const routingEmpty = document.getElementById("routingEmpty");
 
 let unlocked = false;
 let transcriptTimer = null;
@@ -458,6 +460,13 @@ function startPolling() {
             renderDispatcher(latestState);
           }
           break;
+        case "route_state":
+          if (latestState) {
+            const { type: _t, route: _route, ...rest } = data;
+            latestState.routing = { ...latestState.routing, ...rest };
+            renderRouting(latestState);
+          }
+          break;
         case "task_created":
           fetchTasks();
           break;
@@ -528,6 +537,7 @@ function renderState(state) {
   sleepBtn.textContent = state.app?.sleeping ? "Wake" : "Sleep";
   renderEngines(state.agents || {});
   renderProjectName(state);
+  renderRouting(state);
   renderDispatcher(state);
 
   // Update transcript revision from initial state
@@ -1127,6 +1137,139 @@ function renderDispatcher(state) {
   dispatcherRoutes.textContent = String(d.routes_total || 0);
   dispatcherAbsorbs.textContent = String(d.absorbs_total || 0);
   dispatcherTokens.textContent = (d.tokens_saved || 0).toLocaleString();
+}
+
+function renderRouting(state) {
+  const routing = state.routing || {};
+  const active = routing.active || [];
+  const recent = routing.recent || [];
+  routeLanes.innerHTML = "";
+
+  const groups = [];
+  if (active.length) {
+    groups.push({ title: "Live lanes", routes: active.slice(0, 4) });
+  }
+  if (recent.length) {
+    groups.push({ title: active.length ? "Recent lanes" : "Latest lanes", routes: recent.slice(0, 4) });
+  }
+
+  routingEmpty.hidden = groups.length > 0;
+  if (!groups.length) {
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const group of groups) {
+    const section = document.createElement("section");
+    section.className = "route-group";
+
+    const heading = document.createElement("p");
+    heading.className = "route-group__title";
+    heading.textContent = group.title;
+    section.appendChild(heading);
+
+    const grid = document.createElement("div");
+    grid.className = "route-group__grid";
+    for (const route of group.routes) {
+      grid.appendChild(buildRouteLane(route));
+    }
+    section.appendChild(grid);
+    fragment.appendChild(section);
+  }
+  routeLanes.appendChild(fragment);
+}
+
+function buildRouteLane(route) {
+  const lane = document.createElement("article");
+  const status = route.status || "transmitting";
+  const sourceCode = routeSourceCode(route);
+  const statusText = routeStatusText(route);
+  const title = route.task_title || route.body_preview || "Untitled route";
+  const detail = route.body_preview && route.body_preview !== title ? route.body_preview : "";
+  const metaParts = [
+    route.task_id != null ? `#${route.task_id}` : (route.message_kind || "message").toUpperCase(),
+    routeSourceLabel(route),
+    statusText,
+  ];
+  if (route.batch_ids?.length) {
+    metaParts.push(route.batch_ids.map((id) => `#${id}`).join(" "));
+  }
+
+  lane.className = `route-lane route-lane--${status}`;
+  lane.innerHTML = `
+    <div class="route-lane__top">
+      <div>
+        <p class="route-lane__title">${escapeHtml(title)}</p>
+        ${detail ? `<p class="route-lane__detail">${escapeHtml(detail)}</p>` : ""}
+      </div>
+      <span class="route-lane__target">${escapeHtml(route.target || "ENGINE")}</span>
+    </div>
+    <div class="route-lane__flow">
+      <span class="route-node route-node--source">${escapeHtml(sourceCode)}</span>
+      <div class="route-lane__track route-lane__track--${status}">
+        <span class="route-pill route-pill--${routePillClass(route.tx_state)}">TXX</span>
+        <span class="route-pill route-pill--${routePillClass(route.rx_state)}">RXX</span>
+      </div>
+      <span class="route-node route-node--engine">${escapeHtml(route.target || "ENGINE")}</span>
+    </div>
+    <div class="route-lane__meta">${metaParts.map((part) => `<span>${escapeHtml(part)}</span>`).join("")}</div>
+    ${route.last_error ? `<p class="route-lane__error">${escapeHtml(route.last_error)}</p>` : ""}
+  `;
+  return lane;
+}
+
+function routePillClass(state) {
+  switch (state) {
+    case "active":
+      return "active";
+    case "sent":
+      return "sent";
+    case "received":
+      return "received";
+    case "empty":
+      return "empty";
+    case "error":
+      return "error";
+    case "waiting":
+    default:
+      return "waiting";
+  }
+}
+
+function routeSourceCode(route) {
+  switch (route.source) {
+    case "dispatcher":
+      return "DSP";
+    case "mention":
+      return "@TAG";
+    case "batch":
+      return "TASK";
+    default:
+      return "ROOM";
+  }
+}
+
+function routeSourceLabel(route) {
+  switch (route.source) {
+    case "dispatcher":
+      return "Dispatcher route";
+    case "mention":
+      return "Explicit mention";
+    case "batch":
+      return "Batch dispatch";
+    default:
+      return "Broadcast route";
+  }
+}
+
+function routeStatusText(route) {
+  if (route.status === "complete") {
+    return route.rx_state === "empty" ? "RXX empty" : "RXX received";
+  }
+  if (route.status === "error") {
+    return route.tx_state === "error" ? "TXX failed" : "RXX failed";
+  }
+  return "TXX live";
 }
 
 /* ── Task board ──────────────────────────────────────── */

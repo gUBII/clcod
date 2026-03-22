@@ -332,5 +332,58 @@ class RelayTests(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_route_to_emits_route_state_for_live_dispatch(self):
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "room.txt"
+                sessions_path = Path(tmpdir) / "sessions.json"
+                relay.save_sessions(sessions_path, {})
+                events: list[dict[str, object]] = []
+                route = {
+                    "route_id": "route-1",
+                    "task_id": 7,
+                    "task_title": "Verify route bus",
+                    "body_preview": "Verify the TXX/RXX lane end to end.",
+                    "sender": "FARHAN",
+                    "target": "CODEX",
+                    "source": "dispatcher",
+                    "message_kind": "task",
+                    "started_at": "2026-03-22T05:00:00Z",
+                }
+
+                with mock.patch(
+                    "relay.call_agent",
+                    new=mock.AsyncMock(
+                        return_value=relay.AgentCallResult(
+                            reply="Done.",
+                            raw="",
+                            stderr="",
+                            session_id="session-7",
+                        )
+                    ),
+                ):
+                    await relay.route_to(
+                        {"name": "CODEX", "timeout": 180},
+                        "prompt",
+                        log_path,
+                        asyncio.Lock(),
+                        sessions_path,
+                        asyncio.Lock(),
+                        event_callback=events.append,
+                        route=route,
+                    )
+
+                route_events = [event for event in events if event["type"] == "route_state"]
+                self.assertEqual(len(route_events), 2)
+                self.assertEqual(route_events[0]["status"], "transmitting")
+                self.assertEqual(route_events[0]["tx_state"], "active")
+                self.assertEqual(route_events[0]["rx_state"], "waiting")
+                self.assertEqual(route_events[1]["status"], "complete")
+                self.assertEqual(route_events[1]["tx_state"], "sent")
+                self.assertEqual(route_events[1]["rx_state"], "received")
+                self.assertEqual(route_events[1]["session_id"], "session-7")
+
+        asyncio.run(run_case())
+
 if __name__ == "__main__":
     unittest.main()

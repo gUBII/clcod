@@ -49,6 +49,7 @@ def build_ui_url(config: dict[str, Any]) -> str:
 
 USAGE_WINDOW_SECONDS = 5 * 60 * 60  # 5-hour rolling window
 DEFAULT_USAGE_LIMIT = 50000         # default token budget per window
+ROUTE_HISTORY_LIMIT = 8
 
 
 def build_usage_window(agent: dict[str, Any]) -> dict[str, Any]:
@@ -114,6 +115,11 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
             "routes_total": 0,
             "absorbs_total": 0,
             "tokens_saved": 0,
+        },
+        "routing": {
+            "active": [],
+            "recent": [],
+            "last_route_at": None,
         },
         "tasks": {
             "total": 0,
@@ -226,6 +232,14 @@ def infer_agent_state(
     if mirror_view in {"resume", "log"}:
         return "ready"
     return "warming"
+
+
+def sort_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        routes,
+        key=lambda item: item.get("updated_at") or item.get("started_at") or "",
+        reverse=True,
+    )
 
 
 class StateStore:
@@ -1024,6 +1038,38 @@ class RuntimeSupervisor:
                 "routes_total": routes,
                 "absorbs_total": absorbs,
                 "tokens_saved": tokens_saved,
+            })
+            return
+
+        if event["type"] == "route_state":
+            snapshot = self.state.snapshot().get("routing", {})
+            route = {key: value for key, value in event.items() if key != "type"}
+            route_id = route.get("route_id")
+            active = [
+                item for item in snapshot.get("active", [])
+                if item.get("route_id") != route_id
+            ]
+            recent = [
+                item for item in snapshot.get("recent", [])
+                if item.get("route_id") != route_id
+            ]
+
+            status = route.get("status", "transmitting")
+            if status in {"complete", "error"}:
+                route.setdefault("completed_at", route.get("updated_at"))
+                recent = sort_routes([route, *recent])[:ROUTE_HISTORY_LIMIT]
+            else:
+                active = sort_routes([route, *active])[:ROUTE_HISTORY_LIMIT]
+
+            routing_state = {
+                "active": active,
+                "recent": recent,
+                "last_route_at": route.get("updated_at") or route.get("started_at"),
+            }
+            self.state.patch("routing", routing_state)
+            self.sse_broadcast("route_state", {
+                "route": route,
+                **routing_state,
             })
             return
 
