@@ -55,8 +55,12 @@ fi
 while IFS= read -r extra_pid; do
   stop_pid "$extra_pid"
 done < <(
-  ps ax -o pid=,command= 2>/dev/null | awk -v dir="$DIR" '
-    $0 ~ /[[:space:]]python[0-9.]*[[:space:]].*supervisor\.py/ && index($0, dir) { print $1 }
+  ps axww -o pid=,command= 2>/dev/null | awk -v dir="$DIR" '
+    {
+      line = tolower($0)
+      root = tolower(dir)
+    }
+    index(line, root) && line ~ /supervisor\.py/ { print $1 }
   ' || true
 )
 
