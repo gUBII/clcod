@@ -104,67 +104,97 @@
             </div>
           </div>
 
-          <section class="engine-strip" id="engineStrip">
-            <div class="engine-strip__header">
+          <section class="engine-strip section-shell" id="engineStrip">
+            <div class="engine-strip__header section-shell__header">
               <div>
                 <p class="hero__eyebrow">Engine Control</p>
                 <h3>Model, effort, and fuel across all engines</h3>
               </div>
-              <span class="panel__hint">live settings &middot; 3 agents</span>
-            </div>
-            <div class="signal-bus" id="signalBus" aria-hidden="true">
-              <div class="signal-bus__col"><div class="signal-bus__node" data-bus-col="0"></div></div>
-              <div class="signal-bus__col">
-                <div class="signal-bus__hub" id="signalHub">
-                  <div class="signal-bus__hub-core"></div>
-                  <span class="signal-bus__hub-label">DSP</span>
-                </div>
+              <div class="section-shell__actions">
+                <span class="panel__hint">live settings &middot; 3 agents</span>
+                <button type="button" class="section-toggle" data-collapse-target="engineStrip" aria-expanded="false">Expand</button>
               </div>
-              <div class="signal-bus__col"><div class="signal-bus__node" data-bus-col="2"></div></div>
             </div>
-            <div id="statusGrid" class="engine-strip__grid"></div>
+            <div class="section-shell__body">
+              <div class="section-shell__body-inner">
+                <div class="signal-bus" id="signalBus" aria-hidden="true">
+                  <div class="signal-bus__col"><div class="signal-bus__node" data-bus-col="0"></div></div>
+                  <div class="signal-bus__col">
+                    <div class="signal-bus__hub" id="signalHub">
+                      <div class="signal-bus__hub-core"></div>
+                      <span class="signal-bus__hub-label">DSP</span>
+                    </div>
+                  </div>
+                  <div class="signal-bus__col"><div class="signal-bus__node" data-bus-col="2"></div></div>
+                </div>
+                <div id="statusGrid" class="engine-strip__grid"></div>
+              </div>
+            </div>
           </section>
 
           <div class="workspace__grid">
             <div class="workspace__primary">
-              <section class="panel panel--tasks">
-                <div class="panel__header">
+              <section class="panel panel--tasks section-shell" id="tasksPanel">
+                <div class="panel__header section-shell__header">
                   <h3>Task Board</h3>
-                  <span class="panel__hint">pending &middot; active &middot; done</span>
+                  <div class="section-shell__actions">
+                    <span class="panel__hint">pending &middot; active &middot; done</span>
+                    <button type="button" class="section-toggle" data-collapse-target="tasksPanel" aria-expanded="true">Collapse</button>
+                  </div>
                 </div>
-                <div id="taskBoard" class="task-board">
-                  <div class="task-board__col" data-status="pending">
-                    <p class="task-board__col-title">Pending</p>
-                    <div class="task-board__list" id="tasksPending"></div>
-                  </div>
-                  <div class="task-board__col" data-status="in_progress">
-                    <p class="task-board__col-title">Active</p>
-                    <div class="task-board__list" id="tasksActive"></div>
-                  </div>
-                  <div class="task-board__col" data-status="done">
-                    <p class="task-board__col-title">Done</p>
-                    <div class="task-board__list" id="tasksDone"></div>
+                <div class="section-shell__body">
+                  <div class="section-shell__body-inner">
+                    <div id="taskBoard" class="task-board">
+                      <div class="task-board__col" data-status="pending">
+                        <p class="task-board__col-title">Pending</p>
+                        <div class="task-board__list" id="tasksPending"></div>
+                      </div>
+                      <div class="task-board__col" data-status="in_progress">
+                        <p class="task-board__col-title">Active</p>
+                        <div class="task-board__list" id="tasksActive"></div>
+                      </div>
+                      <div class="task-board__col" data-status="done">
+                        <p class="task-board__col-title">Done</p>
+                        <div class="task-board__list" id="tasksDone"></div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </section>
 
-              <section class="panel panel--transcript">
-                <div class="panel__header">
+              <section class="panel panel--transcript section-shell" id="transcriptPanel">
+                <div class="panel__header section-shell__header">
                   <h3>Transcript</h3>
-                  <span class="panel__hint">latest room traffic</span>
+                  <div class="section-shell__actions">
+                    <button type="button" id="transcriptFontDown" class="section-chip" aria-label="Decrease transcript font size">A-</button>
+                    <button type="button" id="transcriptFontUp" class="section-chip" aria-label="Increase transcript font size">A+</button>
+                    <span class="panel__hint">latest room traffic</span>
+                    <button type="button" class="section-toggle" data-collapse-target="transcriptPanel" aria-expanded="true">Collapse</button>
+                  </div>
                 </div>
-                <div id="transcript" class="transcript"></div>
+                <div class="section-shell__body">
+                  <div class="section-shell__body-inner">
+                    <div id="transcript" class="transcript"></div>
+                  </div>
+                </div>
               </section>
             </div>
 
-            <section class="panel panel--routes" id="routingStage">
-              <div class="panel__header">
+            <section class="panel panel--routes section-shell" id="routingStage">
+              <div class="panel__header section-shell__header">
                 <h3>Route Bus</h3>
-                <span class="panel__hint">TXX &rarr; RXX live</span>
+                <div class="section-shell__actions">
+                  <span class="panel__hint">TXX &rarr; RXX live</span>
+                  <button type="button" class="section-toggle" data-collapse-target="routingStage" aria-expanded="true">Collapse</button>
+                </div>
               </div>
-              <div class="routes__body">
-                <p class="routing-stage__empty" id="routingEmpty">No routed traffic yet.</p>
-                <div class="route-groups" id="routeLanes"></div>
+              <div class="section-shell__body">
+                <div class="section-shell__body-inner">
+                  <div class="routes__body">
+                    <p class="routing-stage__empty" id="routingEmpty">No routed traffic yet.</p>
+                    <div class="route-groups" id="routeLanes"></div>
+                  </div>
+                </div>
               </div>
             </section>
           </div>

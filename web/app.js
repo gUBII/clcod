@@ -47,6 +47,9 @@ const themeToggle = document.getElementById("themeToggle");
 const tasksPending = document.getElementById("tasksPending");
 const tasksActive = document.getElementById("tasksActive");
 const tasksDone = document.getElementById("tasksDone");
+const sectionToggleButtons = Array.from(document.querySelectorAll(".section-toggle"));
+const transcriptFontDown = document.getElementById("transcriptFontDown");
+const transcriptFontUp = document.getElementById("transcriptFontUp");
 const dispatcherDot = document.getElementById("dispatcherDot");
 const dispatcherLabel = document.getElementById("dispatcherLabel");
 const dispatcherRoutes = document.getElementById("dispatcherRoutes");
@@ -55,12 +58,24 @@ const dispatcherTokens = document.getElementById("dispatcherTokens");
 const routeLanes = document.getElementById("routeLanes");
 const routingEmpty = document.getElementById("routingEmpty");
 
+const sectionStateStorageKey = "clcod.sectionState";
+const transcriptFontStorageKey = "clcod.transcriptFontScale";
+const defaultCollapsedSections = {
+  engineStrip: true,
+  tasksPanel: false,
+  transcriptPanel: false,
+  routingStage: false,
+};
+
 let unlocked = false;
 let transcriptTimer = null;
 let stateTimer = null;
 let latestState = null;
 let lastSeenSeq = 0;
 let lastSeenRev = 0;
+let taskFetchInFlight = false;
+let sectionCollapsedState = loadSectionState();
+let transcriptFontScale = readStoredTranscriptFontScale();
 
 /* ── Living Engine Room: signal system state ─────────── */
 const needleInertia = new Map();   // agentName → { current, target, velocity, damped }
@@ -629,6 +644,12 @@ function renderState(state) {
   renderRouting(state);
   renderDispatcher(state);
 
+  // Rehydrate the task board from state so project switches or a missed initial
+  // tasks fetch do not leave the board blank or stale.
+  if (unlocked && shouldHydrateTaskBoard(state)) {
+    fetchTasks();
+  }
+
   // Update transcript revision from initial state
   if (state.transcript?.rev !== undefined && state.transcript.rev > lastSeenRev) {
     lastSeenRev = state.transcript.rev;
@@ -1138,6 +1159,128 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function readStorageJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadSectionState() {
+  return { ...defaultCollapsedSections, ...readStorageJson(sectionStateStorageKey, {}) };
+}
+
+function persistSectionState() {
+  try {
+    localStorage.setItem(sectionStateStorageKey, JSON.stringify(sectionCollapsedState));
+  } catch { /* ignore */ }
+}
+
+function setSectionCollapsed(targetId, collapsed, persist = true) {
+  const shell = document.getElementById(targetId);
+  if (!shell) {
+    return;
+  }
+
+  sectionCollapsedState[targetId] = collapsed;
+  shell.classList.toggle("is-collapsed", collapsed);
+
+  const body = shell.querySelector(".section-shell__body");
+  if (body) {
+    body.setAttribute("aria-hidden", collapsed ? "true" : "false");
+  }
+
+  for (const button of document.querySelectorAll(`.section-toggle[data-collapse-target="${targetId}"]`)) {
+    button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    button.textContent = collapsed ? "Expand" : "Collapse";
+  }
+
+  if (persist) {
+    persistSectionState();
+  }
+}
+
+function initSectionShells() {
+  for (const button of sectionToggleButtons) {
+    const targetId = button.dataset.collapseTarget;
+    if (!targetId) {
+      continue;
+    }
+
+    button.addEventListener("click", () => {
+      const shell = document.getElementById(targetId);
+      if (!shell) {
+        return;
+      }
+
+      const nextCollapsed = !shell.classList.contains("is-collapsed");
+      setSectionCollapsed(targetId, nextCollapsed);
+
+      if (!nextCollapsed) {
+        shell.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    });
+
+    setSectionCollapsed(targetId, sectionCollapsedState[targetId] ?? false, false);
+  }
+}
+
+function clampTranscriptFontScale(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 1;
+  }
+  return Math.max(0, Math.min(3, Math.round(numeric)));
+}
+
+function readStoredTranscriptFontScale() {
+  try {
+    const stored = localStorage.getItem(transcriptFontStorageKey);
+    if (stored == null || stored === "") {
+      return 1;
+    }
+    return clampTranscriptFontScale(stored);
+  } catch {
+    return 1;
+  }
+}
+
+function applyTranscriptFontScale(nextScale, persist = true) {
+  transcriptFontScale = clampTranscriptFontScale(nextScale);
+  transcript.dataset.fontScale = String(transcriptFontScale);
+
+  if (transcriptFontDown) {
+    transcriptFontDown.disabled = transcriptFontScale <= 0;
+  }
+  if (transcriptFontUp) {
+    transcriptFontUp.disabled = transcriptFontScale >= 3;
+  }
+
+  if (persist) {
+    try {
+      localStorage.setItem(transcriptFontStorageKey, String(transcriptFontScale));
+    } catch { /* ignore */ }
+  }
+}
+
+function initTranscriptFontControls() {
+  applyTranscriptFontScale(transcriptFontScale, false);
+
+  transcriptFontDown?.addEventListener("click", () => {
+    applyTranscriptFontScale(transcriptFontScale - 1);
+  });
+
+  transcriptFontUp?.addEventListener("click", () => {
+    applyTranscriptFontScale(transcriptFontScale + 1);
+  });
+}
+
 function showGate() {
   gate.classList.remove("hidden");
   engineRoom.classList.add("hidden");
@@ -1576,9 +1719,20 @@ function routeStatusText(route) {
 /* ── Task board ──────────────────────────────────────── */
 
 let cachedTasks = [];
+let cachedTasksProjectKey = null;
+
+function taskBoardProjectKey(state = latestState) {
+  return state?.project?.path || state?.project?.active || "home";
+}
+
+function shouldHydrateTaskBoard(state) {
+  const expectedCount = Math.min(Number(state?.tasks?.total || 0), 100);
+  return cachedTasks.length !== expectedCount || cachedTasksProjectKey !== taskBoardProjectKey(state);
+}
 
 function renderTaskBoard(tasks) {
   cachedTasks = tasks;
+  cachedTasksProjectKey = taskBoardProjectKey();
   const pending = tasks.filter(t => t.status === "pending");
   const active = tasks.filter(t => t.status === "assigned" || t.status === "in_progress");
   const done = tasks.filter(t => t.status === "done").slice(-20);
@@ -1615,12 +1769,24 @@ function taskCard(t) {
 }
 
 async function fetchTasks() {
+  if (!unlocked || taskFetchInFlight) {
+    return;
+  }
+  taskFetchInFlight = true;
   try {
     const res = await fetch("/api/tasks");
+    if (res.status === 401 || res.status === 403) {
+      unlocked = false;
+      showGate();
+      return;
+    }
     if (!res.ok) return;
     const data = await res.json();
     renderTaskBoard(data.tasks || []);
   } catch { /* ignore */ }
+  finally {
+    taskFetchInFlight = false;
+  }
 }
 
 /* ── Theme toggle ────────────────────────────────────── */
@@ -1639,6 +1805,8 @@ themeToggle.addEventListener("click", () => {
 });
 
 applyTheme(localStorage.getItem(themeKey) || "dark");
+initSectionShells();
+initTranscriptFontControls();
 
 (async () => {
   try {

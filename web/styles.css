@@ -346,7 +346,18 @@ button {
   gap: 10px;
   flex: 1 1 0;
   min-height: 0;
+}
+
+.engine-room {
   overflow: hidden;
+}
+
+.workspace {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  scroll-behavior: smooth;
+  scroll-padding-bottom: 110px;
 }
 
 .hero {
@@ -414,9 +425,116 @@ button {
   color: var(--text);
 }
 
+.section-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.section-shell__header {
+  gap: 12px;
+}
+
+.section-shell__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.section-shell__body {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+  transition:
+    grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 220ms ease;
+}
+
+.section-shell__body-inner {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.section-shell.is-collapsed .section-shell__body {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.section-shell.is-collapsed .section-shell__body-inner {
+  pointer-events: none;
+}
+
+.section-shell.is-collapsed .panel__header,
+.section-shell.is-collapsed .engine-strip__header {
+  margin-bottom: 0;
+}
+
+.section-toggle,
+.section-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid rgba(140, 199, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    transform 160ms ease,
+    opacity 160ms ease;
+}
+
+.section-toggle:hover,
+.section-chip:hover {
+  border-color: rgba(255, 210, 124, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+  transform: translateY(-1px);
+}
+
+.section-toggle:disabled,
+.section-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.section-toggle::before {
+  content: "▾";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  line-height: 1;
+  transform-origin: center;
+  transition: transform 220ms ease;
+}
+
+.section-toggle[aria-expanded="false"]::before {
+  transform: rotate(-90deg);
+}
+
+.section-shell__header .panel__hint {
+  margin: 0;
+}
+
 /* ── Engine Control Strip ─────────────────────────────── */
 
 .engine-strip {
+  order: 2;
   flex-shrink: 0;
   padding: 12px 14px;
   border-radius: 16px;
@@ -426,6 +544,8 @@ button {
     linear-gradient(180deg, rgba(10, 18, 29, 0.94), rgba(6, 13, 22, 0.92));
   backdrop-filter: blur(20px);
   box-shadow: var(--shadow);
+  max-height: clamp(170px, 24vh, 238px);
+  overflow: hidden;
 }
 
 .engine-strip__header {
@@ -439,6 +559,16 @@ button {
 .engine-strip__header h3 {
   margin: 0;
   font-size: clamp(0.82rem, 1.2vw, 0.95rem);
+}
+
+.engine-strip .section-shell__body,
+.engine-strip .section-shell__body-inner {
+  min-height: 0;
+}
+
+.engine-strip .section-shell__body-inner {
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .engine-strip__grid {
@@ -1072,12 +1202,13 @@ button {
 }
 
 .workspace__grid {
+  order: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) clamp(240px, 22vw, 320px);
-  grid-template-rows: minmax(0, 1fr);
-  gap: 10px;
-  flex: 1 1 0;
-  min-height: 0;
+  grid-template-columns: minmax(0, 1.45fr) clamp(280px, 25vw, 360px);
+  gap: 12px;
+  flex: 0 0 auto;
+  min-height: clamp(520px, 64vh, 760px);
+  align-items: stretch;
 }
 
 .workspace__primary {
@@ -1086,6 +1217,7 @@ button {
   gap: 10px;
   min-height: 0;
   overflow: hidden;
+  block-size: clamp(520px, 64vh, 760px);
 }
 
 .panel {
@@ -1109,7 +1241,7 @@ button {
 .panel__header {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
   margin-bottom: 8px;
   flex-shrink: 0;
@@ -1262,8 +1394,19 @@ button {
 }
 
 .chat-bar-wrap {
-  position: relative;
+  order: 4;
+  position: sticky;
+  bottom: 0;
+  z-index: 24;
   flex-shrink: 0;
+  padding: 8px 0 4px;
+  margin-top: 4px;
+  background: linear-gradient(
+    180deg,
+    rgba(6, 13, 22, 0),
+    rgba(6, 13, 22, 0.82) 34%,
+    rgba(6, 13, 22, 0.96)
+  );
 }
 
 .mention-popup {
@@ -1381,7 +1524,15 @@ button {
   flex: 1 1 0;
 }
 
+.panel--transcript .section-shell__body,
+.panel--transcript .section-shell__body-inner {
+  flex: 1 1 0;
+}
+
 .transcript {
+  --transcript-header-size: 0.78rem;
+  --transcript-time-size: 0.68rem;
+  --transcript-body-size: 0.88rem;
   flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
@@ -1389,6 +1540,30 @@ button {
   gap: clamp(12px, 1.5vw, 18px);
   align-content: start;
   padding-right: 4px;
+}
+
+#transcript[data-font-scale="0"] {
+  --transcript-header-size: 0.72rem;
+  --transcript-time-size: 0.62rem;
+  --transcript-body-size: 0.8rem;
+}
+
+#transcript[data-font-scale="1"] {
+  --transcript-header-size: 0.78rem;
+  --transcript-time-size: 0.68rem;
+  --transcript-body-size: 0.88rem;
+}
+
+#transcript[data-font-scale="2"] {
+  --transcript-header-size: 0.88rem;
+  --transcript-time-size: 0.74rem;
+  --transcript-body-size: 0.98rem;
+}
+
+#transcript[data-font-scale="3"] {
+  --transcript-header-size: 0.98rem;
+  --transcript-time-size: 0.82rem;
+  --transcript-body-size: 1.08rem;
 }
 
 .message {
@@ -1400,7 +1575,7 @@ button {
 
 .message__header {
   margin-bottom: clamp(6px, 1vw, 10px);
-  font-size: clamp(0.74rem, 1.1vw, 0.84rem);
+  font-size: var(--transcript-header-size);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--warn);
@@ -1409,7 +1584,7 @@ button {
 
 .message__time {
   color: var(--muted);
-  font-size: clamp(0.66rem, 0.9vw, 0.74rem);
+  font-size: var(--transcript-time-size);
   letter-spacing: 0.06em;
   margin-left: 0.5em;
   text-transform: none;
@@ -1421,7 +1596,7 @@ button {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--font-mono);
-  font-size: clamp(0.82rem, 1.2vw, 0.94rem);
+  font-size: var(--transcript-body-size);
   line-height: 1.65;
   color: var(--text);
   letter-spacing: 0.01em;
@@ -1465,7 +1640,7 @@ button {
 
 @media (max-width: 1200px) {
   .workspace__grid {
-    grid-template-columns: minmax(0, 1fr) clamp(200px, 20vw, 280px);
+    grid-template-columns: minmax(0, 1fr) clamp(240px, 24vw, 320px);
   }
   .engine-strip__grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1480,12 +1655,12 @@ button {
 
   .workspace__grid {
     grid-template-columns: 1fr;
+    min-height: 0;
   }
 
   /* Engine strip: cap height and scroll so it never crushes transcript/chat */
   .engine-strip {
     max-height: clamp(160px, 32vh, 240px);
-    overflow-y: auto;
     flex-shrink: 0;
   }
 
@@ -1493,13 +1668,23 @@ button {
     grid-template-columns: 1fr;
   }
 
-  /* Task board can yield space to transcript on constrained heights */
+  .workspace__primary {
+    block-size: auto;
+  }
+
+  .section-shell__actions {
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+
   .panel--tasks {
-    flex-shrink: 1;
+    min-height: 0;
+    max-height: none;
   }
 
   .panel--tasks .task-board {
     grid-template-columns: 1fr;
+    min-height: 0;
   }
 
   .task-board__col + .task-board__col {
@@ -1510,7 +1695,13 @@ button {
   }
 
   .panel--routes {
-    max-height: 200px;
+    block-size: auto;
+    min-height: 0;
+    max-height: clamp(220px, 38vh, 380px);
+  }
+
+  .panel--transcript {
+    min-height: clamp(280px, 42vh, 420px);
   }
 
   .hero,
@@ -1526,6 +1717,11 @@ button {
     flex-wrap: wrap;
   }
 
+  .chat-bar-wrap {
+    background: none;
+    padding-top: 6px;
+  }
+
   .chat-bar__sender {
     width: 100%;
   }
@@ -1539,17 +1735,41 @@ button {
 /* ── Task Board ────────────────────────────────────────── */
 
 .panel--tasks {
-  flex-shrink: 0;
-  max-height: clamp(180px, 28vh, 280px);
+  flex: 0 0 auto;
+  min-height: 220px;
+  max-height: clamp(220px, 34vh, 340px);
+}
+
+.panel--tasks .section-shell__body {
+  min-height: 0;
+}
+
+.panel--tasks.section-shell.is-collapsed {
+  min-height: 0;
+  max-height: none;
 }
 
 .panel--tasks .task-board {
   flex: 1 1 0;
   overflow-y: auto;
-  min-height: 0;
+  min-height: 140px;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
+  padding-right: 4px;
+}
+
+.task-board__col {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-height: 0;
+}
+
+.task-board__list {
+  display: grid;
+  gap: 8px;
+  align-content: start;
 }
 
 .task-board__col + .task-board__col {
@@ -1599,6 +1819,13 @@ button {
   font-size: clamp(0.62rem, 0.8vw, 0.7rem);
 }
 
+.task-board__empty {
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
 .task-card--pending { border-left: 3px solid var(--warn); }
 .task-card--assigned { border-left: 3px solid var(--blue); }
 .task-card--in_progress { border-left: 3px solid var(--blue); }
@@ -1609,14 +1836,26 @@ button {
 .panel--routes {
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  min-height: 520px;
+  block-size: clamp(520px, 64vh, 760px);
   overflow: hidden;
+}
+
+.panel--routes.section-shell.is-collapsed {
+  min-height: 0;
+  block-size: auto;
+}
+
+.panel--routes .section-shell__body,
+.panel--routes .section-shell__body-inner {
+  flex: 1 1 0;
 }
 
 .panel--routes .routes__body {
   overflow-y: auto;
   flex: 1 1 0;
   min-height: 0;
+  padding-right: 4px;
 }
 
 .panel--routes .route-groups {
@@ -1669,6 +1908,7 @@ button {
 /* ── Dispatcher Bar ────────────────────────────────────── */
 
 .dispatcher-bar {
+  order: 3;
   display: flex;
   align-items: center;
   gap: 14px;
@@ -1919,6 +2159,15 @@ button {
   background: rgba(255, 255, 255, 0.9);
 }
 
+[data-theme="light"] .chat-bar-wrap {
+  background: linear-gradient(
+    180deg,
+    rgba(248, 250, 252, 0),
+    rgba(248, 250, 252, 0.88) 34%,
+    rgba(248, 250, 252, 0.96)
+  );
+}
+
 [data-theme="light"] .modal-overlay {
   background: rgba(0, 0, 0, 0.25);
 }
@@ -1935,6 +2184,12 @@ button {
   background:
     radial-gradient(circle at top left, rgba(37, 99, 235, 0.04), transparent 34%),
     linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(240, 242, 245, 0.96));
+}
+
+[data-theme="light"] .section-toggle,
+[data-theme="light"] .section-chip {
+  background: rgba(255, 255, 255, 0.82);
+  border-color: rgba(0, 0, 0, 0.12);
 }
 
 [data-theme="light"] .panel--routes .route-lane {
