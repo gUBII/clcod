@@ -73,7 +73,7 @@ def call_gemini(context: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-pro",
+        model_name="gemini-2.5-flash",
         system_instruction=SYSTEM_PROMPT,
     )
     resp = model.generate_content(context)
