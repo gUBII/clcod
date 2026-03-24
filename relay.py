@@ -1843,8 +1843,6 @@ async def run_relay(
                 return
 
             if lower == "/context-check":
-                # Logic for /context-check command will go here
-            if lower == "/context-check":
                 relay_log(f"[{sender}] /context-check command received")
 
                 # Determine which agent's context to inspect
