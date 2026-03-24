@@ -2,12 +2,14 @@
 
 `clcod` uses a minimal Inter-Agent Coordination Protocol so the room can run autonomously without constant operator cleanup.
 
-## 1. Speaker lock
+## 1. Dispatch queue (replaces speaker lock)
 
-- Lock file: `speaker.lock`
-- Owner: the relay process claims the lock before dispatching a reply cycle
-- Purpose: prevent overlapping relay cycles when the transcript changes rapidly
-- Expiry: if the lock age exceeds `locks.ttl`, it is treated as stale
+- Queue table: `events.db` → `dispatch_queue`
+- Owner: `dispatch_drain_loop` in `relay.py` processes jobs sequentially via `claim_next_dispatch()`
+- Purpose: serialise agent dispatch cycles without blocking the transcript watcher
+- Stale recovery: active jobs older than 600s are reset to `pending` on startup via `recover_stale_active()`
+
+**Legacy:** `speaker.lock` (file lock) was the original dispatch guard. It is still present in `config.json` as `workspace.lock_path` and referenced by `stop.sh` / `healthcheck.sh` for stale-state detection, but `acquire_lock` / `release_lock` are no longer called in the main relay loop. The dispatch queue is the operative mechanism.
 
 ## 2. Adaptive jitter
 
@@ -57,7 +59,17 @@ The dispatcher classifies incoming human messages into one of three actions:
 
 If Ollama is unavailable, the dispatcher fails safely and falls back to routing the message to **all** active cloud agents.
 
-## 8. Room commands
+## 8. Agent circuit breaker
+
+Each agent has a per-agent circuit breaker in `relay.py` (`CircuitBreaker` class):
+
+- **Closed:** requests dispatch normally
+- **Open:** after `failure_threshold` consecutive failures (default 3), dispatch is skipped and a `circuit_open` `agent_state` event is emitted
+- **Half-open:** after `reset_timeout` seconds (default 300s), one attempt is allowed to test recovery
+- On success: failure count resets
+- Configurable via `locks.circuit_breaker.failure_threshold` and `locks.circuit_breaker.reset_timeout` in `config.json`
+
+## 9. Room commands
 
 The chat surface supports explicit commands for overriding the dispatcher and tracking tasks:
 

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import relay
@@ -87,6 +88,82 @@ class SupervisorTests(unittest.TestCase):
         )
 
         self.assertTrue(command.startswith("cd /tmp/demo-repo &&"))
+
+    def test_collect_pane_commands_maps_window_targets_and_pane_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.tmux_session_exists = mock.Mock(return_value=True)
+            runtime.tmux = mock.Mock(
+                return_value=SimpleNamespace(
+                    stdout="%7\ttriagent:CODEX.0\ttriagent:2.0\tcodex\n"
+                )
+            )
+
+            pane_commands = runtime.collect_pane_commands()
+
+            self.assertEqual(pane_commands["%7"], "codex")
+            self.assertEqual(pane_commands["triagent:CODEX.0"], "codex")
+            self.assertEqual(pane_commands["triagent:2.0"], "codex")
+
+    def test_refresh_tmux_state_marks_named_window_targets_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.tmux_session_exists = mock.Mock(return_value=True)
+            runtime.sync_agent_mirrors = mock.Mock()
+            runtime.collect_pane_commands = mock.Mock(
+                return_value={"triagent:CODEX.0": "codex"}
+            )
+            runtime.state.patch("relay", {"state": "running"})
+            runtime.state.patch_agent(
+                "CODEX",
+                {
+                    "pane_target": "triagent:CODEX.0",
+                    "mirror_view": "resume",
+                    "state": "starting",
+                },
+            )
+
+            runtime.refresh_tmux_state()
+
+            agent = runtime.state.snapshot()["agents"]["CODEX"]
+            self.assertEqual(agent["pane_command"], "codex")
+            self.assertEqual(agent["state"], "ready")
 
     def test_refresh_task_state_counts_statuses(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -444,6 +521,75 @@ class SupervisorTests(unittest.TestCase):
                 },
                 None,
             )
+
+
+class SSESubscriberTests(unittest.TestCase):
+    """Tests for SSE subscriber cap and queue cleanup."""
+
+    def _make_runtime(self, max_subscribers=3):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "ui": {
+                            "max_sse_subscribers": max_subscribers,
+                        },
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            return supervisor.RuntimeSupervisor(config)
+
+    def test_subscribe_respects_max_limit(self):
+        runtime = self._make_runtime(max_subscribers=2)
+
+        q1 = runtime.sse_subscribe()
+        q2 = runtime.sse_subscribe()
+        q3 = runtime.sse_subscribe()
+
+        self.assertIsNotNone(q1)
+        self.assertIsNotNone(q2)
+        self.assertIsNone(q3)
+        self.assertEqual(runtime.sse_client_count(), 2)
+
+    def test_unsubscribe_frees_slot(self):
+        runtime = self._make_runtime(max_subscribers=1)
+
+        q1 = runtime.sse_subscribe()
+        self.assertIsNotNone(q1)
+        self.assertIsNone(runtime.sse_subscribe())
+
+        runtime.sse_unsubscribe(q1)
+        q2 = runtime.sse_subscribe()
+        self.assertIsNotNone(q2)
+
+    def test_broadcast_drops_full_queues(self):
+        runtime = self._make_runtime(max_subscribers=5)
+
+        q1 = runtime.sse_subscribe()
+        q2 = runtime.sse_subscribe()
+
+        # Fill q1 to capacity (maxsize=64)
+        for i in range(64):
+            q1.put_nowait({"event_id": None, "payload": {"type": "filler", "i": i}})
+
+        # Broadcast should drop q1 (full) and keep q2
+        runtime.sse_broadcast("test_event", {"data": "hello"})
+
+        self.assertEqual(runtime.sse_client_count(), 1)
+        frame = q2.get_nowait()
+        self.assertEqual(frame["payload"]["type"], "test_event")
 
 
 if __name__ == "__main__":

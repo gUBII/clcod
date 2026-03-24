@@ -18,15 +18,24 @@
 
 ---
 
+## Bug Fix Sprint — Completed 2026-03-24
+
+| Issue | Fix | File |
+|-------|-----|------|
+| Lock release swallows errors | Only catch `FileNotFoundError`, propagate rest | `relay.py` |
+| Advisory flock deadlock | `LOCK_NB` retry loop + `try/finally` unlock | `relay.py` |
+| Dispatcher silent fallback | Exponential backoff retries, `fallback: true` flag | `dispatcher.py` |
+| SSE queue memory leak | Subscriber cap (default 32), 503 on overflow | `supervisor.py` |
+| No circuit breaker | `CircuitBreaker` class, half-open recovery, events emitted | `relay.py` |
+| Context loading O(N) | `read_tail()` seeks to tail, skips full file read | `relay.py` |
+
 ## In-Flight Work
 
 | Task                              | Owner | Status      |
 |-----------------------------------|-------|-------------|
 | Transcript progress bar           | Core  | In progress |
-| Task fanout orchestrator          | Core  | In progress |
-| Dispatcher health telemetry       | Core  | In progress |
-| Routing visualization spine       | Core  | In progress |
-| Explicit realtime events          | Core  | In progress |
+| Task fanout orchestrator (`assigned_to` field) | Core  | In progress |
+| Routing visualization spine       | Core  | In progress (circuit breaker events now feed this) |
 | Synchronized tach timing          | Core  | In progress |
 | Standby / assist as needed        | Core  | Active      |
 
@@ -547,13 +556,302 @@ This is designed to be incremental and low-risk.
 
 Here’s how “version two” works, end-to-end:
 
-You run one local daemon that acts like mission control. Every meaningful thing that happens—task creation, agent prompt construction, model call start, token chunks, tool calls, failures—is written as a structured event into a local SQLite database. The system state (task list, locks, run status) is just a projection of that event history, so it’s always reconstructible by replay, like event sourcing intends. 
+You run one local daemon that acts like mission control. Every meaningful thing that happens—task creation, agent prompt construction, model call start, token chunks, tool calls, failures—is written as a structured event into a local SQLite database. The system state (task list, locks, run status) is just a projection of that event history, so it’s always reconstructible by replay, like event sourcing intends.
 
-Agents aren’t invoked as one-off CLI commands anymore. Instead, each provider has a small “agent runner” process that exposes a stable streaming RPC interface (gRPC). The orchestrator tells a runner what to do; the runner streams back tokens and structured events. gRPC is designed for efficient RPC and supports streaming semantics. 
+Agents aren’t invoked as one-off CLI commands anymore. Instead, each provider has a small “agent runner” process that exposes a stable streaming RPC interface (gRPC). The orchestrator tells a runner what to do; the runner streams back tokens and structured events. gRPC is designed for efficient RPC and supports streaming semantics.
 
-The web UI is not a separate source of truth—it just subscribes to the event stream and renders it. For streaming updates, SSE remains a simple choice: it’s a standardized server→client stream (`text/event-stream`) with reconnection and resume semantics. 
+The web UI is not a separate source of truth—it just subscribes to the event stream and renders it. For streaming updates, SSE remains a simple choice: it’s a standardized server→client stream (`text/event-stream`) with reconnection and resume semantics.
 
-Debugging stops being “watch panes in tmux and guess.” Instead, you can click a run and see a deterministic timeline and correlated logs/traces. OpenTelemetry provides the conceptual model for correlating signals across boundaries using context propagation. 
+Debugging stops being “watch panes in tmux and guess.” Instead, you can click a run and see a deterministic timeline and correlated logs/traces. OpenTelemetry provides the conceptual model for correlating signals across boundaries using context propagation.
 
 Why it’s better: you keep the local-first, inspectable feel, but you stop outsourcing correctness to a text file and polling loop. You get structured recovery, stable interfaces, and real observability—without turning your local system into a complex distributed platform.
+
+---
+
+---
+
+# Runtime Stability Sprint — Five Structural Bug Fixes
+> Added: 2026-03-23 | Status: PENDING IMPLEMENTATION | Owner: CODEX (push/merge), CLAUDE (review), GEMINI (verify)
+
+## Context
+
+During live operation the system exhibited three user-visible failures:
+1. Agents appeared “out of fuel” after only a few message exchanges
+2. Codex stopped responding entirely after its first successful reply
+3. The relay log became unreadable, burying all real error signals
+
+Root-cause analysis identified five structural defects — not surface symptoms. Every fix below is a **permanent architectural correction**, not a patch or workaround.
+
+---
+
+## BUG-1 — Double Token Counting (CRITICAL)
+
+### What is broken
+`supervisor.py` calls `record_agent_usage()` **twice** for every single agent reply:
+
+**Path A** — `handle_relay_event()`, `transcript` handler (`supervisor.py:1084-1089`):
+```python
+# triggered when append_reply() fires a transcript event
+if speaker and speaker in agents and char_count > 0:
+    estimated_tokens = max(1, char_count // 4)
+    self.state.record_agent_usage(speaker, estimated_tokens)  # ← COUNT #1
+```
+
+**Path B** — `handle_relay_event()`, `agent_state` handler (`supervisor.py:1112-1117`):
+```python
+# triggered when route_to() fires agent_state(state=”ready”)
+if “tokens_delta” in event:
+    tokens = event[“tokens_delta”]
+    if tokens > 0:
+        self.state.record_agent_usage(event[“agent”], tokens)  # ← COUNT #2
+```
+
+Both fire for every reply. With `DEFAULT_USAGE_LIMIT = 50,000` tokens and 2× counting, the gauge exhausts after ~25,000 chars of combined agent output — roughly **3–5 long responses**.
+
+Additionally, Path A counts **human messages** too (any speaker whose name matches an agent key — which does not happen, but SYSTEM messages do fire the transcript event), compounding the drain.
+
+### Root cause
+The `transcript` event’s `char_count` field was added for speaker-tracking bookkeeping, not fuel accounting. The `tokens_delta` field in `agent_state` is the intentional per-agent fuel accounting path. Both were wired to the same `record_agent_usage()` call without removing the redundant path.
+
+### Permanent fix
+**File:** `supervisor.py`
+
+Remove the token accounting block from the `transcript` event handler entirely. Keep only the `tokens_delta` path in the `agent_state` handler.
+
+```python
+# supervisor.py — transcript handler
+# REMOVE these lines (currently ~1084-1089):
+#   speaker = event.get(“last_speaker”, “”).strip().upper()
+#   char_count = event.get(“char_count”, 0)
+#   if speaker and speaker in self.state.snapshot()[“agents”] and char_count > 0:
+#       estimated_tokens = max(1, char_count // 4)
+#       self.state.record_agent_usage(speaker, estimated_tokens)
+```
+
+The `agent_state` tokens_delta path (supervisor.py:1112-1117) is the correct single source of truth. It fires once per agent reply, tied to the specific agent, with the precise reply character count.
+
+---
+
+## BUG-2 — “No Fuel Left” = Any Error State (CRITICAL)
+
+### What is broken
+`web/app.js:6`:
+```js
+const stateLabels = {
+  error: “no fuel left”,   // ← shown for ALL errors, not just fuel exhaustion
+};
+```
+
+Every failure — session conflict, API timeout, missing binary, rate limit, wrong flags — displays as “no fuel left”. The actual error text from `last_error` is never shown in the agent card. Operators cannot distinguish a transient session conflict (recoverable in seconds) from a genuine resource exhaustion.
+
+This label also makes the fuel metaphor load-bearing when it isn’t — the fuel limit is tracked but **never enforced** (no routing gate exists that blocks dispatch when fuel is low).
+
+### Permanent fix
+**File:** `web/app.js`
+
+1. Change `stateLabels.error` from `”no fuel left”` to `”error”`.
+2. In the agent card render function, surface `last_error` as a subtitle/tooltip beneath the state label so the actual failure reason is always visible.
+3. Change `stateNotes.error` to accurately describe what error state means: a failed invocation, not capacity exhaustion.
+
+```js
+// web/app.js — stateLabels
+const stateLabels = {
+  starting: “spinning up”,
+  auth: “tool online”,
+  warming: “routing traffic”,
+  ready: “ready”,
+  error: “error”,   // was: “no fuel left”
+};
+
+const stateNotes = {
+  // ...
+  error: “The last routing cycle failed. Check the agent card for the specific error.”,
+};
+```
+
+In the agent card renderer, add a `last_error` line below the state label when `state === “error”` and `last_error` is non-null.
+
+---
+
+## BUG-3 — Codex Always Fails After First Session (CRITICAL)
+
+### What is broken
+In `relay.py` and `config.json`, Codex has two invocation paths:
+
+**First call (no session_id)** — uses `args`:
+```json
+[“exec”, “--skip-git-repo-check”, “--dangerously-bypass-approvals-and-sandbox”, “-C”, “{script_dir}”]
+```
+→ `codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /path prompt`
+✓ Works.
+
+**Every subsequent call (session_id exists)** — uses `invoke_resume_args`:
+```json
+[“exec”, “resume”, “{session_id}”]
+```
+→ `codex exec resume abc123`
+✗ Fails: `Not inside a trusted directory and --skip-git-repo-check was not specified.`
+
+**Confirmed in relay.log:**
+```
+[relay 2026-03-23 14:06:44] CODEX: stderr: Not inside a trusted directory and --skip-git-repo-check was not specified.
+[relay 2026-03-23 14:06:44] CODEX: error: exit code 1
+```
+
+After the session_id is persisted to `sessions.json` on first success, **every subsequent Codex invocation fails**. This is why Codex appears silent after its first reply.
+
+### Root cause
+`invoke_resume_args` was written as a minimal resume command but the Codex CLI’s directory-trust validation runs on every invocation, including resume. The trust bypass flags must be present regardless of invocation path.
+
+### Permanent fix
+**Files:** `config.json` AND `relay.py` DEFAULT_CONFIG (both must stay in sync)
+
+Add the missing trust flags to Codex’s `invoke_resume_args`:
+
+```json
+“invoke_resume_args”: [
+  “exec”,
+  “--skip-git-repo-check”,
+  “--dangerously-bypass-approvals-and-sandbox”,
+  “-C”,
+  “{script_dir}”,
+  “resume”,
+  “{session_id}”
+]
+```
+
+**Verification step before merging:** Run `codex exec --help` and `codex exec resume --help` to confirm flag ordering. Flags for the `exec` subcommand must precede the `resume` subcommand argument.
+
+---
+
+## BUG-4 — HTTP Server Pollutes Relay Log with SSE Disconnect Tracebacks
+
+### What is broken
+`supervisor.py` uses Python’s `ThreadingHTTPServer` which inherits `BaseHTTPRequestHandler`. Every SSE client disconnect — normal browser behavior (tab close, reconnect, refresh) — generates a full Python traceback:
+
+```
+ConnectionResetError: [Errno 54] Connection reset by peer
+  File “.../socketserver.py”, line 697, in process_request_thread
+  ...
+```
+
+The relay.log is currently **almost entirely these tracebacks**, making it impossible to find real errors. Every real routing event, agent error, and session conflict is buried under hundreds of lines of normal connection churn.
+
+### Root cause
+`BaseHTTPRequestHandler.log_error()` is called for all socket errors, including benign ones like client disconnects. Python’s HTTP server has no built-in filter for expected disconnects on SSE endpoints.
+
+### Permanent fix
+**File:** `supervisor.py`
+
+Override `log_error` on the request handler class to suppress `ConnectionResetError` specifically, which is always normal for long-lived SSE connections:
+
+```python
+class QuietRequestHandler(BaseHTTPRequestHandler):
+    def log_error(self, format_str, *args):
+        # ConnectionResetError is normal for SSE clients disconnecting.
+        # Suppress it to keep relay.log readable for real errors.
+        if args and “Connection reset” in str(args[0]):
+            return
+        super().log_error(format_str, *args)
+```
+
+Replace `BaseHTTPRequestHandler` with `QuietRequestHandler` as the handler class for the `ReusableHTTPServer`. Do not suppress `BrokenPipeError` — that also occurs but can indicate real write failures; leave it visible.
+
+---
+
+## BUG-5 — Agents Receive Raw JSON as Context (Context Formatting)
+
+### What is broken
+`relay.py:1587, 1796, 1878` — context passed to every agent prompt:
+```python
+fresh = read_text(log_path)
+context = fresh[-context_len:]  # last 6000 raw chars of clcodgemmix.txt
+```
+
+`clcodgemmix.txt` stores each message as a raw JSON object per line:
+```json
+{“id”: “abc123”, “sender”: “Farhan”, “seq”: 1774232533222, “type”: “message”, “body”: “hi”, “ts”: “2026-03-23T02:22:13Z”}
+```
+
+A 6000-char raw slice:
+- Can cut through the middle of a JSON object (the last line may be truncated mid-field)
+- Contains `id`, `seq`, `type` structural noise agents don’t need
+- Makes agents parse structural noise instead of reading conversation prose
+- Produces confused or non-responsive replies when the context is truncated mid-entry
+
+### Permanent fix
+**File:** `relay.py`
+
+Add a `format_context(raw: str, max_chars: int) -> str` function:
+1. Parse each line of the transcript as a JSON object
+2. Emit each parsed entry as `[SPEAKER] body` — clean, readable prose
+3. Trim from the **oldest** end so the slice always ends at a complete message boundary
+4. Fall back gracefully to raw tail if JSON parsing fails (backward compat)
+
+Use this function in all three places that currently pass raw context:
+- `dispatch_drain_loop()` at `relay.py:1878`
+- `batch_pending_tasks()` at `relay.py:1796`
+- The direct-route path at `relay.py:1587`
+
+```python
+def format_context(raw: str, max_chars: int) -> str:
+    “””Convert raw JSON-per-line transcript to readable [SPEAKER] body format.
+    Slices on message boundaries so context is never cut mid-entry.”””
+    lines = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+            sender = msg.get(“sender”, “?”)
+            body = str(msg.get(“body”, “”)).strip()
+            if body:
+                lines.append(f”[{sender}] {body}”)
+        except json.JSONDecodeError:
+            lines.append(line)  # pass-through for non-JSON legacy lines
+
+    # Build from newest backwards, never exceeding max_chars
+    result_parts: list[str] = []
+    total = 0
+    for entry in reversed(lines):
+        cost = len(entry) + 1  # +1 for newline
+        if total + cost > max_chars:
+            break
+        result_parts.append(entry)
+        total += cost
+    return “\n”.join(reversed(result_parts))
+```
+
+---
+
+## Implementation Assignments
+
+| Task | Bug | Owner | Reviewer | Status |
+|------|-----|-------|----------|--------|
+| T-3 | BUG-1: Remove double token counting | CODEX | CLAUDE | pending |
+| T-4 | BUG-3: Fix Codex invoke_resume_args | CODEX | CLAUDE | pending |
+| T-5 | BUG-2: Fix UI error labels + surface last_error | CODEX | GEMINI | pending |
+| T-6 | BUG-4: Suppress SSE disconnect log noise | CODEX | CLAUDE | pending |
+| T-7 | BUG-5: Fix context formatting | CODEX | GEMINI | pending |
+
+**CODEX is the sole push/merge authority.** CLAUDE reviews backend Python changes. GEMINI reviews frontend JS changes. No agent merges work assigned to another agent.
+
+## Execution Order
+
+Execute in this order — each fix is independent but P1 tasks remove blocking noise first:
+
+1. **T-4 first** (BUG-3 Codex resume args) — unblocks Codex itself from the error loop
+2. **T-3** (BUG-1 double counting) — stops the fuel gauge from false-alarming
+3. **T-6** (BUG-4 log noise) — cleans relay.log so verification is possible
+4. **T-5** (BUG-2 UI labels) — accurate error display
+5. **T-7** (BUG-5 context formatting) — improves agent comprehension across all future sessions
+
+## Verification Checklist (per task)
+
+- [ ] BUG-3: Run `python3 -c “import json,pathlib; d=json.loads(pathlib.Path(‘config.json’).read_text()); print(next(a[‘invoke_resume_args’] for a in d[‘agents’] if a[‘name’]==’CODEX’))”` — confirm trust flags present
+- [ ] BUG-1: Send 5 test messages, check `state.json` fuel gauge doesn’t hit 0 prematurely
+- [ ] BUG-4: Restart supervisor, disconnect/reconnect browser — confirm relay.log shows no ConnectionResetError tracebacks
+- [ ] BUG-2: Trigger an intentional agent error, confirm UI shows “error” not “no fuel left”, and last_error text is visible
+- [ ] BUG-5: Inspect prompt passed to agent in agent IO log — confirm `[SPEAKER] body` format, no raw JSON
 

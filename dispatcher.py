@@ -13,10 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+
+_TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError, OSError)
+
+
+def _log_dispatcher(msg: str, *, level: str = "warning") -> None:
+    """Print a dispatcher log line to stderr."""
+    print(f"[dispatcher] [{level}] {msg}", file=sys.stderr, flush=True)
 
 
 def _ollama_post(url: str, payload: dict[str, Any], timeout: int = 15) -> dict[str, Any]:
@@ -92,40 +101,65 @@ async def classify_message(
         {"role": "user", "content": f"Recent context (last 800 chars):\n{context[-800:]}\n\nNew message:\n{body}"},
     ]
 
-    try:
-        raw = await ollama_chat(model, messages, host, timeout)
-        # Strip markdown code fences if present
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1]
-        if cleaned.endswith("```"):
-            cleaned = cleaned.rsplit("```", 1)[0]
-        cleaned = cleaned.strip()
+    fallback = {
+        "action": "route",
+        "targets": ["CLAUDE", "CODEX", "GEMINI"],
+        "task_type": "code",
+        "priority": "medium",
+        "reply": None,
+        "fallback": True,
+    }
 
-        decision = json.loads(cleaned)
-        # Validate required fields
-        action = decision.get("action", "route")
-        if action not in ("route", "absorb", "clarify"):
-            action = "route"
-        targets = decision.get("targets", [])
-        if not isinstance(targets, list) or not targets:
-            targets = ["CLAUDE", "CODEX", "GEMINI"]
-        return {
-            "action": action,
-            "targets": [t.upper() for t in targets],
-            "task_type": decision.get("task_type", "code"),
-            "priority": decision.get("priority", "medium"),
-            "reply": decision.get("reply"),
-        }
-    except (json.JSONDecodeError, urllib.error.URLError, TimeoutError, OSError):
-        # Fallback: route to all agents
-        return {
-            "action": "route",
-            "targets": ["CLAUDE", "CODEX", "GEMINI"],
-            "task_type": "code",
-            "priority": "medium",
-            "reply": None,
-        }
+    max_retries = config.get("router_retries", 2)
+    last_error: Exception | None = None
+
+    for attempt in range(1 + max_retries):
+        try:
+            raw = await ollama_chat(model, messages, host, timeout)
+            # Strip markdown code fences if present
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1]
+            if cleaned.endswith("```"):
+                cleaned = cleaned.rsplit("```", 1)[0]
+            cleaned = cleaned.strip()
+
+            decision = json.loads(cleaned)
+            # Validate required fields
+            action = decision.get("action", "route")
+            if action not in ("route", "absorb", "clarify"):
+                action = "route"
+            targets = decision.get("targets", [])
+            if not isinstance(targets, list) or not targets:
+                targets = ["CLAUDE", "CODEX", "GEMINI"]
+            return {
+                "action": action,
+                "targets": [t.upper() for t in targets],
+                "task_type": decision.get("task_type", "code"),
+                "priority": decision.get("priority", "medium"),
+                "reply": decision.get("reply"),
+            }
+        except json.JSONDecodeError as exc:
+            # Bad model output — not transient, no point retrying
+            _log_dispatcher(f"router returned invalid JSON: {exc}")
+            return fallback
+        except _TRANSIENT_ERRORS as exc:
+            last_error = exc
+            if attempt < max_retries:
+                delay = 0.5 * (2 ** attempt)
+                _log_dispatcher(
+                    f"router attempt {attempt + 1}/{1 + max_retries} failed "
+                    f"({type(exc).__name__}), retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+            # fall through to next attempt or final fallback
+
+    _log_dispatcher(
+        f"router exhausted {1 + max_retries} attempts — falling back to broadcast "
+        f"(last error: {last_error})",
+        level="error",
+    )
+    return fallback
 
 
 SUMMARIZER_SYSTEM_PROMPT = """\

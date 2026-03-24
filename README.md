@@ -36,9 +36,20 @@ The system has evolved significantly from a simple tmux script into a full local
 - **Task system:** Built-in task tracking with `/task`, `/move`, `/moveall`, `/clearall` commands, persisted in `tasks.json`, with batch processing.
 - **Project locking:** Support for isolating workspaces per project (`projects.json`), securely injecting the `work_dir` for each agent.
 - **SSE event stream:** Replaced UI polling with a low-latency Server-Sent Events (SSE) `/api/events` endpoint.
+- **Event spine:** SQLite-backed `events.db` stores all system events and drives the dispatch queue (`dispatch_drain_loop` replaced `speaker.lock` as the dispatch serialisation mechanism).
 - **Model & effort selectors:** Per-agent dynamic model and reasoning effort settings, persisting across restarts in `preferences.json`.
 - **Sleep & wake toggle:** Suspend routing traffic selectively without tearing down the runtime.
 - **Expanded API surface:** Extensible GET/POST operations for deep UI integration.
+
+### Stability sprint (2026-03-24)
+
+- **Transcript flock:** Non-blocking `LOCK_NB` retry loop with `try/finally` unlock replaces blocking `LOCK_EX`.
+- **Circuit breaker:** Per-agent failure tracking with half-open recovery; `circuit_open` events emitted to UI.
+- **Tail-read optimisation:** `read_tail()` replaces full-file reads on every poll cycle — O(1) context loading.
+- **SSE subscriber cap:** Configurable `max_sse_subscribers` (default 32); 503 on overflow.
+- **Dispatcher retries:** Exponential backoff on transient errors; `fallback: true` flag on exhausted retries.
+- **State reconciliation:** `rebuild_state_from_events()` repairs task count drift in `state.json` on startup.
+- **Password hashing:** SHA-256 hash at init; `secrets.compare_digest` for timing-safe auth comparison.
 
 ## Requirements
 
@@ -127,7 +138,8 @@ flowchart LR
         Tasks[".clcod-runtime/tasks.json"]
         RelayLog[".clcod-runtime/relay.log"]
         AgentLogs[".clcod-runtime/agents/*.log"]
-        Lock["speaker.lock"]
+        Lock["speaker.lock (legacy)"]
+        EventsDB[".clcod-runtime/events.db"]
         Transcript["clcodgemmix.txt"]
         Socket[".clcod-runtime/room.sock"]
     end
@@ -149,6 +161,7 @@ flowchart LR
     Supervisor --> Relay
     Relay --> Socket
     Relay --> Lock
+    Relay --> EventsDB
     Relay --> Transcript
     Relay --> Dispatcher
     Dispatcher --> Ollama
@@ -271,6 +284,8 @@ The supervisor writes and consumes these files:
 | `.clcod-runtime/tasks.json` | Task tracking (pending / in_progress / done) |
 | `.clcod-runtime/relay.log` | supervisor and relay operational log |
 | `.clcod-runtime/agents/*.log` | Agent raw IO mirror sources |
+| `.clcod-runtime/events.db` | SQLite event spine — all system events + dispatch queue |
+| `.clcod-runtime/archives/` | Transcript archives written by compact context |
 
 ## API surface
 
@@ -305,16 +320,23 @@ The `/api/events` endpoint provides a Server-Sent Events stream:
 
 | Event | Payload fields | When emitted |
 |-------|----------------|--------------|
-| `init` | full state snapshot | on connection |
+| `init` | full state snapshot | on SSE connection |
 | `state_refresh` | full state snapshot | every ~3s |
 | `relay_state` | `state` | relay start/stop |
-| `agent_state` | `agent`, `state`, `session_id`, `last_error`, `tokens_delta` | per-agent state change |
-| `transcript` | `last_speaker`, `rev`, `message` (optional) | on new message append |
+| `agent_state` | `agent`, `state`, `last_error` | per-agent state change (includes `circuit_open`) |
+| `transcript` | `last_speaker`, `correlation_id`, `message` | on new message append |
 | `dispatcher` | `action`, `targets`, `task_type`, `priority` | per routing decision |
+| `route_state` | `agent`, `status`, `tx_state`, `rx_state`, `started_at`, `completed_at`, `reply_chars`, `last_error` | per dispatch lifecycle step |
+| `dispatch_queued` | `job_id`, `sender`, `body`, `targets` | message enqueued for dispatch |
+| `dispatch_started` | `job_id` | dispatch job claimed by drain loop |
+| `dispatch_completed` | `job_id` | dispatch job finished successfully |
+| `dispatch_failed` | `job_id`, `error` | dispatch job errored |
 | `task_created` | `task` | on `/task` command |
 | `task_updated` | `task` | on `/move` or status change |
-| `tasks_updated`| `tasks`, `new_status` | on `/moveall` or batch |
-| `tasks_cleared`| — | on `/clearall` |
+| `tasks_updated` | `tasks`, `new_status` | on `/moveall` or batch |
+| `tasks_cleared` | — | on `/clearall` |
+| `transcript_compacted` | `archive_path`, `status` | after compact context archives transcript |
+| `transcript_summary_inserted` | — | after summary is injected into transcript |
 
 ## Room commands
 
@@ -434,13 +456,15 @@ When a `/task` message is routed, agents receive a structured task prompt instea
       ],
       "model_options": [
         "default",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
-        "gemini-2.0-flash"
+        "gemini-2.5-flash-lite"
       ],
       "mirror_mode": "log",
       "preseed_session_id": false,
-      "timeout": 120
+      "timeout": 300
     }
   ],
   "workspace": {
@@ -456,10 +480,15 @@ When a `/task` message is routed, agents receive a structured task prompt instea
     "preferences_path": ".clcod-runtime/preferences.json",
     "agent_logs_dir": ".clcod-runtime/agents",
     "projects_path": ".clcod-runtime/projects.json",
-    "tasks_path": ".clcod-runtime/tasks.json"
+    "tasks_path": ".clcod-runtime/tasks.json",
+    "events_db_path": ".clcod-runtime/events.db"
   },
   "locks": {
-    "ttl": 90
+    "ttl": 90,
+    "circuit_breaker": {
+      "failure_threshold": 3,
+      "reset_timeout": 300
+    }
   },
   "tmux": {
     "session": "triagent"
@@ -470,7 +499,8 @@ When a `/task` message is routed, agents receive a structured task prompt instea
     "password_env": "CLCOD_PASSWORD",
     "password": "free",
     "default_sender": "Operator",
-    "open_browser": true
+    "open_browser": true,
+    "max_sse_subscribers": 32
   },
   "dispatcher": {
     "enabled": true,
@@ -481,7 +511,8 @@ When a `/task` message is routed, agents receive a structured task prompt instea
     "router_timeout": 15,
     "summarizer_timeout": 30,
     "validator_timeout": 10,
-    "fallback_action": "route"
+    "fallback_action": "route",
+    "router_retries": 2
   }
 }
 ```
@@ -531,8 +562,17 @@ Persists per-agent model and effort selections across restarts. Written by `/api
 #### `ui.default_sender`
 Pre-filled sender name shown in the web UI chat form. Can be overridden per session in the browser.
 
+#### `workspace.events_db_path`
+Path to the SQLite event store. Defaults to `.clcod-runtime/events.db` if omitted. Stores all system events and the dispatch queue.
+
+#### `locks.circuit_breaker`
+Optional. Controls per-agent circuit breaker behaviour. `failure_threshold` (default 3) sets how many consecutive failures open the circuit; `reset_timeout` (default 300s) sets how long before a half-open recovery attempt is allowed.
+
+#### `ui.max_sse_subscribers`
+Optional. Maximum concurrent SSE connections (default 32). Requests beyond the cap receive `503 Service Unavailable`.
+
 #### `dispatcher.*`
-Configures local Ollama models used for routing, summarization, and validation. If Ollama is unreachable, the dispatcher fails safely and broadcasts to all enabled cloud agents instead (`fallback_action: "route"`).
+Configures local Ollama models used for routing, summarization, and validation. If Ollama is unreachable, the dispatcher fails safely and broadcasts to all enabled cloud agents instead (`fallback_action: "route"`). `router_retries` (default 2) controls exponential-backoff retries on transient errors before falling back.
 
 ## File layout
 
@@ -542,7 +582,8 @@ Configures local Ollama models used for routing, summarization, and validation. 
 | `stop.sh` | shutdown entrypoint |
 | `healthcheck.sh` | runtime health and stale-state reporting |
 | `supervisor.py` | process owner, HTTP server, tmux manager, state writer |
-| `relay.py` | transcript watcher and agent router |
+| `relay.py` | transcript watcher, agent router, circuit breaker, dispatch drain loop |
+| `event_store.py` | SQLite event spine — schema, event append, dispatch queue ops |
 | `dispatcher.py` | Ollama-powered routing, summarization, and validation |
 | `join.py` | human CLI client |
 | `watch-log.sh` | transcript tail helper used in tmux |

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import errno
 import fcntl
 import json
 import os
@@ -75,7 +76,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "cmd": "gemini",
             "args": ["-y", "-p"],
             "model_arg": ["--model", "{value}"],
-            "model_options": ["default", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+            "model_options": ["default", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
             "mirror_mode": "log",
             "preseed_session_id": False,
             "timeout": 120,
@@ -195,6 +196,21 @@ def interpolate(value: Any, variables: dict[str, str]) -> Any:
 def read_text(path: Path) -> str:
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         return handle.read()
+
+
+def read_tail(path: Path, max_chars: int) -> str:
+    """Read the last max_chars characters of a file without loading the whole file."""
+    try:
+        size = path.stat().st_size
+        max_bytes = max_chars * 4  # 4x for multi-byte chars
+        if size <= max_bytes:
+            return path.read_text(encoding="utf-8", errors="replace")
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(max(0, size - max_bytes))
+            f.readline()  # skip partial line
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def write_text(path: Path, text: str) -> None:
@@ -369,8 +385,11 @@ def default_agent_controls(name: str) -> tuple[list[dict[str, Any]], list[dict[s
     if name == "GEMINI":
         models = [
             build_option("default"),
+            build_option("gemini-3.1-pro-preview"),
+            build_option("gemini-3-flash-preview"),
             build_option("gemini-2.5-pro"),
             build_option("gemini-2.5-flash"),
+            build_option("gemini-2.5-flash-lite"),
         ]
         return models, [], {}
     return [build_option("default")], [], {}
@@ -570,6 +589,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "password": str(ui.get("password", "free")),
             "default_sender": str(ui.get("default_sender") or os.environ.get("USER") or "Operator"),
             "open_browser": bool(ui.get("open_browser", True)),
+            "max_sse_subscribers": int(ui.get("max_sse_subscribers", 32)),
         },
         "dispatcher": {
             "enabled": bool(dispatcher_cfg.get("enabled", True)),
@@ -701,9 +721,7 @@ def release_lock(lock_path: Path) -> None:
     try:
         lock_path.unlink()
     except FileNotFoundError:
-        return
-    except OSError:
-        return
+        pass
 
 
 def persist_transcript_message(
@@ -726,11 +744,24 @@ def persist_transcript_message(
 
     entry = json.dumps(message) + "\n"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_lock_attempts = 10
+    lock_backoff = 0.05  # 50ms
+
     with log_path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.write(entry)
-        handle.flush()
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        for attempt in range(max_lock_attempts):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt == max_lock_attempts - 1:
+                    raise
+                time.sleep(lock_backoff * (2 ** attempt))
+        try:
+            handle.write(entry)
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     emit_event(
         event_callback,
@@ -1169,6 +1200,58 @@ def log_agent_io(path: Path, cmd: list[str], raw: str, stderr_text: str, session
         handle.write("\n".join(lines))
 
 
+class CircuitBreaker:
+    """Circuit breaker for agent dispatch with failure tracking and recovery.
+
+    Implements the standard circuit breaker pattern:
+    - Closed state: Requests pass through normally
+    - Open state: Requests fail immediately after threshold failures
+    - Half-open state: Allow one request to test recovery
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        reset_timeout: float = 300.0,
+    ) -> None:
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self._failures: dict[str, int] = {}
+        self._last_failure: dict[str, float] = {}
+
+    def record_failure(self, agent_name: str) -> None:
+        """Record a failure for an agent."""
+        self._failures[agent_name] = self._failures.get(agent_name, 0) + 1
+        self._last_failure[agent_name] = time.time()
+
+    def record_success(self, agent_name: str) -> None:
+        """Record a success for an agent (resets circuit)."""
+        self._failures.pop(agent_name, None)
+        self._last_failure.pop(agent_name, None)
+
+    def is_open(self, agent_name: str) -> bool:
+        """Check if the circuit is open for an agent.
+
+        Returns False (half-open) if:
+        - Failure count is below threshold, or
+        - Enough time has passed since last failure (timeout exceeded)
+        """
+        failures = self._failures.get(agent_name, 0)
+        if failures < self.failure_threshold:
+            return False
+        last = self._last_failure.get(agent_name, 0)
+        if time.time() - last > self.reset_timeout:
+            # Half-open: allow one attempt
+            self._failures[agent_name] = self.failure_threshold - 1
+            return False
+        return True
+
+    def reset_for_agent(self, agent_name: str) -> None:
+        """Explicitly reset circuit for an agent (e.g., after operator intervention)."""
+        self._failures.pop(agent_name, None)
+        self._last_failure.pop(agent_name, None)
+
+
 async def _exec_agent(
     agent: dict[str, Any],
     cmd: list[str],
@@ -1282,6 +1365,7 @@ async def route_to(
     event_callback: EventCallback | None = None,
     route: dict[str, Any] | None = None,
     event_store: EventStore | None = None,
+    circuit_breaker: "CircuitBreaker | None" = None,
 ) -> None:
     def publish(event: dict[str, Any]) -> dict[str, Any]:
         return emit_event(event_callback, event, event_store=event_store)
@@ -1307,6 +1391,36 @@ async def route_to(
     publish(
         {"type": "agent_state", "agent": name, "state": "warming", "last_error": None},
     )
+
+    # Check circuit breaker before dispatch
+    cb = circuit_breaker
+    if cb is not None and cb.is_open(name):
+        relay_log(f"{name}: circuit open, skipping dispatch")
+        failed_at = utc_now()
+        publish(
+            {
+                "type": "route_state",
+                **route,
+                "started_at": route_started_at,
+                "updated_at": failed_at,
+                "completed_at": failed_at,
+                "status": "error",
+                "tx_state": "circuit_open",
+                "rx_state": "error",
+                "last_error": f"circuit breaker open for {name}",
+                "reply_chars": 0,
+            },
+        )
+        publish(
+            {
+                "type": "agent_state",
+                "agent": name,
+                "state": "circuit_open",
+                "last_error": f"circuit breaker open for {name}",
+            },
+        )
+        return
+
     try:
         result = await call_agent(agent, prompt, sessions_path, session_lock)
         if result.reply:
@@ -1321,6 +1435,9 @@ async def route_to(
             relay_log(f"{name} replied ({len(result.reply)} chars)")
         else:
             relay_log(f"{name}: empty reply")
+        # Record success for circuit breaker
+        if cb is not None:
+            cb.record_success(name)
         if route:
             completed_at = msg["ts"] if result.reply else utc_now()
             publish(
@@ -1351,6 +1468,8 @@ async def route_to(
         )
     except FileNotFoundError:
         relay_log(f"{name}: command not found: {agent['cmd']}")
+        if circuit_breaker is not None:
+            circuit_breaker.record_failure(name)
         if route:
             failed_at = utc_now()
             publish(
@@ -1377,6 +1496,8 @@ async def route_to(
         )
     except asyncio.TimeoutError:
         relay_log(f"{name}: timed out after {agent['timeout']}s")
+        if circuit_breaker is not None:
+            circuit_breaker.record_failure(name)
         if route:
             failed_at = utc_now()
             publish(
@@ -1427,6 +1548,38 @@ async def route_to(
                 "last_error": str(exc),
             },
         )
+        if circuit_breaker is not None:
+            circuit_breaker.record_failure(name)
+
+    # Also catch RuntimeError from call_agent (e.g., non-zero exit code)
+    except RuntimeError as exc:
+        relay_log(f"{name}: {exc}")
+        if circuit_breaker is not None:
+            circuit_breaker.record_failure(name)
+        if route:
+            failed_at = utc_now()
+            publish(
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": failed_at,
+                    "completed_at": failed_at,
+                    "status": "error",
+                    "tx_state": "sent",
+                    "rx_state": "error",
+                    "last_error": str(exc),
+                    "reply_chars": 0,
+                },
+            )
+        publish(
+            {
+                "type": "agent_state",
+                "agent": name,
+                "state": "error",
+                "last_error": str(exc),
+            },
+        )
 
 
 async def run_relay(
@@ -1450,6 +1603,14 @@ async def run_relay(
     write_lock = asyncio.Lock()
     session_lock = asyncio.Lock()
     owns_event_store = False
+
+    # Initialize circuit breaker with configurable thresholds
+    cb_config = config.get("locks", {}).get("circuit_breaker", {})
+    circuit_breaker = CircuitBreaker(
+        failure_threshold=cb_config.get("failure_threshold", 3),
+        reset_timeout=cb_config.get("reset_timeout", 300.0),
+    )
+    relay_log(f"circuit breaker: threshold={circuit_breaker.failure_threshold}, reset={circuit_breaker.reset_timeout}s")
 
     if not enabled_agents:
         raise ValueError("no enabled agents configured")
@@ -1583,8 +1744,7 @@ async def run_relay(
             for agent in enabled_agents:
                 agent["work_dir"] = work_dir
 
-            fresh = read_text(log_path)
-            context = fresh[-context_len:]
+            context = read_tail(log_path, context_len)
 
             dispatch_targets = enabled_agents
             requested_target = None
@@ -1792,8 +1952,7 @@ async def run_relay(
                     },
                 )
 
-                fresh = read_text(log_path)
-                context = fresh[-context_len:]
+                context = read_tail(log_path, context_len)
                 work_dir = str(SCRIPT_DIR)
                 projects = load_projects(projects_path)
                 active_id = projects.get("active")
@@ -1874,8 +2033,7 @@ async def run_relay(
                 for agent in target_agents:
                     agent["work_dir"] = work_dir
 
-                fresh = read_text(log_path)
-                context = fresh[-context_len:]
+                context = read_tail(log_path, context_len)
 
                 task = job.get("task")
                 prompts = {
@@ -1927,6 +2085,7 @@ async def run_relay(
                             event_callback,
                             route_payloads[agent["name"]],
                             event_store=event_store,
+                            circuit_breaker=circuit_breaker,
                         )
                         for agent in target_agents
                     ]

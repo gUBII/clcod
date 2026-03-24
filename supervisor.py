@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import secrets
@@ -127,6 +128,7 @@ def build_initial_state(config: dict[str, Any]) -> dict[str, Any]:
             "routes_total": 0,
             "absorbs_total": 0,
             "tokens_saved": 0,
+            "pane_target": None,
         },
         "routing": {
             "active": [],
@@ -320,6 +322,35 @@ class StateStore:
             window["tokens_used"] += tokens
             relay.write_json(self.path, self.state)
 
+    def reconcile_tasks(self, tasks_path: Path) -> None:
+        """Rebuild task counts in state from tasks.json (primary source).
+
+        Repairs drift in state.json that accumulates when the supervisor
+        crashes between writing tasks.json and patching state.
+        """
+        try:
+            data = relay.load_tasks(tasks_path)
+        except Exception:
+            return
+        tasks = data.get("tasks", [])
+        counts: dict[str, int] = {}
+        last_created_at: str | None = None
+        for t in tasks:
+            status = str(t.get("status", "pending"))
+            counts[status] = counts.get(status, 0) + 1
+            ca = t.get("created_at")
+            if ca and (last_created_at is None or ca > last_created_at):
+                last_created_at = ca
+        with self._lock:
+            self.state["tasks"].update({
+                "total": len(tasks),
+                "pending": counts.get("pending", 0),
+                "in_progress": counts.get("in_progress", 0),
+                "done": counts.get("done", 0),
+                "last_created_at": last_created_at,
+            })
+            relay.write_json(self.path, self.state)
+
     def fuel_for_agent(self, name: str) -> dict[str, Any]:
         """Return fuel gauge data for a single agent."""
         with self._lock:
@@ -356,8 +387,10 @@ class RuntimeSupervisor:
         self._sleeping = False
         self._sleep_lock = threading.Lock()
         self.stop_event = asyncio.Event()
+        self._password_hash: str = self._hash_password(self.password())
         self.auth_tokens: set[str] = set()
         self._load_auth_tokens()
+        self.rebuild_state_from_events()
         self.http_server: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
         self.mirror_keys: dict[str, tuple[str, str | None]] = {}
@@ -365,6 +398,7 @@ class RuntimeSupervisor:
         self.projects_path: Path = config["workspace"]["projects_path"]
         self._sse_clients: list[queue.Queue] = []
         self._sse_lock = threading.Lock()
+        self.max_sse_subscribers: int = config.get("ui", {}).get("max_sse_subscribers", 32)
 
     @property
     def _auth_tokens_path(self) -> Path:
@@ -378,9 +412,23 @@ class RuntimeSupervisor:
     def _save_auth_tokens(self) -> None:
         relay.write_json(self._auth_tokens_path, list(self.auth_tokens))
 
-    def sse_subscribe(self) -> queue.Queue:
+    def rebuild_state_from_events(self) -> None:
+        """Reconcile state.json with tasks.json on startup.
+
+        events.db is the durable event log; tasks.json is the primary task
+        store. This repairs task count drift in state.json caused by crashes
+        between writes. Task events (task_created, task_updated) are already
+        written to events.db via emit_event — this step closes the loop by
+        also keeping state.json consistent.
+        """
+        self.state.reconcile_tasks(self.workspace["tasks_path"])
+
+    def sse_subscribe(self) -> queue.Queue | None:
+        """Subscribe to SSE events. Returns None if at capacity."""
         q: queue.Queue = queue.Queue(maxsize=64)
         with self._sse_lock:
+            if len(self._sse_clients) >= self.max_sse_subscribers:
+                return None
             self._sse_clients.append(q)
         return q
 
@@ -390,6 +438,10 @@ class RuntimeSupervisor:
                 self._sse_clients.remove(q)
             except ValueError:
                 pass
+
+    def sse_client_count(self) -> int:
+        with self._sse_lock:
+            return len(self._sse_clients)
 
     def sse_broadcast(self, event_type: str, data: dict[str, Any], event_id: int | None = None) -> None:
         payload = {"type": event_type, **data}
@@ -405,6 +457,13 @@ class RuntimeSupervisor:
                     self._sse_clients.remove(q)
                 except ValueError:
                     pass
+            if dead:
+                print(
+                    f"[supervisor] SSE: dropped {len(dead)} full queues, "
+                    f"{len(self._sse_clients)} clients remain",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def refresh_task_state(self) -> None:
         tasks_data = relay.load_tasks(self.workspace["tasks_path"])
@@ -439,6 +498,17 @@ class RuntimeSupervisor:
     def password(self) -> str:
         env_name = self.config["ui"]["password_env"]
         return os.environ.get(env_name) or self.config["ui"]["password"]
+
+    @staticmethod
+    def _hash_password(plaintext: str) -> str:
+        return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
+    def verify_password(self, candidate: str) -> bool:
+        """Timing-safe password check. Hashes both sides before comparing."""
+        return secrets.compare_digest(
+            self._hash_password(candidate),
+            self._password_hash,
+        )
 
     def current_repo_path(self) -> Path:
         project_path = self.state.snapshot().get("project", {}).get("path")
@@ -776,7 +846,8 @@ class RuntimeSupervisor:
             self.tmux("kill-session", "-t", self.session, check=False)
 
         self.tmux("new-session", "-d", "-s", self.session, "-x", "220", "-y", "60")
-        self.tmux("rename-window", "-t", f"{self.session}:0", "engines")
+        # Window 0: transcript log watcher
+        self.tmux("rename-window", "-t", f"{self.session}:0", "log")
         self.tmux("set-window-option", "-t", f"{self.session}:0", "remain-on-exit", "on")
         self.tmux(
             "respawn-pane",
@@ -785,55 +856,50 @@ class RuntimeSupervisor:
             f"{self.session}:0.0",
             f"cd {shlex.quote(str(SCRIPT_DIR))} && exec bash watch-log.sh --config {shlex.quote(str(self.config['config_path']))}",
         )
-        agent_root = self.tmux(
-            "split-window",
-            "-v",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-t",
-            f"{self.session}:0.0",
-            "-p",
-            "35",
-            capture=True,
-        ).stdout.strip()
 
+        # One dedicated full-screen window per enabled agent
         enabled_agents = [agent for agent in self.config["agents"] if agent["enabled"]]
-        if enabled_agents:
-            current_pane = agent_root
-            for idx, agent in enumerate(enabled_agents):
-                if idx == 0:
-                    pane_target = current_pane
-                else:
-                    pane_target = self.tmux(
-                        "split-window",
-                        "-h",
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                        "-t",
-                        current_pane,
-                        capture=True,
-                    ).stdout.strip()
-                    current_pane = pane_target
-                self.pane_targets[agent["name"]] = pane_target
-                self.state.patch_agent(
-                    agent["name"],
-                    {
-                        "pane_target": pane_target,
-                        "mirror_mode": agent["mirror_mode"],
-                        "mirror_view": "log",
-                        "selected_model": agent.get("selected_model", "default"),
-                        "selected_effort": agent.get("selected_effort", "default"),
-                        "model_options": agent.get("model_options", []),
-                        "effort_options": agent.get("effort_options", []),
-                        "effort_matrix": agent.get("effort_matrix", {}),
-                    },
-                )
+        for agent in enabled_agents:
+            name = agent["name"]
+            self.tmux("new-window", "-d", "-t", self.session, "-n", name)
+            pane_target = f"{self.session}:{name}.0"
+            self.pane_targets[name] = pane_target
+            self.state.patch_agent(
+                name,
+                {
+                    "pane_target": pane_target,
+                    "mirror_mode": agent["mirror_mode"],
+                    "mirror_view": "log",
+                    "selected_model": agent.get("selected_model", "default"),
+                    "selected_effort": agent.get("selected_effort", "default"),
+                    "model_options": agent.get("model_options", []),
+                    "effort_options": agent.get("effort_options", []),
+                    "effort_matrix": agent.get("effort_matrix", {}),
+                },
+            )
 
-        self.tmux("select-layout", "-t", f"{self.session}:0", "main-horizontal", check=False)
-        self.tmux("set-window-option", "-t", f"{self.session}:0", "main-pane-height", "30", check=False)
-        self.tmux("select-pane", "-t", f"{self.session}:0.0", check=False)
+        # Dispatcher monitor window — shows Ollama router status
+        dispatcher_script = (
+            "echo '[DISPATCHER] Ollama router monitor'; "
+            "while true; do "
+            "echo \"--- $(date) ---\"; "
+            "curl -s http://localhost:11434/api/tags 2>/dev/null "
+            "| python3 -c \""
+            "import json,sys; d=json.load(sys.stdin); "
+            "[print(' ', m['name']) for m in d.get('models',[])]"
+            "\" 2>/dev/null || echo '  Ollama not reachable'; "
+            "sleep 10; "
+            "done"
+        )
+        dispatcher_pane = f"{self.session}:DISPATCHER.0"
+        self.tmux(
+            "new-window", "-d", "-t", self.session, "-n", "DISPATCHER",
+            f"cd {shlex.quote(str(SCRIPT_DIR))} && bash -lc {shlex.quote(dispatcher_script)}",
+        )
+        self.pane_targets["DISPATCHER"] = dispatcher_pane
+        self.state.patch("dispatcher", {"pane_target": dispatcher_pane})
+
+        # Runtime log window
         self.tmux(
             "new-window",
             "-d",
@@ -881,12 +947,16 @@ class RuntimeSupervisor:
     def collect_pane_commands(self) -> dict[str, str]:
         if not self.tmux_session_exists():
             return {}
+        # Query all windows in the session (each agent now has its own window).
+        # Map both the raw tmux pane id (%7) and window-style targets
+        # (triagent:CODEX.0) so health checks keep working across layout changes.
         result = self.tmux(
             "list-panes",
+            "-s",
             "-t",
-            f"{self.session}:0",
+            self.session,
             "-F",
-            "#{pane_id}\t#{pane_current_command}",
+            "#{pane_id}\t#{session_name}:#{window_name}.#{pane_index}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}",
             capture=True,
         )
         pane_commands: dict[str, str] = {}
@@ -894,8 +964,14 @@ class RuntimeSupervisor:
             line = raw_line.strip()
             if not line:
                 continue
-            pane_id, pane_command = line.split("\t", 1)
-            pane_commands[pane_id] = pane_command.strip()
+            parts = line.split("\t", 3)
+            if len(parts) != 4:
+                continue
+            pane_id, named_target, indexed_target, pane_command = parts
+            normalized_command = pane_command.strip()
+            for key in (pane_id.strip(), named_target.strip(), indexed_target.strip()):
+                if key:
+                    pane_commands[key] = normalized_command
         return pane_commands
 
     def _send_to_socket(self, message: dict[str, Any]) -> bool:
@@ -1547,13 +1623,19 @@ class RuntimeSupervisor:
                                 "latest_id": supervisor.event_store.latest_event_id(),
                             }
                         )
+                    q = supervisor.sse_subscribe()
+                    if q is None:
+                        self.send_error(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            "Too many SSE subscribers",
+                        )
+                        return
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                     self.send_header("Connection", "keep-alive")
                     self.send_header("X-Accel-Buffering", "no")
                     self.end_headers()
-                    q = supervisor.sse_subscribe()
                     try:
                         supervisor.refresh_workspace_state()
                         snapshot = supervisor.state.snapshot()
@@ -1595,7 +1677,7 @@ class RuntimeSupervisor:
                 parsed = urlparse(self.path)
                 if parsed.path == "/api/unlock":
                     payload = self._payload()
-                    if str(payload.get("password", "")) != supervisor.password():
+                    if not supervisor.verify_password(str(payload.get("password", ""))):
                         return self._json({"ok": False, "error": "invalid password"}, status=HTTPStatus.UNAUTHORIZED)
 
                     token = secrets.token_urlsafe(24)

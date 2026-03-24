@@ -1,4 +1,4 @@
-# Current Issues — UAT 2026-03-22
+# Current Issues — UAT 2026-03-22 (last reviewed 2026-03-24)
 
 Acknowledged by: Claude (agent)
 Reported by: Farhan
@@ -65,6 +65,6 @@ The TX/RX signal LEDs on each engine control card (`sig-light--tx`, `sig-light--
 | # | Issue | Status | Notes |
 |---|-------|--------|-------|
 | 1 | Dropdown z-index | **Fixed** | `.chrome { z-index: 9999 }` — Gemini |
-| 2 | Redundant gauge / workspace handler | **Open** | `#workspaceTachs` still renders duplicate tachs |
-| 3 | Compact Context behavior | **Open** | Backend `/api/compact` needs archival + transcript summary injection |
+| 2 | Redundant gauge / workspace handler | **Fixed** | `#workspaceTachs`/`htach` removed from UI (verified 2026-03-24) |
+| 3 | Compact Context behavior | **Fixed** | `compact_context()` in supervisor.py archives transcript + injects summary via dispatcher or fallback (verified 2026-03-24) |
 | 4 | DSP TX/RX lights | **Fixed** | CSS `.active` classes added; SSE handler bug fixed (route was always undefined — reads `rest.target` from flat payload now) |

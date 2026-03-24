@@ -155,14 +155,16 @@ statusGrid.addEventListener("click", async (event) => {
   if (inspectButton && !inspectButton.disabled) {
     const paneTarget = inspectButton.dataset.inspect;
     const attachCmd = latestState?.tmux?.attach_command || "tmux attach -t triagent";
-    const cmd = `tmux select-pane -t ${paneTarget} && ${attachCmd}`;
+    // pane_target is "session:WINDOW.0" — select-window on "session:WINDOW"
+    const windowTarget = paneTarget.replace(/\.\d+$/, "");
+    const cmd = `tmux select-window -t ${windowTarget} && ${attachCmd}`;
     try {
       await navigator.clipboard.writeText(cmd);
       inspectButton.textContent = "Copied";
-      setTimeout(() => { inspectButton.textContent = "Inspect Stroker"; }, 1200);
+      setTimeout(() => { inspectButton.textContent = "Inspect"; }, 1200);
     } catch {
       inspectButton.textContent = "Copy failed";
-      setTimeout(() => { inspectButton.textContent = "Inspect Stroker"; }, 1200);
+      setTimeout(() => { inspectButton.textContent = "Inspect"; }, 1200);
     }
     return;
   }
@@ -835,8 +837,8 @@ function renderEngines(agents) {
           data-agent="${name}"
           data-inspect="${payload.pane_target || ""}"
           ${payload.pane_target ? "" : "disabled"}
-          title="${payload.pane_target ? `Copy: tmux select-pane -t ${payload.pane_target} &amp;&amp; ${latestState?.tmux?.attach_command || "tmux attach -t triagent"}` : "No pane target registered"}"
-        >Inspect Stroker</button>
+          title="${payload.pane_target ? `Copy: tmux select-window -t ${payload.pane_target.replace(/\.\d+$/, "")} &amp;&amp; ${latestState?.tmux?.attach_command || "tmux attach -t triagent"}` : "No pane target registered"}"
+        >Inspect</button>
         <button
           type="button"
           class="compact-btn restart-btn"
@@ -1581,6 +1583,40 @@ function renderDispatcher(state) {
   dispatcherRoutes.textContent = String(d.routes_total || 0);
   dispatcherAbsorbs.textContent = String(d.absorbs_total || 0);
   dispatcherTokens.textContent = (d.tokens_saved || 0).toLocaleString();
+
+  // Dispatcher inspect button — links to triagent:DISPATCHER window
+  let inspectBtn = document.getElementById("dispatcherInspect");
+  if (!inspectBtn) {
+    inspectBtn = document.createElement("button");
+    inspectBtn.id = "dispatcherInspect";
+    inspectBtn.type = "button";
+    inspectBtn.className = "compact-btn";
+    inspectBtn.style.marginLeft = "0.75rem";
+    document.getElementById("dispatcherBar").appendChild(inspectBtn);
+  }
+  const paneTarget = d.pane_target || "";
+  const attachCmd = state.tmux?.attach_command || "tmux attach -t triagent";
+  if (paneTarget) {
+    const windowTarget = paneTarget.replace(/\.\d+$/, "");
+    inspectBtn.textContent = "Inspect";
+    inspectBtn.disabled = false;
+    inspectBtn.title = `Copy: tmux select-window -t ${windowTarget} && ${attachCmd}`;
+    inspectBtn.onclick = async () => {
+      const cmd = `tmux select-window -t ${windowTarget} && ${attachCmd}`;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        inspectBtn.textContent = "Copied";
+        setTimeout(() => { inspectBtn.textContent = "Inspect"; }, 1200);
+      } catch {
+        inspectBtn.textContent = "Copy failed";
+        setTimeout(() => { inspectBtn.textContent = "Inspect"; }, 1200);
+      }
+    };
+  } else {
+    inspectBtn.textContent = "Inspect";
+    inspectBtn.disabled = true;
+    inspectBtn.title = "No pane target registered";
+  }
 }
 
 function renderRouting(state) {

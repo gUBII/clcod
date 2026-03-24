@@ -54,6 +54,25 @@ class RelayTests(unittest.TestCase):
             relay.release_lock(lock_path)
             self.assertFalse(lock_path.exists())
 
+    def test_release_lock_ignores_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / "nonexistent.lock"
+            # Should not raise
+            relay.release_lock(lock_path)
+
+    def test_release_lock_propagates_unexpected_oserror(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / "speaker.lock"
+            lock_path.write_text("lock\n", encoding="utf-8")
+
+            with mock.patch.object(
+                type(lock_path),
+                "unlink",
+                side_effect=PermissionError("operation not permitted"),
+            ):
+                with self.assertRaises(PermissionError):
+                    relay.release_lock(lock_path)
+
     def test_load_config_resolves_relative_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.json"
