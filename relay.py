@@ -24,6 +24,7 @@ import signal
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -88,6 +89,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "socket_path": ".clcod-runtime/room.sock",
         "poll_sec": 0.5,
         "context_len": 6000,
+        "context_exclude_types": ["sync", "project"],  # Claude's suggestion
+        "context_max_messages": 30,                    # Claude's suggestion
+        "context_max_age_minutes": None,               # Optional: filter messages older than this
         "relay_log_path": ".clcod-runtime/relay.log",
         "pid_path": ".clcod-runtime/supervisor.pid",
         "state_path": ".clcod-runtime/state.json",
@@ -98,6 +102,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "tasks_path": ".clcod-runtime/tasks.json",
         "events_db_path": ".clcod-runtime/events.db",
         "archives_dir": ".clcod-runtime/archives",
+        "agent_roles": {}, # New: Store predefined role hints for agents
     },
     "locks": {
         "ttl": 90,
@@ -211,6 +216,52 @@ def read_tail(path: Path, max_chars: int) -> str:
             return f.read()
     except (OSError, UnicodeDecodeError):
         return ""
+
+
+def parse_transcript_messages(raw: str) -> list[dict[str, Any]]:
+    """Parse raw transcript string into a list of message dictionaries."""
+    messages: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        try:
+            message = json.loads(line)
+            if isinstance(message, dict):
+                messages.append(message)
+        except json.JSONDecodeError:
+            # Skip lines that are not valid JSON or are incomplete
+            pass
+    return messages
+
+
+def filter_messages(
+    msgs: list[dict[str, Any]],
+    *,
+    exclude_types: set[str] | None = None,
+    max_age_minutes: int | None = None,
+    max_messages: int | None = None,
+) -> list[dict[str, Any]]:
+    """Filter messages by type, age, and count."""
+    filtered: list[dict[str, Any]] = []
+    exclude_types = exclude_types or set()
+    now_utc = datetime.now(timezone.utc)
+
+    for message in reversed(msgs):  # Process from newest to oldest
+        if message.get("type") in exclude_types:
+            continue
+
+        if max_age_minutes is not None:
+            try:
+                # Parse timestamp and make it timezone-aware (assuming UTC)
+                msg_time = datetime.fromisoformat(message["ts"].replace("Z", "+00:00"))
+                if now_utc - msg_time > timedelta(minutes=max_age_minutes):
+                    continue  # Message is too old
+            except (KeyError, ValueError):
+                pass  # Ignore messages with malformed or missing timestamps
+
+        filtered.append(message)
+        if max_messages is not None and len(filtered) >= max_messages:
+            break
+
+    return list(reversed(filtered))  # Return in chronological order
 
 
 def write_text(path: Path, text: str) -> None:
@@ -444,6 +495,13 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "socket_path": resolve_path(config_dir, str(workspace.get("socket_path", ".clcod-runtime/room.sock"))),
         "poll_sec": float(workspace.get("poll_sec", 0.5)),
         "context_len": int(workspace.get("context_len", 6000)),
+        "context_exclude_types": set(workspace.get("context_exclude_types", ["sync", "project"])),
+        "context_max_messages": int(workspace.get("context_max_messages", 30)),
+        "context_max_age_minutes": (
+            int(workspace["context_max_age_minutes"])
+            if workspace.get("context_max_age_minutes") is not None
+            else None
+        ),
         "relay_log_path": resolve_path(
             config_dir, str(workspace.get("relay_log_path", ".clcod-runtime/relay.log"))
         ),
@@ -474,6 +532,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "archives_dir": resolve_path(
             config_dir, str(workspace.get("archives_dir", ".clcod-runtime/archives"))
         ),
+        "agent_roles": copy.deepcopy(workspace.get("agent_roles", {})),
     }
     variables.update(
         {
@@ -635,6 +694,57 @@ def strip_target_prefix(body: str) -> str:
 
 def task_request_from_message(body: str) -> str:
     return strip_target_prefix(strip_task_prefix(body))
+
+
+def build_structured_context(
+    log_path: Path,
+    context_len: int,
+    *,
+    task: dict[str, Any] | None = None,
+    agent_name: str,
+    exclude_types: set[str] | None = None,
+    max_age_minutes: int | None = None,
+    max_messages: int | None = None,
+    role_hint: str | None = None,
+) -> str:
+    """Build a structured context string from the transcript log."""
+    # Read more characters to ensure we capture full JSON lines near the end
+    raw_log = read_tail(log_path, context_len * 4)
+    messages = parse_transcript_messages(raw_log)
+    filtered_messages = filter_messages(
+        messages,
+        exclude_types=exclude_types,
+        max_age_minutes=max_age_minutes,
+        max_messages=max_messages,
+    )
+
+    context_parts: list[str] = []
+
+    # SECTION 1: System Brief
+    context_parts.append("--- SYSTEM BRIEF ---")
+    context_parts.append(f"You are {agent_name.capitalize()}.")
+    # The actual work_dir will be passed to build_agent_prompt, this is a placeholder
+    context_parts.append(f"Your working directory is {{work_dir}}.")
+    if role_hint:
+        context_parts.append(f"Your current role: {role_hint}")
+    context_parts.append("--- END SYSTEM BRIEF ---")
+
+    # SECTION 2: Active Task
+    if task:
+        context_parts.append("\n--- ACTIVE TASK ---")
+        context_parts.append(f"Task ID: {task.get('id')}")
+        context_parts.append(f"Task Title: {task.get('title')}")
+        context_parts.append(f"Task Request: {task.get('request')}")
+        context_parts.append("--- END ACTIVE TASK ---")
+
+    # SECTION 3: Recent Messages
+    context_parts.append("\n--- RECENT CONVERSATION LOG ---")
+    for msg in filtered_messages:
+        # Re-serialize each message to ensure proper formatting and handling of internal quotes
+        context_parts.append(json.dumps(msg))
+    context_parts.append("--- END RECENT CONVERSATION LOG ---")
+
+    return "\n".join(context_parts)
 
 
 def build_agent_prompt(
@@ -1597,6 +1707,10 @@ async def run_relay(
     tasks_path: Path = workspace["tasks_path"]
     poll_sec = workspace["poll_sec"]
     context_len = workspace["context_len"]
+    context_exclude_types = workspace.get("context_exclude_types", set())
+    context_max_messages = workspace.get("context_max_messages")
+    context_max_age_minutes = workspace.get("context_max_age_minutes")
+    agent_roles = workspace.get("agent_roles", {})
     lock_ttl = config["locks"]["ttl"]
     enabled_agents = [agent for agent in config["agents"] if agent["enabled"]]
     managed_names = {agent["name"] for agent in enabled_agents}
@@ -1726,6 +1840,114 @@ async def run_relay(
                         publish({"type": "task_updated", "task": task})
                     else:
                         relay_log(f"/move: task #{move_id} not found")
+                return
+
+            if lower == "/context-check":
+                # Logic for /context-check command will go here
+            if lower == "/context-check":
+                relay_log(f"[{sender}] /context-check command received")
+
+                # Determine which agent's context to inspect
+                target_agent_name = sender.upper() if sender != "Operator" else "GEMINI" # Default to GEMINI if Operator
+
+                # Retrieve config values from the outer scope
+                # log_path, context_len, context_exclude_types, context_max_messages, context_max_age_minutes, agent_roles, tasks_path are available from run_relay's scope
+
+                # Find an agent definition
+                agent_config = next((a for a in enabled_agents if a["name"] == target_agent_name), None)
+                if not agent_config:
+                    await append_reply(
+                        write_lock,
+                        log_path,
+                        "SYSTEM",
+                        f"Could not find configuration for agent {target_agent_name}.",
+                        event_callback=event_callback,
+                        event_store=event_store,
+                    )
+                    return
+
+                # Generate the structured context string
+                current_work_dir = str(SCRIPT_DIR) # Default, will be overridden if project is active
+                projects = load_projects(projects_path)
+                active_id = projects.get("active")
+                if active_id:
+                    active_project = projects.get("projects", {}).get(active_id)
+                    if active_project:
+                        current_work_dir = active_project["path"]
+
+                # Find active task for the agent
+                active_task_info = None
+                all_tasks = load_tasks(tasks_path)["tasks"]
+                for t in all_tasks:
+                    if t["status"] == "in_progress" and target_agent_name in t.get("assigned_to", []):
+                        active_task_info = {"id": t["id"], "title": t["title"], "request": t["source_message"]}
+                        break
+                # If no specific task for this agent, check for any in-progress task
+                if not active_task_info:
+                     for t in all_tasks:
+                        if t["status"] == "in_progress":
+                            active_task_info = {"id": t["id"], "title": t["title"], "request": t["source_message"]}
+                            break
+
+                role_hint = agent_roles.get(target_agent_name)
+
+                # The work_dir placeholder in build_structured_context is formatted outside
+                structured_context_raw = build_structured_context(
+                    log_path,
+                    context_len,
+                    task=active_task_info,
+                    agent_name=target_agent_name,
+                    exclude_types=context_exclude_types,
+                    max_age_minutes=context_max_age_minutes,
+                    max_messages=context_max_messages,
+                    role_hint=role_hint,
+                )
+                structured_context = structured_context_raw.format(work_dir=current_work_dir)
+
+
+                # Analyze raw log for metrics
+                full_raw_log = read_text(log_path) # Read entire log file
+                all_messages = parse_transcript_messages(full_raw_log)
+                initial_message_count = len(all_messages)
+
+                filtered_for_metrics = filter_messages(
+                    all_messages,
+                    exclude_types=context_exclude_types,
+                    max_age_minutes=context_max_age_minutes,
+                    max_messages=context_max_messages,
+                )
+                messages_included_count = len(filtered_for_metrics)
+                messages_filtered_count = initial_message_count - messages_included_count
+
+                oldest_message_ts = filtered_for_metrics[0]["ts"] if filtered_for_metrics else "N/A"
+
+                # Calculate metrics
+                total_chars = len(structured_context)
+                estimated_tokens = total_chars // 4 # Common heuristic
+
+                report_parts = [
+                    f"--- CONTEXT AUDIT REPORT for {target_agent_name} ---",
+                    f"Total Characters in Context Window: {total_chars}",
+                    f"Estimated Tokens (heuristic): {estimated_tokens}",
+                    f"Messages Included: {messages_included_count}",
+                    f"Messages Filtered Out: {messages_filtered_count} (types: {', '.join(context_exclude_types) if context_exclude_types else 'None'})",
+                    f"Oldest Message Timestamp: {oldest_message_ts}",
+                    f"Active Task: {active_task_info['title']} (ID: {active_task_info['id']})" if active_task_info else "Active Task: None",
+                    f"Agent Role Hint: {role_hint or 'None'}",
+                    "--- END REPORT ---",
+                ]
+                report = "\n".join(report_parts)
+                relay_log(report) # Log to relay log
+
+                # Publish as SYSTEM message
+                await append_reply(
+                    write_lock,
+                    log_path,
+                    "SYSTEM",
+                    report,
+                    event_callback=event_callback,
+                    event_store=event_store,
+                )
                 return
 
             explicit_target = extract_target(body)
@@ -1952,7 +2174,6 @@ async def run_relay(
                     },
                 )
 
-                context = read_tail(log_path, context_len)
                 work_dir = str(SCRIPT_DIR)
                 projects = load_projects(projects_path)
                 active_id = projects.get("active")
@@ -2033,13 +2254,20 @@ async def run_relay(
                 for agent in target_agents:
                     agent["work_dir"] = work_dir
 
-                context = read_tail(log_path, context_len)
-
                 task = job.get("task")
                 prompts = {
                     agent["name"]: build_agent_prompt(
                         agent_name=agent["name"],
-                        context=context,
+                        context=build_structured_context(
+                            log_path,
+                            context_len,
+                            task=task,
+                            agent_name=agent["name"],
+                            exclude_types=context_exclude_types,
+                            max_age_minutes=context_max_age_minutes,
+                            max_messages=context_max_messages,
+                            role_hint=agent_roles.get(agent["name"]),
+                        ).format(work_dir=work_dir),
                         work_dir=work_dir,
                         task=task,
                     )
