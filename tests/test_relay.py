@@ -104,6 +104,68 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(config["agents"][0]["args"], ["-p"])
             self.assertEqual(config["agents"][0]["preseed_session_id"], "seed-1")
 
+    def test_load_config_preserves_runtime_workdir_templates_in_agent_args(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "name": "CODEX",
+                                "cmd": "codex",
+                                "args": ["exec", "-C", "{script_dir}"],
+                                "invoke_resume_args": [
+                                    "exec",
+                                    "--dangerously-bypass-approvals-and-sandbox",
+                                    "-C",
+                                    "{script_dir}",
+                                    "resume",
+                                    "{session_id}",
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = relay.load_config(config_path)
+            agent = config["agents"][0]
+
+            self.assertEqual(agent["args"], ["exec", "-C", "{script_dir}"])
+            self.assertEqual(
+                agent["invoke_resume_args"],
+                [
+                    "exec",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-C",
+                    "{script_dir}",
+                    "resume",
+                    "{session_id}",
+                ],
+            )
+
+            agent["work_dir"] = "/tmp/demo-project"
+            cmd, _ = relay.build_agent_command(agent, "hello", None)
+            resume_cmd, session_id = relay.build_agent_command(agent, "hello", "session-1")
+
+            self.assertEqual(cmd, ["codex", "exec", "-C", "/tmp/demo-project", "hello"])
+            self.assertEqual(session_id, "session-1")
+            self.assertEqual(
+                resume_cmd,
+                [
+                    "codex",
+                    "exec",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-C",
+                    "/tmp/demo-project",
+                    "resume",
+                    "session-1",
+                    "hello",
+                ],
+            )
+
     def test_build_agent_command_preseeds_session_id_for_resume_agents(self):
         agent = {
             "name": "CLAUDE",

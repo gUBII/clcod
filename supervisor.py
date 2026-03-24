@@ -698,7 +698,7 @@ class RuntimeSupervisor:
         for agent in self.config["agents"]:
             if agent["enabled"]:
                 agent["work_dir"] = project_path
-        self.mirror_keys.clear()
+        self.reset_all_agent_sessions()
         self.sync_agent_mirrors(force=True)
 
         lock_body = f"[PROJECT] Locked to: {target_name} ({project_path})"
@@ -714,7 +714,7 @@ class RuntimeSupervisor:
 
         for agent in self.config["agents"]:
             agent.pop("work_dir", None)
-        self.mirror_keys.clear()
+        self.reset_all_agent_sessions()
         self.sync_agent_mirrors(force=True)
 
         self.persist_system_message(
@@ -732,6 +732,8 @@ class RuntimeSupervisor:
             projects["active"] = None
             for agent in self.config["agents"]:
                 agent.pop("work_dir", None)
+            self.reset_all_agent_sessions()
+            self.sync_agent_mirrors(force=True)
         del projects["projects"][project_id]
         relay.save_projects(self.projects_path, projects)
         return projects
@@ -742,6 +744,10 @@ class RuntimeSupervisor:
             del sessions[name]
             relay.save_sessions(self.workspace["sessions_path"], sessions)
         self.mirror_keys.pop(name, None)
+
+    def reset_all_agent_sessions(self) -> None:
+        relay.save_sessions(self.workspace["sessions_path"], {})
+        self.mirror_keys.clear()
 
     def update_agent_settings(
         self,

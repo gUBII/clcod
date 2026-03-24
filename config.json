@@ -56,10 +56,15 @@
       ],
       "invoke_resume_args": [
         "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        "{script_dir}",
         "resume",
         "{session_id}"
       ],
       "mirror_resume_args": [
+        "--skip-git-repo-check",
         "resume",
         "--dangerously-bypass-approvals-and-sandbox",
         "--no-alt-screen",

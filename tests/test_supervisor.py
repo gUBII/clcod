@@ -239,6 +239,39 @@ class SupervisorTests(unittest.TestCase):
             self.assertTrue(all(agent.get("work_dir") == str(repo_dir.resolve()) for agent in config["agents"] if agent["enabled"]))
             runtime.sync_agent_mirrors.assert_called_once_with(force=True)
 
+    def test_lock_project_clears_saved_sessions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            runtime = supervisor.RuntimeSupervisor(config)
+            runtime.sync_agent_mirrors = mock.Mock()
+            relay.save_sessions(
+                config["workspace"]["sessions_path"],
+                {"CODEX": "session-1", "CLAUDE": "session-2"},
+            )
+
+            runtime.lock_project(path=str(repo_dir))
+
+            self.assertEqual(relay.load_sessions(config["workspace"]["sessions_path"]), {})
+
     def test_handle_relay_event_updates_transcript_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.json"

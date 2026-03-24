@@ -30,6 +30,9 @@ from typing import Any, Callable
 
 import dispatcher as dispatcher_mod
 from event_store import EventStore
+import grpc
+import service_pb2
+import service_pb2_grpc
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
@@ -62,8 +65,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "-C",
                 "{script_dir}",
             ],
-            "invoke_resume_args": ["exec", "resume", "{session_id}"],
-            "mirror_resume_args": ["resume", "--no-alt-screen", "-C", "{script_dir}", "{session_id}"],
+            "invoke_resume_args": [
+                "exec",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                "{script_dir}",
+                "resume",
+                "{session_id}",
+            ],
+            "mirror_resume_args": [
+                "--skip-git-repo-check",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--no-alt-screen",
+                "-C",
+                "{script_dir}",
+                "{session_id}",
+            ],
             "model_arg": ["-m", "{value}"],
             "effort_arg": ["-c", "model_reasoning_effort=\"{value}\""],
             "mirror_mode": "resume",
@@ -74,12 +93,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {
             "name": "GEMINI",
             "enabled": True,
-            "cmd": "gemini",
-            "args": ["-y", "-p"],
+            "grpc_target": "unix:///tmp/gemini_grpc.sock",
             "model_arg": ["--model", "{value}"],
             "model_options": ["default", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
             "mirror_mode": "log",
-            "preseed_session_id": False,
             "timeout": 120,
         },
     ],
@@ -551,6 +568,11 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "archives_dir": str(normalized_workspace["archives_dir"]),
         }
     )
+    agent_arg_variables = {
+        key: value
+        for key, value in variables.items()
+        if key not in {"script_dir", "work_dir"}
+    }
 
     agents: list[dict[str, Any]] = []
     raw_agents = config.get("agents", [])
@@ -562,8 +584,9 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
 
         name = str(raw_agent.get("name", "")).strip().upper()
         cmd = str(raw_agent.get("cmd", "")).strip()
-        if not name or not cmd:
-            raise ValueError("each agent requires non-empty name and cmd fields")
+        grpc_target = str(raw_agent.get("grpc_target", "")).strip()
+        if not name or (not cmd and not grpc_target):
+            raise ValueError("each agent requires non-empty name and either cmd or grpc_target")
 
         args = normalize_argv(raw_agent.get("args", []), name, "args")
         invoke_resume_args = normalize_argv(
@@ -610,10 +633,11 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         agent = {
             "name": name,
             "enabled": bool(raw_agent.get("enabled", True)),
-            "cmd": interpolate(cmd, variables),
-            "args": interpolate(args, variables),
-            "invoke_resume_args": interpolate(invoke_resume_args, variables),
-            "mirror_resume_args": interpolate(mirror_resume_args, variables),
+            "cmd": interpolate(cmd, variables) if cmd else "",
+            "grpc_target": interpolate(grpc_target, variables) if grpc_target else "",
+            "args": interpolate(args, agent_arg_variables),
+            "invoke_resume_args": interpolate(invoke_resume_args, agent_arg_variables),
+            "mirror_resume_args": interpolate(mirror_resume_args, agent_arg_variables),
             "model_arg": interpolate(model_arg, variables),
             "effort_arg": interpolate(effort_arg, variables),
             "model_options": interpolate(model_options, variables),
@@ -741,7 +765,8 @@ def build_structured_context(
     context_parts.append("\n--- RECENT CONVERSATION LOG ---")
     for msg in filtered_messages:
         # Re-serialize each message to ensure proper formatting and handling of internal quotes
-        context_parts.append(json.dumps(msg))
+        # Escape curly braces to prevent .format() from mis-interpreting them
+        context_parts.append(json.dumps(msg).replace("{", "{{").replace("}", "}}"))
     context_parts.append("--- END RECENT CONVERSATION LOG ---")
 
     return "\n".join(context_parts)
@@ -1390,12 +1415,42 @@ async def _exec_agent(
 _SESSION_IN_USE_RE = re.compile(r"session\s+id\s+\S+\s+is\s+already\s+in\s+use", re.IGNORECASE)
 
 
+async def call_gemini_grpc(agent: dict[str, Any], prompt: str) -> AgentCallResult:
+    """Call the Gemini agent via gRPC."""
+    target = agent.get("grpc_target")
+    if not target:
+        raise ValueError("GEMINI agent config is missing grpc_target")
+
+    try:
+        async with grpc.aio.insecure_channel(target) as channel:
+            stub = service_pb2_grpc.DataRouterStub(channel)
+            request = service_pb2.PayloadRequest(
+                client_id="relay.py",
+                data=prompt.encode("utf-8")
+            )
+            response = await stub.SendPayload(request)
+            return AgentCallResult(
+                reply=response.message,
+                raw=response.message,
+                stderr="",
+                session_id=None, # gRPC is sessionless in this model
+            )
+    except grpc.aio.AioRpcError as e:
+        relay_log(f"GEMINI gRPC Error: {e.code()} - {e.details()}")
+        raise RuntimeError(f"gRPC call failed: {e.details()}") from e
+
+
 async def call_agent(
     agent: dict[str, Any],
     prompt: str,
     sessions_path: Path,
     session_lock: asyncio.Lock,
 ) -> AgentCallResult:
+    # If the agent is Gemini and configured for gRPC, use the new path.
+    if agent["name"] == "GEMINI" and "grpc_target" in agent:
+        return await call_gemini_grpc(agent, prompt)
+
+    # Existing logic for other agents
     env = dict(os.environ)
     if agent["name"] == "CLAUDE":
         env["CLAUDECODE"] = ""
@@ -2015,62 +2070,61 @@ async def run_relay(
                     relay_log(f"[{sender}] mentioned unknown agent @{explicit_target} (valid: {', '.join(sorted(valid_agent_names))})")
                     dispatch_targets = enabled_agents
                     requested_target = explicit_target
+            elif dispatch_config.get("enabled"):
+                try:
+                    dispatcher_decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
+                    action = dispatcher_decision.get("action", "route")
+                    relay_log(f"dispatcher: action={action} targets={dispatcher_decision.get('targets')} type={dispatcher_decision.get('task_type')}")
+                    dispatcher_event: dict[str, Any] = {
+                        "type": "dispatcher",
+                        "action": action,
+                        "targets": dispatcher_decision.get("targets", []),
+                    }
+                    # Only include task metadata when the message is an explicit /task command
+                    if body.strip().lower().startswith("/task"):
+                        dispatcher_event["task_type"] = dispatcher_decision.get("task_type")
+                        dispatcher_event["priority"] = dispatcher_decision.get("priority")
+                    publish(dispatcher_event)
+
+                    is_slash_task = lower.startswith("/task")
+
+                    if action == "absorb" and dispatcher_decision.get("reply"):
+                        await append_reply(
+                            write_lock,
+                            log_path,
+                            "DISPATCHER",
+                            dispatcher_decision["reply"],
+                            event_callback=event_callback,
+                            event_store=event_store,
+                        )
+                        relay_log(f"dispatcher absorbed: {dispatcher_decision['reply'][:80]}")
+                        if not is_slash_task:
+                            return
+
+                    if action == "clarify" and dispatcher_decision.get("reply"):
+                        await append_reply(
+                            write_lock,
+                            log_path,
+                            "DISPATCHER",
+                            dispatcher_decision["reply"],
+                            event_callback=event_callback,
+                            event_store=event_store,
+                        )
+                        relay_log(f"dispatcher clarifying: {dispatcher_decision['reply'][:80]}")
+                        if not is_slash_task:
+                            return
+
+                    if action == "route" and dispatcher_decision.get("targets"):
+                        target_names = set(dispatcher_decision["targets"])
+                        filtered = [a for a in enabled_agents if a["name"] in target_names]
+                        if filtered:
+                            dispatch_targets = filtered
+                            requested_target = " ".join(target_names)
+                            relay_log(f"dispatcher routed to: {', '.join(a['name'] for a in dispatch_targets)}")
+                except Exception as exc:
+                    relay_log(f"dispatcher error (falling back to broadcast): {exc}")
             else:
-                if dispatch_config.get("enabled"):
-                    try:
-                        dispatcher_decision = await dispatcher_mod.classify_message(body, context, dispatch_config)
-                        action = dispatcher_decision.get("action", "route")
-                        relay_log(f"dispatcher: action={action} targets={dispatcher_decision.get('targets')} type={dispatcher_decision.get('task_type')}")
-                        dispatcher_event: dict[str, Any] = {
-                            "type": "dispatcher",
-                            "action": action,
-                            "targets": dispatcher_decision.get("targets", []),
-                        }
-                        # Only include task metadata when the message is an explicit /task command
-                        if body.strip().lower().startswith("/task"):
-                            dispatcher_event["task_type"] = dispatcher_decision.get("task_type")
-                            dispatcher_event["priority"] = dispatcher_decision.get("priority")
-                        publish(dispatcher_event)
-
-                        is_slash_task = lower.startswith("/task")
-
-                        if action == "absorb" and dispatcher_decision.get("reply"):
-                            await append_reply(
-                                write_lock,
-                                log_path,
-                                "DISPATCHER",
-                                dispatcher_decision["reply"],
-                                event_callback=event_callback,
-                                event_store=event_store,
-                            )
-                            relay_log(f"dispatcher absorbed: {dispatcher_decision['reply'][:80]}")
-                            if not is_slash_task:
-                                return
-
-                        if action == "clarify" and dispatcher_decision.get("reply"):
-                            await append_reply(
-                                write_lock,
-                                log_path,
-                                "DISPATCHER",
-                                dispatcher_decision["reply"],
-                                event_callback=event_callback,
-                                event_store=event_store,
-                            )
-                            relay_log(f"dispatcher clarifying: {dispatcher_decision['reply'][:80]}")
-                            if not is_slash_task:
-                                return
-
-                        if action == "route" and dispatcher_decision.get("targets"):
-                            target_names = set(dispatcher_decision["targets"])
-                            filtered = [a for a in enabled_agents if a["name"] in target_names]
-                            if filtered:
-                                dispatch_targets = filtered
-                                requested_target = " ".join(target_names)
-                                relay_log(f"dispatcher routed to: {', '.join(a['name'] for a in dispatch_targets)}")
-                    except Exception as exc:
-                        relay_log(f"dispatcher error (falling back to broadcast): {exc}")
-                else:
-                    relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
+                relay_log(f"[{sender}] spoke -> {', '.join(agent['name'] for agent in enabled_agents)}")
 
             task: dict[str, Any] | None = None
             task_prompt: dict[str, Any] | None = None
@@ -2234,18 +2288,19 @@ async def run_relay(
                     await asyncio.sleep(0.3)
                     continue
 
+                relay_log(f"[DEBUG] Job claimed: id={job.get('id')}, keys={list(job.keys())}")
                 target_names = set(job["targets"])
                 target_agents = [a for a in enabled_agents if a["name"] in target_names]
                 if not target_agents:
-                    event_store.complete_dispatch(job["id"], "failed", "no matching agents")
+                    event_store.complete_dispatch(job.get("id"), "failed", "no matching agents")
                     publish({
                         "type": "dispatch_failed",
-                        "job_id": job["id"],
+                        "job_id": job.get("id"),
                         "targets": job["targets"],
                         "error": "no matching agents",
                         "queue_depth": event_store.queue_depth(),
                     })
-                    relay_log(f"dispatch job #{job['id']} failed: no matching agents for {job['targets']}")
+                    relay_log(f"dispatch job #{job.get('id')} failed: no matching agents for {job['targets']}")
                     continue
 
                 work_dir = job.get("work_dir") or str(SCRIPT_DIR)
@@ -2293,7 +2348,7 @@ async def run_relay(
 
                 publish({
                     "type": "dispatch_started",
-                    "job_id": job["id"],
+                    "job_id": job.get("id"),
                     "targets": job["targets"],
                     "sender": job.get("sender"),
                     "queue_depth": event_store.queue_depth(),
@@ -2317,10 +2372,10 @@ async def run_relay(
                     ]
                 )
 
-                event_store.complete_dispatch(job["id"], "done")
+                event_store.complete_dispatch(job.get("id"), "done")
                 publish({
                     "type": "dispatch_completed",
-                    "job_id": job["id"],
+                    "job_id": job.get("id"),
                     "targets": job["targets"],
                     "queue_depth": event_store.queue_depth(),
                 })
@@ -2329,15 +2384,21 @@ async def run_relay(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                import traceback
+                relay_log(f"dispatch error (job={job.get('id') if job else None}): {type(exc).__name__}: {exc}")
+                relay_log(f"traceback: {traceback.format_exc()[:500]}")
                 if job:
-                    event_store.complete_dispatch(job["id"], "failed", str(exc))
-                    publish({
-                        "type": "dispatch_failed",
-                        "job_id": job["id"],
-                        "targets": job.get("targets", []),
-                        "error": str(exc),
-                        "queue_depth": event_store.queue_depth(),
-                    })
+                    try:
+                        event_store.complete_dispatch(job.get("id"), "failed", str(exc))
+                        publish({
+                            "type": "dispatch_failed",
+                            "job_id": job.get("id"),
+                            "targets": job.get("targets", []),
+                            "error": str(exc),
+                            "queue_depth": event_store.queue_depth(),
+                        })
+                    except Exception as inner_exc:
+                        relay_log(f"error in error handler: {inner_exc}")
                 relay_log(f"dispatch drain error: {exc}")
 
     if socket_path.exists():
