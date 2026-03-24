@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package ipc;
+
+// The data routing service definition
+service DataRouter {
+  // Unary RPC for sending payloads
+  rpc SendPayload (PayloadRequest) returns (PayloadResponse) {}
+}
+
+// The request containing the client identifier and the binary payload
+message PayloadRequest {
+  string client_id = 1;
+  bytes data = 2; // Binary representation of the 1KB-500KB payload
+}
+
+// The server's acknowledgment response
+message PayloadResponse {
+  bool success = 1;
+  string message = 2;
+}
