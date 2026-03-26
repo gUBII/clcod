@@ -1,5 +1,10 @@
 # Next Upgrade Plan
 
+> Backlog/context note only.
+> Do not treat this file as the live runtime spec.
+> For current behavior, use `docs/architecture.md`, `docs/operations.md`, and
+> the code/tests.
+
 
 
 ---
@@ -854,4 +859,3 @@ Execute in this order — each fix is independent but P1 tasks remove blocking n
 - [ ] BUG-4: Restart supervisor, disconnect/reconnect browser — confirm relay.log shows no ConnectionResetError tracebacks
 - [ ] BUG-2: Trigger an intentional agent error, confirm UI shows “error” not “no fuel left”, and last_error text is visible
 - [ ] BUG-5: Inspect prompt passed to agent in agent IO log — confirm `[SPEAKER] body` format, no raw JSON
-

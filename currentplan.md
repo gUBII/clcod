@@ -1,5 +1,10 @@
 # Current Plan — Critical Bug Fixes & Stability Improvements
 
+> Historical planning note only.
+> Do not treat this file as the live runtime spec.
+> Phase 2.2 task state normalization has since shipped.
+> Current truth lives in `docs/architecture.md` and the code/tests.
+
 **Created:** 2026-03-24
 **Updated:** 2026-03-24
 **Status:** ALL ISSUES COMPLETE (10/10)
