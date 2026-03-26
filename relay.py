@@ -1447,7 +1447,7 @@ async def call_agent(
     session_lock: asyncio.Lock,
 ) -> AgentCallResult:
     # If the agent is Gemini and configured for gRPC, use the new path.
-    if agent["name"] == "GEMINI" and "grpc_target" in agent:
+    if agent["name"] == "GEMINI" and agent.get("grpc_target"):
         return await call_gemini_grpc(agent, prompt)
 
     # Existing logic for other agents

@@ -41,6 +41,8 @@
       ],
       "mirror_mode": "log",
       "preseed_session_id": true,
+      "selected_model": "sonnet",
+      "selected_effort": "medium",
       "timeout": 180
     },
     {
