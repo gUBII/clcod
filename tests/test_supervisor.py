@@ -1,10 +1,12 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from event_store import EventStore
 import relay
 import supervisor
 
@@ -186,17 +188,20 @@ class SupervisorTests(unittest.TestCase):
             )
             config = relay.load_config(config_path)
             runtime = supervisor.RuntimeSupervisor(config)
-            relay.save_tasks(
-                config["workspace"]["tasks_path"],
-                {
-                    "next_id": 4,
-                    "tasks": [
-                        {"id": 1, "status": "pending", "created_at": "2026-03-20T09:00:00Z"},
-                        {"id": 2, "status": "assigned", "created_at": "2026-03-20T09:01:00Z"},
-                        {"id": 3, "status": "done", "created_at": "2026-03-20T09:02:00Z"},
-                    ],
-                },
+            runtime.task_state.create_task_command(
+                title="pending task",
+                source_message="/task pending task",
             )
+            runtime.task_state.create_task_command(
+                title="assigned task",
+                assigned_to=["CLAUDE"],
+                source_message="/task assigned task",
+            )
+            third = runtime.task_state.create_task_command(
+                title="done task",
+                source_message="/task done task",
+            )
+            runtime.task_state.update_task_command(third["id"], status="done")
 
             runtime.refresh_task_state()
             snapshot = runtime.state.snapshot()["tasks"]
@@ -205,7 +210,115 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(snapshot["pending"], 1)
             self.assertEqual(snapshot["in_progress"], 1)
             self.assertEqual(snapshot["done"], 1)
-            self.assertEqual(snapshot["last_created_at"], "2026-03-20T09:02:00Z")
+            self.assertTrue(snapshot["last_created_at"])
+
+    def test_runtime_rebuilds_tasks_projection_from_events_on_startup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                            "events_db_path": ".clcod-runtime/events.db",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            event_store = EventStore(config["workspace"]["events_db_path"])
+            event_store.append_event(
+                {
+                    "type": "task_created",
+                    "ts": "2026-03-20T09:00:00Z",
+                    "task_id": 7,
+                    "status": "assigned",
+                    "task": {
+                        "id": 7,
+                        "title": "Replay me",
+                        "type": "general",
+                        "status": "assigned",
+                        "priority": "normal",
+                        "assigned_to": ["CODEX"],
+                        "source_message": "/task Replay me",
+                        "created_at": "2026-03-20T09:00:00Z",
+                        "completed_at": None,
+                        "tokens_spent": 0,
+                    },
+                }
+            )
+            event_store.close()
+            config["workspace"]["tasks_path"].write_text("{not valid json", encoding="utf-8")
+
+            runtime = supervisor.RuntimeSupervisor(config)
+
+            tasks_data = relay.load_tasks(config["workspace"]["tasks_path"])
+            self.assertEqual(tasks_data["tasks"][0]["id"], 7)
+            self.assertEqual(tasks_data["next_id"], 8)
+            self.assertEqual(runtime.state.snapshot()["tasks"]["in_progress"], 1)
+
+    def test_runtime_seeds_legacy_tasks_when_event_history_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspace": {
+                            "log_path": "room.txt",
+                            "relay_log_path": ".clcod-runtime/relay.log",
+                            "state_path": ".clcod-runtime/state.json",
+                            "sessions_path": ".clcod-runtime/sessions.json",
+                            "preferences_path": ".clcod-runtime/preferences.json",
+                            "projects_path": ".clcod-runtime/projects.json",
+                            "tasks_path": ".clcod-runtime/tasks.json",
+                            "events_db_path": ".clcod-runtime/events.db",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = relay.load_config(config_path)
+            relay.save_tasks(
+                config["workspace"]["tasks_path"],
+                {
+                    "next_id": 6,
+                    "tasks": [
+                        {
+                            "id": 5,
+                            "title": "Legacy task",
+                            "type": "general",
+                            "status": "done",
+                            "priority": "normal",
+                            "assigned_to": ["CLAUDE"],
+                            "source_message": "/task Legacy task",
+                            "created_at": "2026-03-20T09:00:00Z",
+                            "completed_at": "2026-03-20T09:05:00Z",
+                            "tokens_spent": 0,
+                        }
+                    ],
+                },
+            )
+
+            runtime = supervisor.RuntimeSupervisor(config)
+
+            conn = sqlite3.connect(config["workspace"]["events_db_path"])
+            count = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE type IN ('task_created', 'task_updated', 'tasks_bulk_updated', 'tasks_updated', 'tasks_cleared')"
+            ).fetchone()[0]
+            conn.close()
+
+            tasks_data = relay.load_tasks(config["workspace"]["tasks_path"])
+            self.assertEqual(count, 1)
+            self.assertEqual(tasks_data["tasks"][0]["id"], 5)
+            self.assertEqual(tasks_data["next_id"], 6)
+            self.assertEqual(runtime.state.snapshot()["tasks"]["done"], 1)
 
     def test_lock_project_sets_active_project_and_agent_workdirs(self):
         with tempfile.TemporaryDirectory() as tmpdir:

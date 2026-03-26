@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -19,6 +20,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 2
+LOGGER = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -213,8 +215,42 @@ class EventStore:
 
     # ── Event store operations ───────────────────────────────────
 
+    def _prepare_event_insert(self, event_data: dict[str, Any]) -> tuple[str, str, Any, Any, Any, Any, Any, dict[str, Any]]:
+        payload = dict(event_data)
+        event_type = str(payload.pop("type"))
+        payload.pop("event_id", None)
+        ts = str(payload.get("ts") or utc_now())
+        correlation_id = payload.get("correlation_id")
+        task_id = payload.get("task_id")
+        sender = payload.get("sender") or payload.get("last_speaker")
+        target = payload.get("target")
+        if not target and isinstance(payload.get("route"), dict):
+            target = payload["route"].get("target")
+        if not target and payload.get("agent"):
+            target = payload.get("agent")
+        status = payload.get("status") or payload.get("state")
+        return (
+            event_type,
+            ts,
+            correlation_id,
+            task_id,
+            sender,
+            target,
+            status,
+            payload,
+        )
+
     def _decode_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        payload = json.loads(row["payload"]) if row["payload"] else {}
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "event_store: skipping malformed payload JSON for event id=%s type=%s: %s",
+                row["id"],
+                row["type"],
+                exc,
+            )
+            payload = {}
         event = {"id": row["id"], "ts": row["ts"], "type": row["type"], **payload}
         if row["correlation_id"] and "correlation_id" not in event:
             event["correlation_id"] = row["correlation_id"]
@@ -229,19 +265,9 @@ class EventStore:
         return event
 
     def append_event(self, event_data: dict[str, Any]) -> dict[str, Any]:
-        payload = dict(event_data)
-        event_type = str(payload.pop("type"))
-        payload.pop("event_id", None)
-        ts = str(payload.get("ts") or utc_now())
-        correlation_id = payload.get("correlation_id")
-        task_id = payload.get("task_id")
-        sender = payload.get("sender") or payload.get("last_speaker")
-        target = payload.get("target")
-        if not target and isinstance(payload.get("route"), dict):
-            target = payload["route"].get("target")
-        if not target and payload.get("agent"):
-            target = payload.get("agent")
-        status = payload.get("status") or payload.get("state")
+        event_type, ts, correlation_id, task_id, sender, target, status, payload = (
+            self._prepare_event_insert(event_data)
+        )
 
         with self._lock:
             cur = self._conn.execute(
@@ -262,7 +288,36 @@ class EventStore:
             )
             self._conn.commit()
             event_id = cur.lastrowid
-        return {"id": event_id, "type": event_type, **payload}
+        return {"id": event_id, "ts": ts, "type": event_type, **payload}
+
+    def append_events(self, event_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not event_data:
+            return []
+
+        prepared = [self._prepare_event_insert(item) for item in event_data]
+        stored: list[dict[str, Any]] = []
+        with self._lock:
+            cur = self._conn.cursor()
+            for event_type, ts, correlation_id, task_id, sender, target, status, payload in prepared:
+                cur.execute(
+                    """
+                    INSERT INTO events (ts, type, correlation_id, task_id, sender, target, status, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts,
+                        event_type,
+                        correlation_id,
+                        task_id,
+                        sender,
+                        target,
+                        status,
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+                stored.append({"id": cur.lastrowid, "ts": ts, "type": event_type, **payload})
+            self._conn.commit()
+        return stored
 
     def list_events(self, after_id: int = 0, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
@@ -282,6 +337,22 @@ class EventStore:
         with self._lock:
             row = self._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM events").fetchone()
         return int(row["max_id"] if row else 0)
+
+    def count_events(self, types: list[str] | tuple[str, ...] | set[str] | None = None) -> int:
+        with self._lock:
+            if types:
+                values = tuple(str(item) for item in types)
+                placeholders = ", ".join("?" for _ in values)
+                row = self._conn.execute(
+                    f"SELECT COUNT(*) AS cnt FROM events WHERE type IN ({placeholders})",
+                    values,
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT COUNT(*) AS cnt FROM events").fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def has_events(self, types: list[str] | tuple[str, ...] | set[str] | None = None) -> bool:
+        return self.count_events(types) > 0
 
     def import_transcript(self, transcript_path: Path | str) -> int:
         path = Path(transcript_path)

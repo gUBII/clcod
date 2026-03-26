@@ -33,6 +33,13 @@ from event_store import EventStore
 import grpc
 import service_pb2
 import service_pb2_grpc
+from task_state import (
+    TASK_STATUSES,
+    TaskStateManager,
+    atomic_write_json,
+    load_tasks_projection,
+    save_tasks_projection,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
@@ -297,7 +304,7 @@ def read_json(path: Path, default: Any) -> Any:
 
 
 def write_json(path: Path, payload: Any) -> None:
-    write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    atomic_write_json(path, payload)
 
 
 def build_option(
@@ -1047,22 +1054,34 @@ def save_projects(path: Path, projects: dict[str, Any]) -> None:
 
 # ── Task queue data model ──────────────────────────────────────
 
-DEFAULT_TASKS: dict[str, Any] = {"tasks": [], "next_id": 1}
-
-TASK_STATUSES = {"pending", "assigned", "in_progress", "review", "done", "blocked", "failed"}
-
-
 def load_tasks(path: Path) -> dict[str, Any]:
-    data = read_json(path, DEFAULT_TASKS)
-    if not isinstance(data, dict):
-        return copy.deepcopy(DEFAULT_TASKS)
-    data.setdefault("tasks", [])
-    data.setdefault("next_id", 1)
-    return data
+    return load_tasks_projection(path)
 
 
 def save_tasks(path: Path, tasks: dict[str, Any]) -> None:
-    write_json(path, tasks)
+    save_tasks_projection(path, tasks)
+
+
+def _task_manager_for_path(
+    tasks_path: Path,
+    *,
+    event_store: EventStore | None = None,
+    state_store: Any | None = None,
+    event_callback: EventCallback | None = None,
+) -> tuple[TaskStateManager, EventStore | None]:
+    store = event_store
+    owned_store: EventStore | None = None
+    if store is None:
+        owned_store = EventStore(tasks_path.parent / "events.db")
+        store = owned_store
+    manager = TaskStateManager(
+        event_store=store,
+        tasks_path=tasks_path,
+        state_store=state_store,
+        event_callback=event_callback,
+    )
+    manager.rebuild_from_events()
+    return manager, owned_store
 
 
 def create_task(
@@ -1073,71 +1092,94 @@ def create_task(
     priority: str = "normal",
     assigned_to: list[str] | None = None,
     source_message: str = "",
+    event_store: EventStore | None = None,
+    state_store: Any | None = None,
+    event_callback: EventCallback | None = None,
 ) -> dict[str, Any]:
-    """Create a new task and persist it. Returns the created task dict."""
-    store = load_tasks(tasks_path)
-    task_id = store["next_id"]
-    store["next_id"] = task_id + 1
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    task = {
-        "id": task_id,
-        "title": title[:200],
-        "type": task_type,
-        "status": "assigned" if assigned_to else "pending",
-        "priority": priority,
-        "assigned_to": assigned_to or [],
-        "source_message": source_message[:500],
-        "created_at": now,
-        "completed_at": None,
-        "tokens_spent": 0,
-    }
-    store["tasks"].append(task)
-    save_tasks(tasks_path, store)
-    return task
+    """Compatibility wrapper for event-first task creation."""
+    manager, owned_store = _task_manager_for_path(
+        tasks_path,
+        event_store=event_store,
+        state_store=state_store,
+        event_callback=event_callback,
+    )
+    try:
+        return manager.create_task_command(
+            title=title,
+            task_type=task_type,
+            priority=priority,
+            assigned_to=assigned_to,
+            source_message=source_message,
+        )
+    finally:
+        if owned_store is not None:
+            owned_store.close()
 
 
-def update_task(tasks_path: Path, task_id: int, new_status: str) -> dict[str, Any] | None:
-    """Update a single task's status. Returns the updated task or None if not found."""
-    if new_status not in TASK_STATUSES:
-        return None
-    store = load_tasks(tasks_path)
-    task = next((t for t in store["tasks"] if t["id"] == task_id), None)
-    if task is None:
-        return None
-    task["status"] = new_status
-    if new_status == "done":
-        task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    save_tasks(tasks_path, store)
-    return task
+def update_task(
+    tasks_path: Path,
+    task_id: int,
+    new_status: str,
+    *,
+    event_store: EventStore | None = None,
+    state_store: Any | None = None,
+    event_callback: EventCallback | None = None,
+) -> dict[str, Any] | None:
+    """Compatibility wrapper for event-first single-task updates."""
+    manager, owned_store = _task_manager_for_path(
+        tasks_path,
+        event_store=event_store,
+        state_store=state_store,
+        event_callback=event_callback,
+    )
+    try:
+        return manager.update_task_command(task_id, status=new_status)
+    finally:
+        if owned_store is not None:
+            owned_store.close()
 
 
-def update_all_tasks(tasks_path: Path, new_status: str) -> list[dict[str, Any]]:
-    """Move all non-done tasks to *new_status*. Returns the list of updated tasks."""
-    if new_status not in TASK_STATUSES:
-        return []
-    store = load_tasks(tasks_path)
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    updated: list[dict[str, Any]] = []
-    for task in store["tasks"]:
-        if task["status"] == new_status:
-            continue
-        task["status"] = new_status
-        if new_status == "done":
-            task["completed_at"] = now
-        updated.append(task)
-    if updated:
-        save_tasks(tasks_path, store)
-    return updated
+def update_all_tasks(
+    tasks_path: Path,
+    new_status: str,
+    *,
+    event_store: EventStore | None = None,
+    state_store: Any | None = None,
+    event_callback: EventCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper for event-first bulk task updates."""
+    manager, owned_store = _task_manager_for_path(
+        tasks_path,
+        event_store=event_store,
+        state_store=state_store,
+        event_callback=event_callback,
+    )
+    try:
+        return manager.bulk_update_tasks_command(new_status)
+    finally:
+        if owned_store is not None:
+            owned_store.close()
 
 
-def clear_all_tasks(tasks_path: Path) -> int:
-    """Delete all tasks and reset the ID counter. Returns the count of cleared tasks."""
-    store = load_tasks(tasks_path)
-    count = len(store["tasks"])
-    store["tasks"] = []
-    store["next_id"] = 1
-    save_tasks(tasks_path, store)
-    return count
+def clear_all_tasks(
+    tasks_path: Path,
+    *,
+    event_store: EventStore | None = None,
+    state_store: Any | None = None,
+    event_callback: EventCallback | None = None,
+) -> int:
+    """Compatibility wrapper for event-first task clearing."""
+    manager, owned_store = _task_manager_for_path(
+        tasks_path,
+        event_store=event_store,
+        state_store=state_store,
+        event_callback=event_callback,
+    )
+    try:
+        return manager.clear_tasks_command()
+    finally:
+        if owned_store is not None:
+            owned_store.close()
 
 
 def load_sessions(path: Path) -> dict[str, str]:
@@ -1753,6 +1795,7 @@ async def run_relay(
     stop_event: asyncio.Event | None = None,
     is_sleeping: Callable[[], bool] | None = None,
     event_store: EventStore | None = None,
+    task_manager: TaskStateManager | None = None,
 ) -> int:
     workspace = config["workspace"]
     log_path: Path = workspace["log_path"]
@@ -1787,6 +1830,18 @@ async def run_relay(
     if event_store is None:
         event_store = EventStore(workspace["events_db_path"])
         owns_event_store = True
+
+    owns_task_manager = False
+    if task_manager is None:
+        task_manager = TaskStateManager(
+            event_store=event_store,
+            tasks_path=tasks_path,
+            event_callback=event_callback,
+        )
+        task_manager.rebuild_from_events()
+        owns_task_manager = True
+    else:
+        task_manager.set_event_callback(event_callback)
 
     def publish(event: dict[str, Any]) -> dict[str, Any]:
         return emit_event(event_callback, event, event_store=event_store)
@@ -1856,9 +1911,8 @@ async def run_relay(
             lower = stripped.lower()
 
             if lower == "/clearall":
-                count = clear_all_tasks(tasks_path)
+                count = task_manager.clear_tasks_command()
                 relay_log(f"/clearall: {count} task(s) removed, board reset")
-                publish({"type": "tasks_cleared", "tasks": []})
                 return
 
             if lower.startswith("/moveall "):
@@ -1866,15 +1920,8 @@ async def run_relay(
                 if target_status not in TASK_STATUSES:
                     relay_log(f"/moveall: invalid status '{target_status}'")
                 else:
-                    updated = update_all_tasks(tasks_path, target_status)
+                    updated = task_manager.bulk_update_tasks_command(target_status)
                     relay_log(f"/moveall -> {target_status}: {len(updated)} task(s) updated")
-                    publish(
-                        {
-                            "type": "tasks_updated",
-                            "tasks": updated,
-                            "new_status": target_status,
-                        }
-                    )
                 return
 
             if lower.startswith("/move "):
@@ -1889,10 +1936,9 @@ async def run_relay(
                     if target_status not in TASK_STATUSES:
                         relay_log(f"/move: invalid status '{target_status}'")
                         return
-                    task = update_task(tasks_path, move_id, target_status)
+                    task = task_manager.update_task_command(move_id, status=target_status)
                     if task:
                         relay_log(f"/move #{move_id} -> {target_status}")
-                        publish({"type": "task_updated", "task": task})
                     else:
                         relay_log(f"/move: task #{move_id} not found")
                 return
@@ -1930,7 +1976,7 @@ async def run_relay(
 
                 # Find active task for the agent
                 active_task_info = None
-                all_tasks = load_tasks(tasks_path)["tasks"]
+                all_tasks = task_manager.list_tasks()
                 for t in all_tasks:
                     if t["status"] == "in_progress" and target_agent_name in t.get("assigned_to", []):
                         active_task_info = {"id": t["id"], "title": t["title"], "request": t["source_message"]}
@@ -2138,8 +2184,7 @@ async def run_relay(
                 if dispatcher_decision:
                     task_type = dispatcher_decision.get("task_type", "general")
                     task_priority = dispatcher_decision.get("priority", "normal")
-                task = create_task(
-                    tasks_path,
+                task = task_manager.create_task_command(
                     title=task_title,
                     task_type=task_type,
                     priority=task_priority,
@@ -2147,7 +2192,6 @@ async def run_relay(
                     source_message=body,
                 )
                 relay_log(f"task #{task['id']} created: {task['title'][:60]}")
-                publish({"type": "task_created", "task": task})
                 task_prompt = {
                     "id": task["id"],
                     "title": task_title,
@@ -2202,29 +2246,21 @@ async def run_relay(
                 await asyncio.sleep(30)
                 if is_sleeping and is_sleeping():
                     continue
-                store = load_tasks(tasks_path)
-                pending = [t for t in store["tasks"] if t["status"] == "pending"]
+                pending = [task for task in task_manager.list_tasks() if task["status"] == "pending"]
                 if not pending:
                     continue
                 batch_body_parts = []
                 batch_ids = []
-                updated_tasks = []
                 for task in pending[:5]:
                     batch_body_parts.append(f"- [{task['type']}] {task['title']}")
                     batch_ids.append(task["id"])
-                    task["status"] = "in_progress"
-                    task["assigned_to"] = [a["name"] for a in enabled_agents]
-                    updated_tasks.append(dict(task))
-                batch_body = "Batch tasks:\n" + "\n".join(batch_body_parts)
-                save_tasks(tasks_path, store)
-                relay_log(f"batch processing {len(batch_ids)} pending tasks: {batch_ids}")
-                publish(
-                    {
-                        "type": "tasks_updated",
-                        "tasks": updated_tasks,
-                        "new_status": "in_progress",
-                    },
+                task_manager.bulk_update_tasks_command(
+                    "in_progress",
+                    task_ids=batch_ids,
+                    assigned_to=[a["name"] for a in enabled_agents],
                 )
+                batch_body = "Batch tasks:\n" + "\n".join(batch_body_parts)
+                relay_log(f"batch processing {len(batch_ids)} pending tasks: {batch_ids}")
 
                 work_dir = str(SCRIPT_DIR)
                 projects = load_projects(projects_path)
@@ -2342,9 +2378,7 @@ async def run_relay(
                 }
 
                 if task and isinstance(task.get("id"), int):
-                    updated_task = update_task(tasks_path, task["id"], "in_progress")
-                    if updated_task:
-                        publish({"type": "task_updated", "task": updated_task})
+                    task_manager.update_task_command(task["id"], status="in_progress")
 
                 publish({
                     "type": "dispatch_started",
@@ -2430,6 +2464,8 @@ async def run_relay(
 
     relay_log("stopped")
     publish({"type": "relay_state", "state": "stopped"})
+    if owns_task_manager:
+        task_manager.set_event_callback(None)
     if owns_event_store and event_store is not None:
         event_store.close()
     return 0

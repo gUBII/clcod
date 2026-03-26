@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 import relay
 import dispatcher as dispatcher_mod
 from event_store import EventStore, import_transcript_to_event_store
+from task_state import TaskStateManager, atomic_write_json
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEB_DIR = SCRIPT_DIR / "web"
@@ -286,9 +287,12 @@ class StateStore:
         self.state = build_initial_state(config)
         self.write()
 
+    def _write_locked(self) -> None:
+        atomic_write_json(self.path, self.state)
+
     def write(self) -> None:
         with self._lock:
-            relay.write_json(self.path, self.state)
+            self._write_locked()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -297,12 +301,12 @@ class StateStore:
     def patch(self, section: str, values: dict[str, Any]) -> None:
         with self._lock:
             self.state[section].update(values)
-            relay.write_json(self.path, self.state)
+            self._write_locked()
 
     def patch_agent(self, name: str, values: dict[str, Any]) -> None:
         with self._lock:
             self.state["agents"][name].update(values)
-            relay.write_json(self.path, self.state)
+            self._write_locked()
 
     def record_agent_usage(self, name: str, tokens: int) -> None:
         """Increment token usage for an agent, resetting the window if expired."""
@@ -320,36 +324,17 @@ class StateStore:
                 window["window_start"] = now
                 window["tokens_used"] = 0
             window["tokens_used"] += tokens
-            relay.write_json(self.path, self.state)
+            self._write_locked()
 
-    def reconcile_tasks(self, tasks_path: Path) -> None:
-        """Rebuild task counts in state from tasks.json (primary source).
+    def patch_tasks_summary(self, values: dict[str, Any]) -> None:
+        """Persist the replayed task summary only.
 
-        Repairs drift in state.json that accumulates when the supervisor
-        crashes between writing tasks.json and patching state.
+        Task counters are durable/replayed state. Other sections in state.json
+        remain volatile runtime materialized views owned by the supervisor.
         """
-        try:
-            data = relay.load_tasks(tasks_path)
-        except Exception:
-            return
-        tasks = data.get("tasks", [])
-        counts: dict[str, int] = {}
-        last_created_at: str | None = None
-        for t in tasks:
-            status = str(t.get("status", "pending"))
-            counts[status] = counts.get(status, 0) + 1
-            ca = t.get("created_at")
-            if ca and (last_created_at is None or ca > last_created_at):
-                last_created_at = ca
         with self._lock:
-            self.state["tasks"].update({
-                "total": len(tasks),
-                "pending": counts.get("pending", 0),
-                "in_progress": counts.get("in_progress", 0),
-                "done": counts.get("done", 0),
-                "last_created_at": last_created_at,
-            })
-            relay.write_json(self.path, self.state)
+            self.state["tasks"].update(values)
+            self._write_locked()
 
     def fuel_for_agent(self, name: str) -> dict[str, Any]:
         """Return fuel gauge data for a single agent."""
@@ -384,6 +369,12 @@ class RuntimeSupervisor:
         self.event_store = EventStore(config["workspace"]["events_db_path"])
         self.apply_saved_preferences()
         self.state = StateStore(config)
+        self.task_state = TaskStateManager(
+            event_store=self.event_store,
+            tasks_path=config["workspace"]["tasks_path"],
+            state_store=self.state,
+            event_callback=self.handle_relay_event,
+        )
         self._sleeping = False
         self._sleep_lock = threading.Lock()
         self.stop_event = asyncio.Event()
@@ -413,15 +404,18 @@ class RuntimeSupervisor:
         relay.write_json(self._auth_tokens_path, list(self.auth_tokens))
 
     def rebuild_state_from_events(self) -> None:
-        """Reconcile state.json with tasks.json on startup.
+        """Replay durable task state into the runtime projections on startup.
 
-        events.db is the durable event log; tasks.json is the primary task
-        store. This repairs task count drift in state.json caused by crashes
-        between writes. Task events (task_created, task_updated) are already
-        written to events.db via emit_event — this step closes the loop by
-        also keeping state.json consistent.
+        Durable/replayed state:
+        - task board contents
+        - task counters and last_created_at summary
+
+        Volatile/runtime-only state:
+        - tmux pane data
+        - queue and routing activity
+        - live agent process metadata
         """
-        self.state.reconcile_tasks(self.workspace["tasks_path"])
+        self.task_state.rebuild_from_events()
 
     def sse_subscribe(self) -> queue.Queue | None:
         """Subscribe to SSE events. Returns None if at capacity."""
@@ -466,25 +460,7 @@ class RuntimeSupervisor:
                 )
 
     def refresh_task_state(self) -> None:
-        tasks_data = relay.load_tasks(self.workspace["tasks_path"])
-        all_tasks = tasks_data.get("tasks", [])
-        total = len(all_tasks)
-        pending = sum(1 for task in all_tasks if task.get("status") == "pending")
-        in_progress = sum(
-            1 for task in all_tasks if task.get("status") in ("assigned", "in_progress")
-        )
-        done = sum(1 for task in all_tasks if task.get("status") == "done")
-        last_created_at = all_tasks[-1].get("created_at") if all_tasks else None
-        self.state.patch(
-            "tasks",
-            {
-                "total": total,
-                "pending": pending,
-                "in_progress": in_progress,
-                "done": done,
-                "last_created_at": last_created_at,
-            },
-        )
+        self.state.patch_tasks_summary(self.task_state.summary())
 
     def is_sleeping(self) -> bool:
         with self._sleep_lock:
@@ -560,6 +536,13 @@ class RuntimeSupervisor:
         stored = self.event_store.append_event(payload)
         payload["event_id"] = stored["id"]
         self.handle_relay_event(payload)
+        return payload
+
+    @staticmethod
+    def sse_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(event)
+        if payload.get("type") == "tasks_bulk_updated":
+            payload["type"] = "tasks_updated"
         return payload
 
     def persist_system_message(
@@ -1321,17 +1304,14 @@ class RuntimeSupervisor:
             return
 
         if event["type"] == "task_created":
-            self.refresh_task_state()
             self.sse_broadcast("task_created", event.get("task", {}), event_id)
             return
 
         if event["type"] == "task_updated":
-            self.refresh_task_state()
             self.sse_broadcast("task_updated", {"task": event.get("task", {})}, event_id)
             return
 
         if event["type"] == "tasks_updated":
-            self.refresh_task_state()
             self.sse_broadcast(
                 "tasks_updated",
                 {
@@ -1343,7 +1323,6 @@ class RuntimeSupervisor:
             return
 
         if event["type"] == "tasks_cleared":
-            self.refresh_task_state()
             self.sse_broadcast("tasks_cleared", {"tasks": []}, event_id)
             return
 
@@ -1558,10 +1537,7 @@ class RuntimeSupervisor:
                         return self._json({"error": "locked"}, status=HTTPStatus.UNAUTHORIZED)
                     query = parse_qs(parsed.query)
                     status_filter = query.get("status", [None])[0]
-                    tasks_data = relay.load_tasks(supervisor.workspace["tasks_path"])
-                    tasks_list = tasks_data.get("tasks", [])
-                    if status_filter:
-                        tasks_list = [t for t in tasks_list if t.get("status") == status_filter]
+                    tasks_list = supervisor.task_state.list_tasks(status_filter=status_filter)
                     return self._json({"tasks": tasks_list[-100:]})
                 if parsed.path == "/api/dispatcher/health":
                     if not self._authorized():
@@ -1656,7 +1632,7 @@ class RuntimeSupervisor:
                             replay = supervisor.event_store.list_events(after_id=int(last_event_id), limit=500)
                             for item in replay:
                                 event_id = item.get("id")
-                                payload = json.dumps(item)
+                                payload = json.dumps(supervisor.sse_event_payload(item))
                                 if event_id is not None:
                                     self.wfile.write(f"id: {event_id}\n".encode())
                                 self.wfile.write(f"data: {payload}\n\n".encode())
@@ -1859,15 +1835,13 @@ class RuntimeSupervisor:
                     title = str(payload.get("title") or "").strip()
                     if not title:
                         return self._json({"ok": False, "error": "title is required"}, status=HTTPStatus.BAD_REQUEST)
-                    task = relay.create_task(
-                        supervisor.workspace["tasks_path"],
+                    task = supervisor.task_state.create_task_command(
                         title=title,
                         task_type=str(payload.get("type") or "general"),
                         priority=str(payload.get("priority") or "normal"),
                         assigned_to=payload.get("assigned_to") if isinstance(payload.get("assigned_to"), list) else None,
                         source_message=str(payload.get("source_message") or ""),
                     )
-                    supervisor.refresh_task_state()
                     return self._json({"ok": True, "task": task})
 
                 if parsed.path.startswith("/api/tasks/") and not parsed.path.endswith("/"):
@@ -1878,21 +1852,18 @@ class RuntimeSupervisor:
                         except ValueError:
                             return self._json({"ok": False, "error": "invalid task id"}, status=HTTPStatus.BAD_REQUEST)
                         payload = self._payload()
-                        tasks_data = relay.load_tasks(supervisor.workspace["tasks_path"])
-                        task = next((t for t in tasks_data["tasks"] if t["id"] == task_id), None)
+                        task = supervisor.task_state.get_task(task_id)
                         if not task:
                             return self._json({"ok": False, "error": "task not found"}, status=HTTPStatus.NOT_FOUND)
+                        kwargs: dict[str, Any] = {}
                         if "status" in payload and payload["status"] in relay.TASK_STATUSES:
-                            task["status"] = payload["status"]
-                            if payload["status"] == "done":
-                                task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                            kwargs["status"] = payload["status"]
                         if "assigned_to" in payload and isinstance(payload["assigned_to"], list):
-                            task["assigned_to"] = payload["assigned_to"]
+                            kwargs["assigned_to"] = payload["assigned_to"]
                         if "priority" in payload:
-                            task["priority"] = str(payload["priority"])
-                        relay.save_tasks(supervisor.workspace["tasks_path"], tasks_data)
-                        supervisor.refresh_task_state()
-                        supervisor.sse_broadcast("task_updated", {"task": task})
+                            kwargs["priority"] = str(payload["priority"])
+                        if kwargs:
+                            task = supervisor.task_state.update_task_command(task_id, **kwargs)
                         return self._json({"ok": True, "task": task})
 
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -1959,6 +1930,7 @@ class RuntimeSupervisor:
                 stop_event=self.stop_event,
                 is_sleeping=self.is_sleeping,
                 event_store=self.event_store,
+                task_manager=self.task_state,
             )
         )
 
