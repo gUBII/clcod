@@ -30,9 +30,6 @@ from typing import Any, Callable
 
 import dispatcher as dispatcher_mod
 from event_store import EventStore
-import grpc
-import service_pb2
-import service_pb2_grpc
 from task_state import (
     TASK_STATUSES,
     TaskStateManager,
@@ -100,11 +97,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {
             "name": "GEMINI",
             "enabled": True,
-            "grpc_target": "unix:///tmp/gemini_grpc.sock",
+            "cmd": "gemini",
+            "args": ["-y", "-p"],
             "model_arg": ["--model", "{value}"],
             "model_options": ["default", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
             "mirror_mode": "log",
-            "timeout": 120,
+            "timeout": 300,
         },
     ],
     "workspace": {
@@ -1457,11 +1455,26 @@ async def _exec_agent(
 _SESSION_IN_USE_RE = re.compile(r"session\s+id\s+\S+\s+is\s+already\s+in\s+use", re.IGNORECASE)
 
 
+def load_grpc_modules() -> tuple[Any, Any, Any]:
+    try:
+        import grpc  # type: ignore[import-not-found]
+        import service_pb2  # type: ignore[import-not-found]
+        import service_pb2_grpc  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Gemini gRPC transport is configured, but its Python runtime "
+            "dependencies are missing. Remove grpc_target or install "
+            "grpcio>=1.78.0 and protobuf>=6.31.1."
+        ) from exc
+    return grpc, service_pb2, service_pb2_grpc
+
+
 async def call_gemini_grpc(agent: dict[str, Any], prompt: str) -> AgentCallResult:
     """Call the Gemini agent via gRPC."""
     target = agent.get("grpc_target")
     if not target:
         raise ValueError("GEMINI agent config is missing grpc_target")
+    grpc, service_pb2, service_pb2_grpc = load_grpc_modules()
 
     try:
         async with grpc.aio.insecure_channel(target) as channel:
