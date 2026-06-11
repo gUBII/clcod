@@ -1433,9 +1433,16 @@ async def _exec_agent(
     env: dict[str, str],
 ) -> tuple[bytes, bytes, int]:
     work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
+    # stdin=DEVNULL is required: codex exec, when stdin is not a TTY, drains it
+    # via Stdin::read_to_end for "additional input". Under PM2/launchd the relay's
+    # inherited fd 0 is a pipe that never delivers EOF, so codex blocks forever on
+    # read() (0% CPU, stat=S) and hits the timeout. DEVNULL gives an immediate EOF.
+    # Claude/Gemini read their prompt from argv and ignore stdin, so this is a no-op
+    # for them.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=work_dir,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
