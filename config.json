@@ -52,14 +52,20 @@
       "args": [
         "exec",
         "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "--sandbox",
+        "read-only",
+        "-c",
+        "approval_policy=\"never\"",
         "-C",
         "{script_dir}"
       ],
       "invoke_resume_args": [
         "exec",
         "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "--sandbox",
+        "read-only",
+        "-c",
+        "approval_policy=\"never\"",
         "-C",
         "{script_dir}",
         "resume",
@@ -68,7 +74,8 @@
       "mirror_resume_args": [
         "--skip-git-repo-check",
         "resume",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "--sandbox",
+        "read-only",
         "--no-alt-screen",
         "-C",
         "{script_dir}",

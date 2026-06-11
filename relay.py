@@ -1433,8 +1433,6 @@ async def _exec_agent(
     env: dict[str, str],
 ) -> tuple[bytes, bytes, int]:
     work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
-    _s1_name = agent.get("name", "?")  # S1-INSTRUMENT
-    _s1_spawn = time.monotonic()  # S1-INSTRUMENT
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=work_dir,
@@ -1442,25 +1440,15 @@ async def _exec_agent(
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    relay_log(f"S1-TIMING {_s1_name} spawn pid={proc.pid} t=0ms")  # S1-INSTRUMENT
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=agent["timeout"])
     except asyncio.TimeoutError:
-        _s1_to = (time.monotonic() - _s1_spawn) * 1000.0  # S1-INSTRUMENT
-        relay_log(f"S1-TIMING {_s1_name} timeout after {_s1_to:.0f}ms (limit={agent['timeout']}s)")  # S1-INSTRUMENT
         proc.kill()
         try:
             await proc.communicate()
         except Exception:
             pass
         raise
-    # first-byte is indistinguishable from exit here: communicate() blocks until the
-    # process closes its pipes, so spawn->first-byte == spawn->exit under this model.  # S1-INSTRUMENT
-    _s1_exit = (time.monotonic() - _s1_spawn) * 1000.0  # S1-INSTRUMENT
-    relay_log(  # S1-INSTRUMENT
-        f"S1-TIMING {_s1_name} exit rc={proc.returncode} "  # S1-INSTRUMENT
-        f"first_byte~exit={_s1_exit:.0f}ms bytes={len(stdout)}"  # S1-INSTRUMENT
-    )  # S1-INSTRUMENT
     return stdout, stderr, proc.returncode
 
 
