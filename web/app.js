@@ -73,6 +73,7 @@ let stateTimer = null;
 let latestState = null;
 let lastSeenSeq = 0;
 let lastSeenRev = 0;
+const liveTypingBubbles = new Map();
 let taskFetchInFlight = false;
 let sectionCollapsedState = loadSectionState();
 let transcriptFontScale = readStoredTranscriptFontScale();
@@ -514,6 +515,13 @@ function startPolling() {
           }
           // Primary path: instant append when message payload is present
           if (data.message && data.message.seq > lastSeenSeq) {
+            // Remove live-typing bubble for this sender before appending final message
+            const senderKey = (data.message.sender || "").toUpperCase();
+            const bubble = liveTypingBubbles.get(senderKey);
+            if (bubble) {
+              bubble.remove();
+              liveTypingBubbles.delete(senderKey);
+            }
             appendMessage(data.message);
             lastSeenSeq = data.message.seq;
           } else if (!data.message) {
@@ -584,6 +592,34 @@ function startPolling() {
             }
           }, 4000);
           break;
+        case "token": {
+          const agent = data.agent;
+          const delta = data.delta;
+          if (!agent || delta === undefined) break;
+          let bubble = liveTypingBubbles.get(agent);
+          if (!bubble) {
+            const empty = transcript.querySelector(".transcript__empty");
+            if (empty) empty.remove();
+            bubble = document.createElement("article");
+            bubble.className = "message message--streaming";
+            bubble.dataset.streamingAgent = agent;
+            const hdr = document.createElement("header");
+            hdr.className = "message__header";
+            hdr.textContent = agent;
+            const pre = document.createElement("pre");
+            pre.className = "message__body";
+            bubble.appendChild(hdr);
+            bubble.appendChild(pre);
+            transcript.appendChild(bubble);
+            liveTypingBubbles.set(agent, bubble);
+          }
+          const pre = bubble.querySelector(".message__body");
+          if (pre) {
+            pre.textContent += delta;
+            transcript.scrollTop = transcript.scrollHeight;
+          }
+          break;
+        }
       }
     } catch { /* ignore malformed */ }
   };

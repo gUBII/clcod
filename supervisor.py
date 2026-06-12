@@ -1444,6 +1444,24 @@ class RuntimeSupervisor:
             )
             return
 
+        if event["type"] == "token":
+            # Broadcast-only: token deltas must NOT be persisted via emit_event /
+            # event_store.append_event.  Persisting them would corrupt Last-Event-ID
+            # replay — the replay must reconstruct the full reply from the single
+            # consolidated transcript event, not from thousands of delta fragments.
+            self.sse_broadcast(
+                "token",
+                {
+                    "agent": event.get("agent", ""),
+                    "delta": event.get("delta", ""),
+                    "seq": event.get("seq", 0),
+                },
+                # Pass None for event_id so the SSE frame carries no id: line —
+                # clients must not track streaming deltas as their Last-Event-ID.
+                None,
+            )
+            return
+
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
         supervisor = self
 

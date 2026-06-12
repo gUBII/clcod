@@ -185,6 +185,10 @@ SESSION_PATTERNS: dict[str, re.Pattern[str]] = {
 EventCallback = Callable[[dict[str, Any]], None]
 EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 
+# Feature flag: set STREAM_TOKENS=1 in env to enable progressive Claude streaming.
+# Default is OFF — preserves the existing communicate() behavior exactly.
+STREAM_TOKENS: bool = os.environ.get("STREAM_TOKENS", "").lower() in ("1", "true", "yes", "on")
+
 
 class SafeFormatDict(dict[str, str]):
     def __missing__(self, key: str) -> str:
@@ -1026,6 +1030,78 @@ PARSERS = {
 }
 
 
+def parse_claude_stream_delta(line: str) -> str | None:
+    """Extract assistant text delta from one Claude stream-json NDJSON line.
+
+    Returns the delta string when the line is an assistant chunk with text content,
+    None for all other line types (system init, result, empty, malformed).
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("type") != "assistant":
+        return None
+    message = obj.get("message") or {}
+    content = message.get("content") or []
+    if not content:
+        return None
+    first = content[0]
+    if isinstance(first, dict) and first.get("type") == "text":
+        text = first.get("text")
+        return text if text else None
+    return None
+
+
+def parse_claude_stream_final(raw: str) -> str:
+    """Extract the consolidated reply from Claude stream-json NDJSON output.
+
+    Prefers the 'result' field from the final result line.  Falls back to
+    concatenating all assistant text deltas when no result line is present.
+    """
+    deltas: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("type") == "result":
+            result = obj.get("result")
+            if isinstance(result, str):
+                return result
+        delta = parse_claude_stream_delta(stripped)
+        if delta is not None:
+            deltas.append(delta)
+    return "".join(deltas)
+
+
+def extract_session_id_from_stream_json(raw: str, fallback: str | None) -> str | None:
+    """Extract session_id from Claude stream-json NDJSON output.
+
+    Checks 'system' init lines and the 'result' line — both carry session_id.
+    Returns the first non-empty one found, or fallback if none is found.
+    """
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("type") in ("system", "result"):
+            sid = obj.get("session_id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+    return fallback
+
+
 @dataclass
 class AgentCallResult:
     reply: str
@@ -1459,6 +1535,59 @@ async def _exec_agent(
     return stdout, stderr, proc.returncode
 
 
+async def _exec_agent_streaming(
+    agent: dict[str, Any],
+    cmd: list[str],
+    env: dict[str, str],
+    line_callback: Callable[[str], None] | None = None,
+) -> tuple[bytes, bytes, int]:
+    """Like _exec_agent but reads stdout line-by-line for incremental streaming.
+
+    line_callback is called with each raw NDJSON line as it arrives from stdout.
+    stderr is collected concurrently to avoid pipe-buffer deadlocks.
+    Returns (stdout_bytes, stderr_bytes, returncode) identical to _exec_agent.
+    """
+    work_dir = agent.get("work_dir") or str(SCRIPT_DIR)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=work_dir,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+
+    stdout_chunks: list[bytes] = []
+
+    async def _drain_stdout() -> None:
+        assert proc.stdout is not None
+        async for line_bytes in proc.stdout:
+            stdout_chunks.append(line_bytes)
+            if line_callback is not None:
+                line_callback(line_bytes.decode("utf-8", errors="replace"))
+
+    async def _drain_stderr() -> bytes:
+        assert proc.stderr is not None
+        return await proc.stderr.read()
+
+    async def _drain_both() -> bytes:
+        _, stderr_bytes = await asyncio.gather(_drain_stdout(), _drain_stderr())
+        return stderr_bytes
+
+    try:
+        stderr_bytes = await asyncio.wait_for(_drain_both(), timeout=agent["timeout"])
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await proc.communicate()
+        except Exception:
+            pass
+        raise
+
+    await proc.wait()
+    return b"".join(stdout_chunks), stderr_bytes, proc.returncode
+
+
 _SESSION_IN_USE_RE = re.compile(r"session\s+id\s+\S+\s+is\s+already\s+in\s+use", re.IGNORECASE)
 
 
@@ -1507,6 +1636,7 @@ async def call_agent(
     prompt: str,
     sessions_path: Path,
     session_lock: asyncio.Lock,
+    token_callback: Callable[[str], None] | None = None,
 ) -> AgentCallResult:
     # If the agent is Gemini and configured for gRPC, use the new path.
     if agent["name"] == "GEMINI" and agent.get("grpc_target"):
@@ -1521,6 +1651,78 @@ async def call_agent(
         sessions = load_sessions(sessions_path)
         current_session_id = sessions.get(agent["name"])
         cmd, current_session_id = build_agent_command(agent, prompt, current_session_id)
+
+    # ── STREAM_TOKENS path (CLAUDE only) ──────────────────────────────────────
+    if STREAM_TOKENS and agent["name"] == "CLAUDE":
+        def _add_stream_json(base_cmd: list[str]) -> list[str]:
+            # Insert --output-format stream-json before the prompt (last element).
+            return base_cmd[:-1] + ["--output-format", "stream-json"] + [base_cmd[-1]]
+
+        def _on_stream_line(line: str) -> None:
+            if token_callback is None:
+                return
+            delta = parse_claude_stream_delta(line)
+            if delta:
+                token_callback(delta)
+
+        stream_cmd = _add_stream_json(cmd)
+        stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+        if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
+            relay_log(f"{agent['name']}: session in use, retrying with fresh session (streaming)")
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                sessions.pop(agent["name"], None)
+                save_sessions(sessions_path, sessions)
+
+            cmd, current_session_id = build_agent_command(agent, prompt, None)
+            stream_cmd = _add_stream_json(cmd)
+            log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
+
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+            if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
+                relay_log(f"{agent['name']}: fresh session also in use, retrying without session (streaming)")
+                current_session_id = None
+                cmd = _build_sessionless_command(agent, prompt)
+                stream_cmd = _add_stream_json(cmd)
+                log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
+
+                stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+                stderr_text = stderr.decode("utf-8", errors="replace").strip()
+                if stderr_text:
+                    relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+        raw = stdout.decode("utf-8", errors="replace")
+        if returncode != 0:
+            if _SESSION_IN_USE_RE.search(stderr_text) and raw.strip():
+                relay_log(f"{agent['name']}: non-zero exit with session error but stdout present, salvaging reply (streaming)")
+            else:
+                raise RuntimeError(f"exit code {returncode}")
+
+        current_session_id = extract_session_id_from_stream_json(raw, current_session_id)
+        if current_session_id:
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                if sessions.get(agent["name"]) != current_session_id:
+                    sessions[agent["name"]] = current_session_id
+                    save_sessions(sessions_path, sessions)
+
+        log_agent_io(agent["io_log_path"], stream_cmd, raw, stderr_text, current_session_id)
+        return AgentCallResult(
+            reply=parse_claude_stream_final(raw),
+            raw=raw,
+            stderr=stderr_text,
+            session_id=current_session_id,
+        )
+    # ── END streaming path ────────────────────────────────────────────────────
 
     stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
 
@@ -1649,7 +1851,19 @@ async def route_to(
         return
 
     try:
-        result = await call_agent(agent, prompt, sessions_path, session_lock)
+        _token_seq = 0
+
+        def _token_emit(delta: str) -> None:
+            nonlocal _token_seq
+            if not delta or event_callback is None:
+                return
+            _token_seq += 1
+            event_callback({"type": "token", "agent": name, "delta": delta, "seq": _token_seq})
+
+        result = await call_agent(
+            agent, prompt, sessions_path, session_lock,
+            token_callback=_token_emit if STREAM_TOKENS else None,
+        )
         if result.reply:
             msg = await append_reply(
                 write_lock,
