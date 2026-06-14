@@ -9,6 +9,7 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: '1',
         CONFIG: '/Users/moofasa/clcod/config.json',
+        STREAM_TOKENS: '1',
       },
       autorestart: true,
       watch: false,

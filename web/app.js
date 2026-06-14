@@ -4,6 +4,7 @@ const stateLabels = {
   warming: "routing traffic",
   ready: "ready",
   error: "no fuel left",
+  still_working: "still working",
 };
 
 const stateNotes = {
@@ -12,6 +13,7 @@ const stateNotes = {
   warming: "The room is settling and the engine is actively routing work.",
   ready: "Mirror and routing path are healthy.",
   error: "Out of fuel. The last routing cycle failed or capacity was exhausted.",
+  still_working: "Awaiting a reply — this agent is still processing. Other engines remain active.",
 };
 
 const previousStates = new Map();
@@ -535,7 +537,13 @@ function startPolling() {
             if (data.last_error !== undefined) {
               latestState.agents[data.agent].last_error = data.last_error;
             }
-            renderState(latestState);
+            if (data.state === "still_working") {
+              // Surgical straggler indicator — do not rebuild all engine cards
+              updateAgentStraggler(data.agent, true);
+            } else {
+              updateAgentStraggler(data.agent, false);
+              renderState(latestState);
+            }
           }
           break;
         case "dispatcher":
@@ -596,13 +604,14 @@ function startPolling() {
           const agent = data.agent;
           const delta = data.delta;
           if (!agent || delta === undefined) break;
-          let bubble = liveTypingBubbles.get(agent);
+          const agentKey = agent.toUpperCase();
+          let bubble = liveTypingBubbles.get(agentKey);
           if (!bubble) {
             const empty = transcript.querySelector(".transcript__empty");
             if (empty) empty.remove();
             bubble = document.createElement("article");
             bubble.className = "message message--streaming";
-            bubble.dataset.streamingAgent = agent;
+            bubble.dataset.streamingAgent = agentKey;
             const hdr = document.createElement("header");
             hdr.className = "message__header";
             hdr.textContent = agent;
@@ -611,7 +620,7 @@ function startPolling() {
             bubble.appendChild(hdr);
             bubble.appendChild(pre);
             transcript.appendChild(bubble);
-            liveTypingBubbles.set(agent, bubble);
+            liveTypingBubbles.set(agentKey, bubble);
           }
           const pre = bubble.querySelector(".message__body");
           if (pre) {
@@ -769,6 +778,7 @@ function renderEngines(agents) {
     const isDamped = state === "error";
     const card = document.createElement("article");
     card.className = `engine engine--${state}`;
+    card.dataset.agent = name;
     card.dataset.pressure = p.level;
     card.innerHTML = `
       <div class="engine__spark"></div>
@@ -780,7 +790,7 @@ function renderEngines(agents) {
         <div class="tach__dial" style="--fuel-angle:${fuelAngle}deg"></div>
         <div class="tach__fuel-arc" style="--fuel-angle:${fuelAngle}deg"></div>
         <div class="tach__needle" data-needle-agent="${name}" style="--needle-color:${nColor}"></div>
-        <div class="tach__mark">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
+        <div class="tach__mark">${state === "error" ? "ERR" : state === "still_working" ? "WAIT" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
       </div>
       <p class="engine__note">${stateNotes[state] || ""}</p>
       <div class="engine__meta engine__meta--stack">
@@ -821,11 +831,17 @@ function renderEngines(agents) {
           <div class="tach__dial tach__dial--sm" style="--fuel-angle:${fuelAngle}deg"></div>
           <div class="tach__fuel-arc tach__fuel-arc--sm" style="--fuel-angle:${fuelAngle}deg"></div>
           <div class="tach__needle tach__needle--sm" data-needle-agent="${name}" style="--needle-color:${nColor}"></div>
-          <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
+          <div class="tach__mark tach__mark--sm">${state === "error" ? "ERR" : state === "still_working" ? "WAIT" : p.score > 70 ? "HOT" : p.score > 35 ? "REV" : "IDLE"}</div>
         </div>
         <div class="control__status">
           <span>${stateLabels[state] || state}</span>
           <span>${(payload.mirror_view || payload.mirror_mode || "log").toUpperCase()}</span>
+          ${(() => {
+            const lastErr = payload.last_error || "";
+            return lastErr.includes("timed out")
+              ? `<span class="timed-out-badge" role="alert" title="${escapeHtml(lastErr)}">timed out</span>`
+              : "";
+          })()}
           <span class="sig-lights" aria-hidden="true">
             <span class="sig-light sig-light--tx${txActiveClass}" data-sig-agent="${name}"></span>
             <span class="sig-label">TX</span>
@@ -979,6 +995,37 @@ function setControlMessage(agent, message) {
   const target = card?.querySelector("[data-control-message]");
   if (target) {
     target.textContent = message;
+  }
+}
+
+function updateAgentStraggler(agentName, active) {
+  const control = statusGrid.querySelector(`[data-agent="${agentName}"]`);
+  if (control) {
+    control.classList.toggle("control--straggler", active);
+    let badge = control.querySelector(".straggler-badge");
+    if (active && !badge) {
+      badge = document.createElement("span");
+      badge.className = "straggler-badge";
+      badge.setAttribute("aria-live", "polite");
+      badge.textContent = "still working…";
+      const hdr = control.querySelector(".control__header");
+      if (hdr) hdr.insertAdjacentElement("afterend", badge);
+    } else if (!active && badge) {
+      badge.remove();
+    }
+  }
+  const engine = engineCards.querySelector(`[data-agent="${agentName}"]`);
+  if (engine) {
+    engine.classList.toggle("engine--straggler", active);
+    let badge = engine.querySelector(".straggler-badge");
+    if (active && !badge) {
+      badge = document.createElement("span");
+      badge.className = "straggler-badge";
+      badge.textContent = "still working…";
+      engine.querySelector(".engine__header")?.insertAdjacentElement("afterend", badge);
+    } else if (!active && badge) {
+      badge.remove();
+    }
   }
 }
 
@@ -1149,6 +1196,7 @@ function formatTime(ts) {
 }
 
 function renderTranscript(entries) {
+  liveTypingBubbles.clear();
   transcript.innerHTML = "";
   if (!entries.length) {
     transcript.innerHTML = `<p class="transcript__empty">No transcript entries yet.</p>`;

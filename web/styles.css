@@ -988,6 +988,74 @@ button:focus-visible {
 .chip--active { color: oklch(10% 0.025 248); background: linear-gradient(100deg, var(--c-amber) 0%, var(--c-hot) 100%); border-color: transparent; }
 .chip--empty  { cursor: default; border-style: dashed; color: var(--muted); }
 
+/* Control select */
+.control-select {
+  width: 100%;
+  padding: 5px var(--sp-2);
+  border-radius: var(--r-xs);
+  border: 1px solid oklch(79% 0.12 239 / 0.22);
+  background: oklch(10% 0.025 248 / 0.88);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.control-select:hover { border-color: oklch(79% 0.12 239 / 0.42); }
+.control-select:focus-visible { outline: 2px solid var(--c-amber); outline-offset: 2px; border-color: oklch(79% 0.12 239 / 0.55); }
+.control-select:disabled { opacity: 0.4; cursor: default; }
+
+/* Straggler — per-agent still_working indicator */
+.engine--straggler {
+  border-color: oklch(82% 0.155 72 / 0.32) !important;
+  animation: straggler-border 1.8s var(--ease-io) infinite;
+}
+
+.control--straggler {
+  border-color: oklch(82% 0.155 72 / 0.28) !important;
+  animation: straggler-border 1.8s var(--ease-io) infinite;
+}
+
+.straggler-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px var(--sp-3);
+  margin: var(--sp-2) 0 0;
+  border-radius: var(--r-pill);
+  border: 1px solid oklch(82% 0.155 72 / 0.36);
+  background: oklch(82% 0.155 72 / 0.08);
+  color: var(--warn);
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.straggler-badge::before {
+  content: "";
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex-shrink: 0;
+  animation: straggler-dot 1s step-end infinite;
+}
+
+/* Timed-out badge (shown inside .control__status when last_error contains "timed out") */
+.timed-out-badge {
+  padding: 3px var(--sp-2);
+  border-radius: var(--r-pill);
+  border: 1px solid oklch(67% 0.22 16 / 0.38);
+  background: oklch(67% 0.22 16 / 0.1);
+  color: var(--error);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 /* Fuel gauge */
 .fuel-gauge {
   width: 100%;
@@ -1752,6 +1820,16 @@ button:focus-visible {
   50%       { border-color: oklch(67% 0.22 16 / 0.5); }
 }
 
+@keyframes straggler-border {
+  0%, 100% { box-shadow: none; }
+  50%       { box-shadow: inset 0 0 20px oklch(82% 0.155 72 / 0.07); }
+}
+
+@keyframes straggler-dot {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
 @keyframes node-fire {
   0%   { background: oklch(82% 0.155 72 / 0);   border-color: oklch(79% 0.12 239 / 0.16); }
   25%  { background: oklch(82% 0.155 72 / 0.7); border-color: oklch(82% 0.155 72 / 0.6); box-shadow: 0 0 8px oklch(82% 0.155 72 / 0.4); }
@@ -1866,6 +1944,9 @@ button:focus-visible {
 
 [data-theme="light"] .panel--routes .route-lane { background: oklch(100% 0 0 / 0.6); }
 
+[data-theme="light"] .control-select { background: oklch(100% 0 0 / 0.75); border-color: oklch(0% 0 0 / 0.14); color: var(--text); }
+[data-theme="light"] .straggler-badge { background: oklch(68% 0.16 72 / 0.1); border-color: oklch(68% 0.16 72 / 0.32); }
+[data-theme="light"] .timed-out-badge  { background: oklch(52% 0.22 20 / 0.08); border-color: oklch(52% 0.22 20 / 0.3); }
 [data-theme="light"] .signal-bus::before { background: linear-gradient(90deg, transparent, oklch(52% 0.18 255 / 0.1) 12%, oklch(52% 0.18 255 / 0.1) 88%, transparent); }
 [data-theme="light"] .signal-bus__col::after { background: oklch(52% 0.18 255 / 0.06); }
 [data-theme="light"] .signal-bus__hub { background: oklch(100% 0 0 / 0.9); border-color: oklch(52% 0.18 255 / 0.18); }
@@ -1928,4 +2009,7 @@ button:focus-visible {
 
   .message--streaming .message__body::after { animation: none; opacity: 1; }
   .section-shell__body { transition: none; }
+  .engine--straggler,
+  .control--straggler { animation: none; }
+  .straggler-badge::before { animation: none; opacity: 1; }
 }
