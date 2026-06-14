@@ -51,6 +51,7 @@
       "cmd": "codex",
       "args": [
         "exec",
+        "--json",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
@@ -61,6 +62,7 @@
       ],
       "invoke_resume_args": [
         "exec",
+        "--json",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",

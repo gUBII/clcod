@@ -1023,9 +1023,67 @@ def parse_claude(raw: str) -> str:
     return raw.strip()
 
 
+def parse_codex_stream_delta(line: str) -> str | None:
+    """Extract assistant text from one Codex --json NDJSON line.
+
+    Codex emits item.completed events with the full agent_message text (one
+    chunk per item, not token-by-token like Claude).  Returns the text when
+    the line is an item.completed agent_message, None for all other line types
+    (thread.started, turn.started, turn.completed, empty, malformed).
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if obj.get("type") != "item.completed":
+        return None
+    item = obj.get("item") or {}
+    if item.get("type") != "agent_message":
+        return None
+    text = item.get("text")
+    return text if text else None
+
+
+def parse_codex_stream_final(raw: str) -> str:
+    """Extract the consolidated reply from Codex --json NDJSON output.
+
+    Concatenates text from all item.completed agent_message events in order.
+    """
+    parts: list[str] = []
+    for line in raw.splitlines():
+        text = parse_codex_stream_delta(line)
+        if text is not None:
+            parts.append(text)
+    return "".join(parts)
+
+
+def extract_session_id_from_codex_stream_json(raw: str, fallback: str | None) -> str | None:
+    """Extract thread_id from Codex --json NDJSON output.
+
+    Codex emits {"type":"thread.started","thread_id":"UUID"} as the first event.
+    Returns the first non-empty thread_id found, or fallback if none is found.
+    """
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("type") == "thread.started":
+            tid = obj.get("thread_id")
+            if isinstance(tid, str) and tid.strip():
+                return tid.strip()
+    return fallback
+
+
 PARSERS = {
     "CLAUDE": parse_claude,
-    "CODEX": parse_codex,
+    "CODEX": parse_codex_stream_final,
     "GEMINI": parse_gemini,
 }
 
@@ -1336,6 +1394,20 @@ def resolve_preseed_session_id(agent: dict[str, Any]) -> str | None:
 
 
 def extract_session_id(agent: dict[str, Any], raw: str, stderr_text: str, session_id: str | None) -> str | None:
+    # Codex --json mode: prefer thread_id from the thread.started NDJSON event in stdout.
+    # Fall back to the text-mode regex on stderr for backwards compatibility.
+    if agent["name"] == "CODEX":
+        json_id = extract_session_id_from_codex_stream_json(raw, None)
+        if json_id:
+            return json_id
+        pattern = SESSION_PATTERNS.get("CODEX")
+        if pattern:
+            for text in (stderr_text, raw):
+                match = pattern.search(text)
+                if match:
+                    return match.group(1)
+        return session_id
+
     pattern = SESSION_PATTERNS.get(agent["name"])
     if not pattern:
         return session_id
@@ -1722,7 +1794,74 @@ async def call_agent(
             stderr=stderr_text,
             session_id=current_session_id,
         )
-    # ── END streaming path ────────────────────────────────────────────────────
+    # ── END CLAUDE streaming path ─────────────────────────────────────────────
+
+    # ── STREAM_TOKENS path (CODEX) ────────────────────────────────────────────
+    # cmd already contains --json (from config.json CODEX args), so no injection
+    # needed.  Route through _exec_agent_streaming for progressive token delivery.
+    if STREAM_TOKENS and agent["name"] == "CODEX":
+        def _on_codex_stream_line(line: str) -> None:
+            if token_callback is None:
+                return
+            delta = parse_codex_stream_delta(line)
+            if delta:
+                token_callback(delta)
+
+        stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+        if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
+            relay_log(f"{agent['name']}: session in use, retrying with fresh session (streaming)")
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                sessions.pop(agent["name"], None)
+                save_sessions(sessions_path, sessions)
+
+            cmd, current_session_id = build_agent_command(agent, prompt, None)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+            if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
+                relay_log(f"{agent['name']}: fresh session also in use, retrying without session (streaming)")
+                current_session_id = None
+                cmd = _build_sessionless_command(agent, prompt)
+                log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+
+                stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+                stderr_text = stderr.decode("utf-8", errors="replace").strip()
+                if stderr_text:
+                    relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+        raw = stdout.decode("utf-8", errors="replace")
+        if returncode != 0:
+            if _SESSION_IN_USE_RE.search(stderr_text) and raw.strip():
+                relay_log(f"{agent['name']}: non-zero exit with session error but stdout present, salvaging reply (streaming)")
+            else:
+                raise RuntimeError(f"exit code {returncode}")
+
+        current_session_id = extract_session_id_from_codex_stream_json(raw, current_session_id)
+        if current_session_id:
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                if sessions.get(agent["name"]) != current_session_id:
+                    sessions[agent["name"]] = current_session_id
+                    save_sessions(sessions_path, sessions)
+
+        log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id)
+        return AgentCallResult(
+            reply=parse_codex_stream_final(raw),
+            raw=raw,
+            stderr=stderr_text,
+            session_id=current_session_id,
+        )
+    # ── END CODEX streaming path ──────────────────────────────────────────────
 
     stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
 
