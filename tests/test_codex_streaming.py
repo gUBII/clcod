@@ -289,7 +289,7 @@ class TestCodexOffPathRegression(unittest.TestCase):
                 mock.patch.object(relay, "_exec_agent_streaming", side_effect=fake_exec_agent_streaming),
                 mock.patch.object(relay, "log_agent_io", return_value=None),
             ):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     relay.call_agent(agent, "say hi", sessions_path, session_lock, token_callback=None)
                 )
 
@@ -353,7 +353,7 @@ class TestCodexOffPathRegression(unittest.TestCase):
                 mock.patch.object(relay, "_exec_agent_streaming", side_effect=fake_exec_agent_streaming),
                 mock.patch.object(relay, "log_agent_io", return_value=None),
             ):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     relay.call_agent(agent, "say hi", sessions_path, session_lock, token_callback=token_cb)
                 )
 
