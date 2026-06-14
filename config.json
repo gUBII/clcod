@@ -102,6 +102,16 @@
       "cmd": "gemini",
       "args": [
         "-y",
+        "-o",
+        "stream-json",
+        "-p"
+      ],
+      "invoke_resume_args": [
+        "-y",
+        "--session-id",
+        "{session_id}",
+        "-o",
+        "stream-json",
         "-p"
       ],
       "model_arg": [
