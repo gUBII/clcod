@@ -84,7 +84,7 @@ class TestParseCaudeStreamDelta(unittest.TestCase):
 
 
 class TestParseCaudeStreamFinal(unittest.TestCase):
-    def _make_raw(self, session_id: str = "ses-1", result_text: str = "Hello world") -> str:
+    def _make_raw(self, session_id: str = "ses-12345", result_text: str = "Hello world") -> str:
         lines = [
             json.dumps({"type": "system", "subtype": "init", "session_id": session_id}),
             json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello"}]}}),
@@ -115,14 +115,14 @@ class TestParseCaudeStreamFinal(unittest.TestCase):
 class TestExtractSessionIdFromStreamJson(unittest.TestCase):
     def test_extracts_from_system_init_line(self):
         raw = "\n".join([
-            json.dumps({"type": "system", "subtype": "init", "session_id": "abc123"}),
-            json.dumps({"type": "result", "result": "ok", "session_id": "abc123"}),
+            json.dumps({"type": "system", "subtype": "init", "session_id": "abc12345"}),
+            json.dumps({"type": "result", "result": "ok", "session_id": "abc12345"}),
         ])
-        self.assertEqual(relay.extract_session_id_from_stream_json(raw, None), "abc123")
+        self.assertEqual(relay.extract_session_id_from_stream_json(raw, None), "abc12345")
 
     def test_extracts_from_result_line_only(self):
-        raw = json.dumps({"type": "result", "result": "ok", "session_id": "xyz456"})
-        self.assertEqual(relay.extract_session_id_from_stream_json(raw, None), "xyz456")
+        raw = json.dumps({"type": "result", "result": "ok", "session_id": "xyz45678"})
+        self.assertEqual(relay.extract_session_id_from_stream_json(raw, None), "xyz45678")
 
     def test_returns_fallback_when_no_session_id(self):
         raw = json.dumps({"type": "assistant", "message": {"content": []}})

@@ -466,5 +466,131 @@ class RelayTests(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_route_to_tolerates_agent_without_timeout(self):
+        """route_to must not raise KeyError when agent dict has no 'timeout' key."""
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "room.txt"
+                sessions_path = Path(tmpdir) / "sessions.json"
+                relay.save_sessions(sessions_path, {})
+
+                with mock.patch(
+                    "relay.call_agent",
+                    new=mock.AsyncMock(
+                        return_value=relay.AgentCallResult(
+                            reply="ok",
+                            raw="",
+                            stderr="",
+                            session_id=None,
+                        )
+                    ),
+                ):
+                    # Agent dict has no "timeout" key — should use .get("timeout", 60) default
+                    await relay.route_to(
+                        {"name": "CLAUDE"},
+                        "hello",
+                        log_path,
+                        asyncio.Lock(),
+                        sessions_path,
+                        asyncio.Lock(),
+                    )
+
+        asyncio.run(run_case())
+
+    def test_session_id_validator_accepts_valid_and_rejects_garbage(self):
+        """_SESSION_ID_RE accepts real-looking IDs and rejects garbage / overlong strings."""
+        valid_ids = [
+            "abcdefgh",                    # 8 chars, minimum
+            "abc-def-012",                 # hyphens
+            "A1b2C3d4",                    # mixed case
+            "a" * 128,                     # maximum length
+            "session-abc123.XYZ_ok",       # real-looking id with all allowed chars
+        ]
+        invalid_ids = [
+            "",                            # empty
+            "abc",                         # too short (< 8 chars)
+            "a" * 129,                     # too long (> 128 chars)
+            "has space here1234",          # space not allowed
+            "has/slash1234567",            # slash not allowed
+            "has@at12345678",              # @ not allowed
+            "has\x00null1234",             # null byte
+        ]
+        for sid in valid_ids:
+            self.assertIsNotNone(
+                relay._SESSION_ID_RE.match(sid),
+                f"Expected valid: {sid!r}",
+            )
+        for sid in invalid_ids:
+            self.assertIsNone(
+                relay._SESSION_ID_RE.match(sid),
+                f"Expected invalid: {sid!r}",
+            )
+
+    def test_extract_session_id_rejects_garbage_and_accepts_real(self):
+        """extract_session_id_from_stream_json falls back when session_id is garbage."""
+        garbage_ndjson = json.dumps({"type": "system", "session_id": "!!bad!!"}) + "\n"
+        result = relay.extract_session_id_from_stream_json(garbage_ndjson, "fallback-id")
+        self.assertEqual(result, "fallback-id")
+
+        valid_sid = "abc123defg"  # 10 chars, all alphanumeric
+        good_ndjson = json.dumps({"type": "system", "session_id": valid_sid}) + "\n"
+        result = relay.extract_session_id_from_stream_json(good_ndjson, "fallback-id")
+        self.assertEqual(result, valid_sid)
+
+    def test_streaming_retry_suppresses_token_callback(self):
+        """On streaming retry, line_callback=None is passed so tokens are not double-emitted.
+
+        Requires STREAM_TOKENS=True and a pre-existing session (so _was_resuming=True)
+        to trigger the resume-failure cold-spawn fallback path.
+        """
+        async def run_case() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                sessions_path = Path(tmpdir) / "sessions.json"
+                relay.save_sessions(sessions_path, {"CLAUDE": "old-session-id"})
+
+                agent = {
+                    "name": "CLAUDE",
+                    "cmd": "claude",
+                    "args": ["-p", "--dangerously-skip-permissions"],
+                    "invoke_resume_args": ["-p", "--dangerously-skip-permissions", "--session-id", "{session_id}"],
+                    "timeout": 10,
+                    "io_log_path": None,
+                    "work_dir": None,
+                    "preseed_session_id": True,
+                }
+                call_count = 0
+                captured_callbacks: list = []
+
+                async def fake_streaming(ag, cmd, env, line_callback=None):
+                    nonlocal call_count
+                    call_count += 1
+                    captured_callbacks.append(line_callback)
+                    if call_count == 1:
+                        # Resume attempt fails (non-session-in-use error) → triggers cold-spawn retry
+                        return b"", b"fatal error", 1
+                    # Second call: cold-spawn succeeds
+                    line = json.dumps({
+                        "type": "result", "result": "hello", "session_id": "abcdefghij"
+                    }) + "\n"
+                    return line.encode(), b"", 0
+
+                with mock.patch("relay._exec_agent_streaming", side_effect=fake_streaming), \
+                     mock.patch("relay.log_agent_io"), \
+                     mock.patch("relay.STREAM_TOKENS", True):
+                    await relay.call_agent(
+                        agent, "test prompt",
+                        sessions_path,
+                        asyncio.Lock(),
+                        token_callback=lambda d: None,
+                    )
+
+            # First call (resume): may have streaming callback
+            # Second call (cold-spawn retry): MUST have line_callback=None to prevent duplication
+            self.assertEqual(call_count, 2)
+            self.assertIsNone(captured_callbacks[1], "retry attempt must pass line_callback=None")
+
+        asyncio.run(run_case())
+
+
 if __name__ == "__main__":
     unittest.main()

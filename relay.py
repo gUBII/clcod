@@ -64,15 +64,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "cmd": "codex",
             "args": [
                 "exec",
+                "--json",
                 "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "approval_policy=\"never\"",
                 "-C",
                 "{script_dir}",
             ],
             "invoke_resume_args": [
                 "exec",
+                "--json",
                 "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "approval_policy=\"never\"",
                 "-C",
                 "{script_dir}",
                 "resume",
@@ -81,7 +89,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "mirror_resume_args": [
                 "--skip-git-repo-check",
                 "resume",
-                "--dangerously-bypass-approvals-and-sandbox",
                 "--no-alt-screen",
                 "-C",
                 "{script_dir}",
@@ -196,6 +203,11 @@ WARM_SESSIONS: bool = os.environ.get("WARM_SESSIONS", "").lower() in ("1", "true
 _WARM_POOL_PROMPT = "Reply with only the word READY"
 _WARM_POOL_MAX_AGE_SECS: float = float(os.environ.get("WARM_SESSION_MAX_AGE", "1800"))
 _WARM_POOL_HEALTH_INTERVAL_SECS: float = float(os.environ.get("WARM_SESSION_HEALTH_INTERVAL", "60"))
+
+
+_SESSION_ID_RE = re.compile(r"^[0-9A-Za-z._-]{8,128}$")
+
+_MAX_STDOUT_BYTES = 64 * 1024 * 1024  # 64 MB cumulative cap for _exec_agent_streaming
 
 
 class SafeFormatDict(dict[str, str]):
@@ -1085,7 +1097,9 @@ def extract_session_id_from_codex_stream_json(raw: str, fallback: str | None) ->
         if obj.get("type") == "thread.started":
             tid = obj.get("thread_id")
             if isinstance(tid, str) and tid.strip():
-                return tid.strip()
+                candidate = tid.strip()
+                if _SESSION_ID_RE.match(candidate):
+                    return candidate
     return fallback
 
 
@@ -1143,7 +1157,9 @@ def extract_session_id_from_gemini_stream_json(raw: str, fallback: str | None) -
         if obj.get("type") == "init":
             sid = obj.get("session_id")
             if isinstance(sid, str) and sid.strip():
-                return sid.strip()
+                candidate = sid.strip()
+                if _SESSION_ID_RE.match(candidate):
+                    return candidate
     return fallback
 
 
@@ -1222,7 +1238,9 @@ def extract_session_id_from_stream_json(raw: str, fallback: str | None) -> str |
         if obj.get("type") in ("system", "result"):
             sid = obj.get("session_id")
             if isinstance(sid, str) and sid.strip():
-                return sid.strip()
+                candidate = sid.strip()
+                if _SESSION_ID_RE.match(candidate):
+                    return candidate
     return fallback
 
 
@@ -1706,7 +1724,12 @@ async def _exec_agent_streaming(
 
     async def _drain_stdout() -> None:
         assert proc.stdout is not None
+        total_bytes = 0
         async for line_bytes in proc.stdout:
+            total_bytes += len(line_bytes)
+            if total_bytes > _MAX_STDOUT_BYTES:
+                proc.kill()
+                break
             stdout_chunks.append(line_bytes)
             if line_callback is not None:
                 line_callback(line_bytes.decode("utf-8", errors="replace"))
@@ -1720,7 +1743,7 @@ async def _exec_agent_streaming(
         return stderr_bytes
 
     try:
-        stderr_bytes = await asyncio.wait_for(_drain_both(), timeout=agent["timeout"])
+        stderr_bytes = await asyncio.wait_for(_drain_both(), timeout=agent.get("timeout", 60))
     except asyncio.TimeoutError:
         proc.kill()
         try:
@@ -1811,6 +1834,7 @@ class WarmSessionPool:
         self._health_interval = health_interval_secs
         self._last_warmed: dict[str, float] = {}
         self._inflight: set[str] = set()
+        self._tasks: set[asyncio.Task] = set()
 
     def _is_warm(self, name: str) -> bool:
         ts = self._last_warmed.get(name)
@@ -1860,7 +1884,14 @@ class WarmSessionPool:
         if name in self._inflight or name not in self._agents:
             return
         self._inflight.add(name)
-        asyncio.create_task(self._warm_one(self._agents[name]))
+        task = asyncio.create_task(self._warm_one(self._agents[name]))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def cancel_warm_tasks(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+        self._tasks.clear()
 
     async def start(self, stop_event: asyncio.Event) -> None:
         for name in self._agents:
@@ -1935,7 +1966,7 @@ async def call_agent(
             cmd = _build_sessionless_command(agent, prompt)
             stream_cmd = _add_stream_json(cmd)
             log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
-            stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -1951,7 +1982,7 @@ async def call_agent(
             stream_cmd = _add_stream_json(cmd)
             log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
 
-            stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -1963,7 +1994,7 @@ async def call_agent(
                 stream_cmd = _add_stream_json(cmd)
                 log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
 
-                stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+                stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=None)
                 stderr_text = stderr.decode("utf-8", errors="replace").strip()
                 if stderr_text:
                     relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2019,7 +2050,7 @@ async def call_agent(
             current_session_id = None
             cmd = _build_sessionless_command(agent, prompt)
             log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
-            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2034,7 +2065,7 @@ async def call_agent(
             cmd, current_session_id = build_agent_command(agent, prompt, None)
             log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
 
-            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2045,7 +2076,7 @@ async def call_agent(
                 cmd = _build_sessionless_command(agent, prompt)
                 log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
 
-                stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+                stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
                 stderr_text = stderr.decode("utf-8", errors="replace").strip()
                 if stderr_text:
                     relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2102,7 +2133,7 @@ async def call_agent(
             current_session_id = None
             cmd = _build_sessionless_command(agent, prompt)
             log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
-            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_gemini_stream_line)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2117,7 +2148,7 @@ async def call_agent(
             cmd, current_session_id = build_agent_command(agent, prompt, None)
             log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
 
-            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_gemini_stream_line)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2128,7 +2159,7 @@ async def call_agent(
                 cmd = _build_sessionless_command(agent, prompt)
                 log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
 
-                stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_gemini_stream_line)
+                stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
                 stderr_text = stderr.decode("utf-8", errors="replace").strip()
                 if stderr_text:
                     relay_log(f"{agent['name']}: stderr: {stderr_text}")
@@ -2311,7 +2342,7 @@ async def route_to(
             event_callback({"type": "token", "agent": name, "delta": delta, "seq": _token_seq})
 
         _soft_threshold = float(
-            agent.get("straggler_threshold_secs") or max(60.0, agent["timeout"] * 0.4)
+            agent.get("straggler_threshold_secs") or max(60.0, agent.get("timeout", 60) * 0.4)
         )
 
         async def _emit_straggler() -> None:
@@ -3147,6 +3178,7 @@ async def run_relay(
     batch_task = asyncio.create_task(batch_pending_tasks())
     drain_task = asyncio.create_task(dispatch_drain_loop())
     warm_pool_task: asyncio.Task | None = None
+    _warm_pool: WarmSessionPool | None = None
     if WARM_SESSIONS:
         _warm_pool = WarmSessionPool(enabled_agents, sessions_path, session_lock)
         warm_pool_task = asyncio.create_task(_warm_pool.start(internal_stop_event))
@@ -3154,6 +3186,8 @@ async def run_relay(
     try:
         await internal_stop_event.wait()
     finally:
+        if _warm_pool is not None:
+            _warm_pool.cancel_warm_tasks()
         batch_task.cancel()
         drain_task.cancel()
         if warm_pool_task is not None:
