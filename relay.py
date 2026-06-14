@@ -189,6 +189,14 @@ EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 # Default is OFF — preserves the existing communicate() behavior exactly.
 STREAM_TOKENS: bool = os.environ.get("STREAM_TOKENS", "").lower() in ("1", "true", "yes", "on")
 
+# Feature flag: set WARM_SESSIONS=1 to enable pre-warming of one session per engine at
+# relay startup.  Default is OFF — when off, no WarmSessionPool is created and call_agent
+# is byte-identical to pre-S4 behavior.
+WARM_SESSIONS: bool = os.environ.get("WARM_SESSIONS", "").lower() in ("1", "true", "yes", "on")
+_WARM_POOL_PROMPT = "Reply with only the word READY"
+_WARM_POOL_MAX_AGE_SECS: float = float(os.environ.get("WARM_SESSION_MAX_AGE", "1800"))
+_WARM_POOL_HEALTH_INTERVAL_SECS: float = float(os.environ.get("WARM_SESSION_HEALTH_INTERVAL", "60"))
+
 
 class SafeFormatDict(dict[str, str]):
     def __missing__(self, key: str) -> str:
@@ -1768,6 +1776,111 @@ async def call_gemini_grpc(agent: dict[str, Any], prompt: str) -> AgentCallResul
         raise RuntimeError(f"gRPC call failed: {e.details()}") from e
 
 
+class WarmSessionPool:
+    """Optional warm-session pool. Gate: WARM_SESSIONS env flag (default OFF).
+
+    Keeps at most one warm session per engine. At startup (and whenever a session
+    expires), fires a minimal cold-spawn warmup call to pre-establish a session_id in
+    sessions.json.  Real turns then hit the resume path (invoke_resume_args) instead of
+    cold-spawning.
+
+    Health-check loop: runs every ``health_interval_secs`` seconds.  If a session's
+    last_warmed timestamp is older than ``max_age_secs``, a new warmup is scheduled in
+    the background.  A warmup in-flight is not duplicated.  Pool misses (warmup still
+    running when a real turn arrives) fall through to the normal cold-spawn behavior in
+    call_agent — no code change required there.
+
+    Uses only asyncio.create_task + asyncio.Lock — no external dependencies.
+    """
+
+    def __init__(
+        self,
+        agents: list[dict[str, Any]],
+        sessions_path: Path,
+        session_lock: asyncio.Lock,
+        *,
+        max_age_secs: float = _WARM_POOL_MAX_AGE_SECS,
+        health_interval_secs: float = _WARM_POOL_HEALTH_INTERVAL_SECS,
+    ) -> None:
+        self._agents: dict[str, dict[str, Any]] = {
+            a["name"]: a for a in agents if a.get("enabled", True)
+        }
+        self._sessions_path = sessions_path
+        self._session_lock = session_lock
+        self._max_age = max_age_secs
+        self._health_interval = health_interval_secs
+        self._last_warmed: dict[str, float] = {}
+        self._inflight: set[str] = set()
+
+    def _is_warm(self, name: str) -> bool:
+        ts = self._last_warmed.get(name)
+        return ts is not None and (time.monotonic() - ts) < self._max_age
+
+    async def _warm_one(self, agent: dict[str, Any]) -> None:
+        name = agent["name"]
+        relay_log(f"[warm-pool] warming {name}")
+        try:
+            env = dict(os.environ)
+            if name == "CLAUDE":
+                env["CLAUDECODE"] = ""
+
+            # For agents with preseed_session_id, build_agent_command preseds a UUID
+            # so the warmup call itself creates the session.  For others, cold spawn.
+            if agent.get("preseed_session_id"):
+                warmup_cmd, effective_id = build_agent_command(agent, _WARM_POOL_PROMPT, None)
+            else:
+                warmup_cmd = _build_sessionless_command(agent, _WARM_POOL_PROMPT)
+                effective_id = None
+
+            stdout_b, stderr_b, rc = await _exec_agent(agent, warmup_cmd, env)
+            raw = stdout_b.decode("utf-8", errors="replace")
+            stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
+
+            if rc != 0:
+                relay_log(f"[warm-pool] {name} warmup failed (rc={rc}): {stderr_text[:120]}")
+                return
+
+            new_id = extract_session_id(agent, raw, stderr_text, effective_id)
+            if new_id:
+                async with self._session_lock:
+                    sessions = load_sessions(self._sessions_path)
+                    sessions[name] = new_id
+                    save_sessions(self._sessions_path, sessions)
+                relay_log(f"[warm-pool] {name} warm (session={new_id[:8]}…)")
+            else:
+                relay_log(f"[warm-pool] {name} warmup ok but no session_id captured")
+
+            self._last_warmed[name] = time.monotonic()
+        except Exception as exc:
+            relay_log(f"[warm-pool] {name} warmup error: {exc}")
+        finally:
+            self._inflight.discard(name)
+
+    def _schedule_warm(self, name: str) -> None:
+        if name in self._inflight or name not in self._agents:
+            return
+        self._inflight.add(name)
+        asyncio.create_task(self._warm_one(self._agents[name]))
+
+    async def start(self, stop_event: asyncio.Event) -> None:
+        for name in self._agents:
+            self._schedule_warm(name)
+
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(stop_event.wait()),
+                    timeout=self._health_interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                break
+            for name in list(self._agents):
+                if not self._is_warm(name):
+                    self._schedule_warm(name)
+
+
 async def call_agent(
     agent: dict[str, Any],
     prompt: str,
@@ -1787,6 +1900,7 @@ async def call_agent(
     async with session_lock:
         sessions = load_sessions(sessions_path)
         current_session_id = sessions.get(agent["name"])
+        _was_resuming = current_session_id is not None  # True only when a stored session exists
         cmd, current_session_id = build_agent_command(agent, prompt, current_session_id)
 
     # ── STREAM_TOKENS path (CLAUDE only) ──────────────────────────────────────
@@ -1808,6 +1922,23 @@ async def call_agent(
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         if stderr_text:
             relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+        # Resume-failure fallback: if we were attempting a resume and the call failed for a
+        # reason other than "session in use", clear the stale session and try a cold spawn.
+        if returncode != 0 and _was_resuming and not _SESSION_IN_USE_RE.search(stderr_text):
+            relay_log(f"{agent['name']}: resume failed (rc={returncode}), cold-spawn fallback (streaming)")
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                sessions.pop(agent["name"], None)
+                save_sessions(sessions_path, sessions)
+            current_session_id = None
+            cmd = _build_sessionless_command(agent, prompt)
+            stream_cmd = _add_stream_json(cmd)
+            log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=_on_stream_line)
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                relay_log(f"{agent['name']}: stderr: {stderr_text}")
 
         if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
             relay_log(f"{agent['name']}: session in use, retrying with fresh session (streaming)")
@@ -1878,6 +2009,21 @@ async def call_agent(
         if stderr_text:
             relay_log(f"{agent['name']}: stderr: {stderr_text}")
 
+        # Resume-failure fallback: stale/invalid session causes a non-session-in-use failure.
+        if returncode != 0 and _was_resuming and not _SESSION_IN_USE_RE.search(stderr_text):
+            relay_log(f"{agent['name']}: resume failed (rc={returncode}), cold-spawn fallback (streaming)")
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                sessions.pop(agent["name"], None)
+                save_sessions(sessions_path, sessions)
+            current_session_id = None
+            cmd = _build_sessionless_command(agent, prompt)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_codex_stream_line)
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
         if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
             relay_log(f"{agent['name']}: session in use, retrying with fresh session (streaming)")
             async with session_lock:
@@ -1946,6 +2092,21 @@ async def call_agent(
         if stderr_text:
             relay_log(f"{agent['name']}: stderr: {stderr_text}")
 
+        # Resume-failure fallback: stale/invalid session causes a non-session-in-use failure.
+        if returncode != 0 and _was_resuming and not _SESSION_IN_USE_RE.search(stderr_text):
+            relay_log(f"{agent['name']}: resume failed (rc={returncode}), cold-spawn fallback (streaming)")
+            async with session_lock:
+                sessions = load_sessions(sessions_path)
+                sessions.pop(agent["name"], None)
+                save_sessions(sessions_path, sessions)
+            current_session_id = None
+            cmd = _build_sessionless_command(agent, prompt)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=_on_gemini_stream_line)
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
         if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
             relay_log(f"{agent['name']}: session in use, retrying with fresh session (streaming)")
             async with session_lock:
@@ -2001,6 +2162,22 @@ async def call_agent(
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if stderr_text:
         relay_log(f"{agent['name']}: stderr: {stderr_text}")
+
+    # Resume-failure fallback: if we were resuming and the call failed for a reason other
+    # than "session in use", clear the stale session and fall back to a cold spawn once.
+    if returncode != 0 and _was_resuming and not _SESSION_IN_USE_RE.search(stderr_text):
+        relay_log(f"{agent['name']}: resume failed (rc={returncode}), cold-spawn fallback")
+        async with session_lock:
+            sessions = load_sessions(sessions_path)
+            sessions.pop(agent["name"], None)
+            save_sessions(sessions_path, sessions)
+        current_session_id = None
+        cmd = _build_sessionless_command(agent, prompt)
+        log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+        stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            relay_log(f"{agent['name']}: stderr: {stderr_text}")
 
     # Retry once with a fresh session ID when the stored one is still held open
     if returncode != 0 and _SESSION_IN_USE_RE.search(stderr_text):
@@ -2950,11 +3127,18 @@ async def run_relay(
 
     batch_task = asyncio.create_task(batch_pending_tasks())
     drain_task = asyncio.create_task(dispatch_drain_loop())
+    warm_pool_task: asyncio.Task | None = None
+    if WARM_SESSIONS:
+        _warm_pool = WarmSessionPool(enabled_agents, sessions_path, session_lock)
+        warm_pool_task = asyncio.create_task(_warm_pool.start(internal_stop_event))
+        relay_log("warm-pool: enabled (WARM_SESSIONS=1)")
     try:
         await internal_stop_event.wait()
     finally:
         batch_task.cancel()
         drain_task.cancel()
+        if warm_pool_task is not None:
+            warm_pool_task.cancel()
         try:
             await batch_task
         except asyncio.CancelledError:
@@ -2963,6 +3147,11 @@ async def run_relay(
             await drain_task
         except asyncio.CancelledError:
             pass
+        if warm_pool_task is not None:
+            try:
+                await warm_pool_task
+            except asyncio.CancelledError:
+                pass
         server.close()
         await server.wait_closed()
         if socket_path.exists():
