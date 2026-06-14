@@ -664,7 +664,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             "selected_effort": selected_effort if effort_options else "default",
             "mirror_mode": mirror_mode,
             "preseed_session_id": interpolate(raw_preseed_session_id, variables),
-            "timeout": int(raw_agent.get("timeout", 60)),
+            "timeout": int(raw_agent.get("timeout", locks.get("default_timeout", 60))),
             "io_log_path": normalized_workspace["agent_logs_dir"] / f"{name.lower()}.log",
         }
         agents.append(agent)
@@ -2275,20 +2275,21 @@ async def route_to(
     if cb is not None and cb.is_open(name):
         relay_log(f"{name}: circuit open, skipping dispatch")
         failed_at = utc_now()
-        publish(
-            {
-                "type": "route_state",
-                **route,
-                "started_at": route_started_at,
-                "updated_at": failed_at,
-                "completed_at": failed_at,
-                "status": "error",
-                "tx_state": "circuit_open",
-                "rx_state": "error",
-                "last_error": f"circuit breaker open for {name}",
-                "reply_chars": 0,
-            },
-        )
+        if route:
+            publish(
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": failed_at,
+                    "completed_at": failed_at,
+                    "status": "error",
+                    "tx_state": "circuit_open",
+                    "rx_state": "error",
+                    "last_error": f"circuit breaker open for {name}",
+                    "reply_chars": 0,
+                },
+            )
         publish(
             {
                 "type": "agent_state",
@@ -2309,10 +2310,27 @@ async def route_to(
             _token_seq += 1
             event_callback({"type": "token", "agent": name, "delta": delta, "seq": _token_seq})
 
-        result = await call_agent(
-            agent, prompt, sessions_path, session_lock,
-            token_callback=_token_emit if STREAM_TOKENS else None,
+        _soft_threshold = float(
+            agent.get("straggler_threshold_secs") or max(60.0, agent["timeout"] * 0.4)
         )
+
+        async def _emit_straggler() -> None:
+            await asyncio.sleep(_soft_threshold)
+            relay_log(f"{name}: still working after {_soft_threshold:.0f}s")
+            publish({"type": "agent_state", "agent": name, "state": "still_working", "last_error": None})
+
+        _straggler_task = asyncio.create_task(_emit_straggler())
+        try:
+            result = await call_agent(
+                agent, prompt, sessions_path, session_lock,
+                token_callback=_token_emit if STREAM_TOKENS else None,
+            )
+        finally:
+            _straggler_task.cancel()
+            try:
+                await _straggler_task
+            except asyncio.CancelledError:
+                pass
         if result.reply:
             msg = await append_reply(
                 write_lock,
@@ -2412,6 +2430,34 @@ async def route_to(
                 "last_error": f"timed out after {agent['timeout']}s",
             },
         )
+    except RuntimeError as exc:
+        relay_log(f"{name}: {exc}")
+        if circuit_breaker is not None:
+            circuit_breaker.record_failure(name)
+        if route:
+            failed_at = utc_now()
+            publish(
+                {
+                    "type": "route_state",
+                    **route,
+                    "started_at": route_started_at,
+                    "updated_at": failed_at,
+                    "completed_at": failed_at,
+                    "status": "error",
+                    "tx_state": "sent",
+                    "rx_state": "error",
+                    "last_error": str(exc),
+                    "reply_chars": 0,
+                },
+            )
+        publish(
+            {
+                "type": "agent_state",
+                "agent": name,
+                "state": "error",
+                "last_error": str(exc),
+            },
+        )
     except Exception as exc:
         relay_log(f"{name}: error: {exc}")
         if route:
@@ -2441,36 +2487,6 @@ async def route_to(
         if circuit_breaker is not None:
             circuit_breaker.record_failure(name)
 
-    # Also catch RuntimeError from call_agent (e.g., non-zero exit code)
-    except RuntimeError as exc:
-        relay_log(f"{name}: {exc}")
-        if circuit_breaker is not None:
-            circuit_breaker.record_failure(name)
-        if route:
-            failed_at = utc_now()
-            publish(
-                {
-                    "type": "route_state",
-                    **route,
-                    "started_at": route_started_at,
-                    "updated_at": failed_at,
-                    "completed_at": failed_at,
-                    "status": "error",
-                    "tx_state": "sent",
-                    "rx_state": "error",
-                    "last_error": str(exc),
-                    "reply_chars": 0,
-                },
-            )
-        publish(
-            {
-                "type": "agent_state",
-                "agent": name,
-                "state": "error",
-                "last_error": str(exc),
-            },
-        )
-
 
 async def run_relay(
     config: dict[str, Any],
@@ -2499,11 +2515,13 @@ async def run_relay(
     session_lock = asyncio.Lock()
     owns_event_store = False
 
-    # Initialize circuit breaker with configurable thresholds
+    # Initialize circuit breaker with configurable thresholds.
+    # Defaults: trip after 2 consecutive failures, try half-open after 120s.
+    # Gemini's 300s timeout means 2 consecutive timeouts = 10 minutes; CB prevents the 3rd.
     cb_config = config.get("locks", {}).get("circuit_breaker", {})
     circuit_breaker = CircuitBreaker(
-        failure_threshold=cb_config.get("failure_threshold", 3),
-        reset_timeout=cb_config.get("reset_timeout", 300.0),
+        failure_threshold=cb_config.get("failure_threshold", 2),
+        reset_timeout=cb_config.get("reset_timeout", 120.0),
     )
     relay_log(f"circuit breaker: threshold={circuit_breaker.failure_threshold}, reset={circuit_breaker.reset_timeout}s")
 
@@ -3086,7 +3104,8 @@ async def run_relay(
                             circuit_breaker=circuit_breaker,
                         )
                         for agent in target_agents
-                    ]
+                    ],
+                    return_exceptions=True,
                 )
 
                 event_store.complete_dispatch(job.get("id"), "done")
