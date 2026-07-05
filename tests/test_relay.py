@@ -591,6 +591,81 @@ class RelayTests(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_scrub_claude_stream_json_removes_tool_result(self):
+        """Test that tool_result events are scrubbed to metadata-only."""
+        raw = json.dumps({"type": "tool_result", "id": "123", "content": "secret file contents"})
+        scrubbed = relay._scrub_claude_stream_json(raw)
+        obj = json.loads(scrubbed)
+        self.assertEqual(obj["type"], "tool_result")
+        self.assertEqual(obj["id"], "123")
+        self.assertTrue(obj["SCRUBBED"])
+        self.assertNotIn("content", obj)
+
+    def test_scrub_claude_stream_json_removes_tool_use(self):
+        """Test that tool_use events are scrubbed to metadata-only."""
+        raw = json.dumps({"type": "tool_use", "id": "456", "name": "read", "input": {"path": "secret.env"}})
+        scrubbed = relay._scrub_claude_stream_json(raw)
+        obj = json.loads(scrubbed)
+        self.assertEqual(obj["type"], "tool_use")
+        self.assertEqual(obj["id"], "456")
+        self.assertEqual(obj["name"], "read")
+        self.assertTrue(obj["SCRUBBED"])
+        self.assertNotIn("input", obj)
+
+    def test_scrub_claude_stream_json_preserves_other_events(self):
+        """Test that non-tool events are preserved unchanged."""
+        raw = json.dumps({"type": "text", "content": "hello world"})
+        scrubbed = relay._scrub_claude_stream_json(raw)
+        obj = json.loads(scrubbed)
+        self.assertEqual(obj["type"], "text")
+        self.assertEqual(obj["content"], "hello world")
+        self.assertNotIn("SCRUBBED", obj)
+
+    def test_scrub_claude_stream_json_handles_multiline_ndjson(self):
+        """Test scrubbing with multiple NDJSON lines."""
+        lines = [
+            json.dumps({"type": "text", "content": "thinking"}),
+            json.dumps({"type": "tool_use", "id": "1", "name": "read", "input": {"path": "/etc/passwd"}}),
+            json.dumps({"type": "text", "content": "output"}),
+            json.dumps({"type": "tool_result", "id": "1", "content": "root:..."}),
+        ]
+        raw = "\n".join(lines)
+        scrubbed = relay._scrub_claude_stream_json(raw)
+        scrubbed_lines = scrubbed.split("\n")
+
+        self.assertEqual(len(scrubbed_lines), 4)
+        obj0 = json.loads(scrubbed_lines[0])
+        self.assertEqual(obj0["type"], "text")
+        self.assertNotIn("SCRUBBED", obj0)
+
+        obj1 = json.loads(scrubbed_lines[1])
+        self.assertEqual(obj1["type"], "tool_use")
+        self.assertTrue(obj1["SCRUBBED"])
+
+        obj2 = json.loads(scrubbed_lines[2])
+        self.assertEqual(obj2["type"], "text")
+        self.assertNotIn("SCRUBBED", obj2)
+
+        obj3 = json.loads(scrubbed_lines[3])
+        self.assertEqual(obj3["type"], "tool_result")
+        self.assertTrue(obj3["SCRUBBED"])
+
+    def test_scrub_claude_stream_json_handles_malformed_json(self):
+        """Test that malformed JSON lines are passed through unchanged."""
+        lines = [
+            json.dumps({"type": "text", "content": "valid"}),
+            "not valid json",
+            json.dumps({"type": "tool_result", "id": "1", "content": "sensitive"}),
+        ]
+        raw = "\n".join(lines)
+        scrubbed = relay._scrub_claude_stream_json(raw)
+        scrubbed_lines = scrubbed.split("\n")
+
+        self.assertEqual(len(scrubbed_lines), 3)
+        self.assertEqual(scrubbed_lines[1], "not valid json")
+        obj2 = json.loads(scrubbed_lines[2])
+        self.assertTrue(obj2["SCRUBBED"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1596,7 +1596,38 @@ def seed_sessions(path: Path, agents: list[dict[str, Any]]) -> dict[str, str]:
     return sessions
 
 
-def log_agent_io(path: Path, cmd: list[str], raw: str, stderr_text: str, session_id: str | None) -> None:
+def _scrub_claude_stream_json(raw: str) -> str:
+    """Scrub sensitive NDJSON lines from CLAUDE stream-json output.
+
+    Strips tool_result and tool_use events before logging to prevent sensitive
+    file contents from accumulating in io_logs. Replaces full events with
+    minimal metadata-only versions.
+    """
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            lines.append(line)
+            continue
+
+        event_type = obj.get("type")
+        if event_type == "tool_result":
+            scrubbed = {"type": "tool_result", "id": obj.get("id", ""), "SCRUBBED": True}
+            lines.append(json.dumps(scrubbed))
+        elif event_type == "tool_use":
+            scrubbed = {"type": "tool_use", "id": obj.get("id", ""), "name": obj.get("name", ""), "SCRUBBED": True}
+            lines.append(json.dumps(scrubbed))
+        else:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def log_agent_io(path: Path, cmd: list[str], raw: str, stderr_text: str, session_id: str | None, agent_name: str = "") -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         f"[{timestamp}] cmd: {' '.join(shlex.quote(part) for part in cmd)}",
@@ -1606,7 +1637,10 @@ def log_agent_io(path: Path, cmd: list[str], raw: str, stderr_text: str, session
     if stderr_text:
         lines.extend([f"[{timestamp}] --- stderr ---", stderr_text])
     if raw:
-        lines.extend([f"[{timestamp}] --- stdout ---", raw.rstrip()])
+        output = raw
+        if agent_name == "CLAUDE":
+            output = _scrub_claude_stream_json(raw)
+        lines.extend([f"[{timestamp}] --- stdout ---", output.rstrip()])
     lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1965,7 +1999,7 @@ async def call_agent(
             current_session_id = None
             cmd = _build_sessionless_command(agent, prompt)
             stream_cmd = _add_stream_json(cmd)
-            log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id, agent["name"])
             stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
@@ -1980,7 +2014,7 @@ async def call_agent(
 
             cmd, current_session_id = build_agent_command(agent, prompt, None)
             stream_cmd = _add_stream_json(cmd)
-            log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id, agent["name"])
 
             stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -1992,7 +2026,7 @@ async def call_agent(
                 current_session_id = None
                 cmd = _build_sessionless_command(agent, prompt)
                 stream_cmd = _add_stream_json(cmd)
-                log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id)
+                log_agent_io(agent["io_log_path"], stream_cmd, "", stderr_text, current_session_id, agent["name"])
 
                 stdout, stderr, returncode = await _exec_agent_streaming(agent, stream_cmd, env, line_callback=None)
                 stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2014,7 +2048,7 @@ async def call_agent(
                     sessions[agent["name"]] = current_session_id
                     save_sessions(sessions_path, sessions)
 
-        log_agent_io(agent["io_log_path"], stream_cmd, raw, stderr_text, current_session_id)
+        log_agent_io(agent["io_log_path"], stream_cmd, raw, stderr_text, current_session_id, agent["name"])
         return AgentCallResult(
             reply=parse_claude_stream_final(raw),
             raw=raw,
@@ -2049,7 +2083,7 @@ async def call_agent(
                 save_sessions(sessions_path, sessions)
             current_session_id = None
             cmd = _build_sessionless_command(agent, prompt)
-            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
             stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
@@ -2063,7 +2097,7 @@ async def call_agent(
                 save_sessions(sessions_path, sessions)
 
             cmd, current_session_id = build_agent_command(agent, prompt, None)
-            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
 
             stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2074,7 +2108,7 @@ async def call_agent(
                 relay_log(f"{agent['name']}: fresh session also in use, retrying without session (streaming)")
                 current_session_id = None
                 cmd = _build_sessionless_command(agent, prompt)
-                log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+                log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
 
                 stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
                 stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2096,7 +2130,7 @@ async def call_agent(
                     sessions[agent["name"]] = current_session_id
                     save_sessions(sessions_path, sessions)
 
-        log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id)
+        log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id, agent["name"])
         return AgentCallResult(
             reply=parse_codex_stream_final(raw),
             raw=raw,
@@ -2132,7 +2166,7 @@ async def call_agent(
                 save_sessions(sessions_path, sessions)
             current_session_id = None
             cmd = _build_sessionless_command(agent, prompt)
-            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
             stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
@@ -2146,7 +2180,7 @@ async def call_agent(
                 save_sessions(sessions_path, sessions)
 
             cmd, current_session_id = build_agent_command(agent, prompt, None)
-            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
 
             stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2157,7 +2191,7 @@ async def call_agent(
                 relay_log(f"{agent['name']}: fresh session also in use, retrying without session (streaming)")
                 current_session_id = None
                 cmd = _build_sessionless_command(agent, prompt)
-                log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+                log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
 
                 stdout, stderr, returncode = await _exec_agent_streaming(agent, cmd, env, line_callback=None)
                 stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2179,7 +2213,7 @@ async def call_agent(
                     sessions[agent["name"]] = current_session_id
                     save_sessions(sessions_path, sessions)
 
-        log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id)
+        log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id, agent["name"])
         return AgentCallResult(
             reply=parse_gemini_stream_final(raw),
             raw=raw,
@@ -2204,7 +2238,7 @@ async def call_agent(
             save_sessions(sessions_path, sessions)
         current_session_id = None
         cmd = _build_sessionless_command(agent, prompt)
-        log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+        log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
         stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         if stderr_text:
@@ -2219,7 +2253,7 @@ async def call_agent(
             save_sessions(sessions_path, sessions)
 
         cmd, current_session_id = build_agent_command(agent, prompt, None)
-        log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+        log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
 
         stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2231,7 +2265,7 @@ async def call_agent(
             relay_log(f"{agent['name']}: fresh session also in use, retrying without session")
             current_session_id = None
             cmd = _build_sessionless_command(agent, prompt)
-            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id)
+            log_agent_io(agent["io_log_path"], cmd, "", stderr_text, current_session_id, agent["name"])
 
             stdout, stderr, returncode = await _exec_agent(agent, cmd, env)
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2255,7 +2289,7 @@ async def call_agent(
                 sessions[agent["name"]] = current_session_id
                 save_sessions(sessions_path, sessions)
 
-    log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id)
+    log_agent_io(agent["io_log_path"], cmd, raw, stderr_text, current_session_id, agent["name"])
     return AgentCallResult(
         reply=parser(raw),
         raw=raw,
